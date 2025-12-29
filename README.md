@@ -98,6 +98,7 @@ listeners:
 backends:
   - name: "api-servers"
     balance: "roundrobin"
+    send_proxy_v2: true # Enable PROXY Protocol v2 to pass client IP
     servers:
       - "10.0.0.1:8080"
       - "10.0.0.2:8080"
