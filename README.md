@@ -69,7 +69,7 @@ graph TD
 
 ### Build from Source
 ```bash
-git clone https://github.com/nvelox/nvelox.git
+git clone git@github.com:nvelox/nvelox.git
 cd nvelox
 go build -o nvelox main.go
 ```
@@ -131,7 +131,7 @@ We welcome contributions from the community! Whether it's reporting a bug, impro
 1. **Fork the Repository**: Click the "Fork" button on the top right.
 2. **Clone your Fork**:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/nvelox.git
+   git clone git@github.com:YOUR_USERNAME/nvelox.git
    cd nvelox
    ```
 3. **Create a Branch**:
