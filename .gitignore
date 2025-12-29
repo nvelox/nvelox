@@ -1,0 +1,24 @@
+# Binaries
+nvelox
+proxy-server
+mock_backend
+
+# Logs
+*.log
+*.out
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+backend1.log
+backend2.log
+proxy.log
+nvelox.log

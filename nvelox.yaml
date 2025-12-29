@@ -1,0 +1,12 @@
+listeners:
+  - name: "debug-listener"
+    bind: ":9000"
+    protocol: "tcp"
+    zero_copy: false
+    default_backend: "echo-pool"
+
+backends:
+  - name: "echo-pool"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"
