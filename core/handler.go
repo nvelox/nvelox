@@ -1,6 +1,7 @@
 package core
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -134,6 +135,13 @@ func (h *ProxyEventHandler) connectBackend(c gnet.Conn, ctx *ConnContext, l *Lis
 		logging.Error("[ERR] failed to pick backend: %v", err)
 		h.safeClose(c, ctx)
 		return
+	}
+
+	// If target has no port (e.g. "10.0.0.103"), assume 1:1 mapping and append listener port
+	if _, _, err := net.SplitHostPort(target); err != nil {
+		// Verify if it's missing port error or something else
+		// "missing port in address" is the typical error
+		target = fmt.Sprintf("%s:%d", target, l.Port)
 	}
 
 	// Blocking dial
