@@ -16,13 +16,17 @@ import (
 	"nvelox/core/logging"
 )
 
+const (
+	Version = "v0.2.0"
+)
+
 func main() {
-	version := flag.Bool("version", false, "Print version and exit")
+	versionFlag := flag.Bool("version", false, "Print version and exit")
 	configPath := flag.String("config", "nvelox.yaml", "Path to configuration file")
 	flag.Parse()
 
-	if *version {
-		fmt.Println("nvelox v0.1.0")
+	if *versionFlag {
+		fmt.Println("nvelox", Version)
 		os.Exit(0)
 	}
 

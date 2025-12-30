@@ -115,6 +115,15 @@ backends:
   - name: "api-servers"
     balance: "roundrobin"
     send_proxy_v2: true # Enable PROXY Protocol v2 to pass client IP
+    
+    # Active Health Check
+    health_check:
+      active:
+        type: "tcp"     # "tcp" or "http"
+        interval: "5s"  # Check every 5 seconds
+        timeout: "1s"   # Timeout after 1 second
+        # path: "/health" # Required if type is "http"
+
     servers:
       - "10.0.0.1:8080"
       - "10.0.0.2:8080"

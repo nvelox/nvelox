@@ -30,3 +30,15 @@ backends:
     servers:
       - "10.0.0.1:8080"
       - "10.0.0.2:8080"
+  - name: "api-servers"
+    balance: "roundrobin"
+    send_proxy_v2: true
+    # Health Check Configuration
+    # active:
+    #   type: "tcp" # or "http"
+    #   interval: "5s"
+    #   timeout: "1s"
+    #   path: "/health" # only for http
+    servers:
+      - "10.0.0.1:8080"
+      - "10.0.0.2:8080"
