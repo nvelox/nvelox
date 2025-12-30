@@ -85,11 +85,14 @@ func (e *Engine) Start(ctx context.Context) error {
 	// Issue: gnet.Run taking a "proto://addr" only takes one.
 	// If we want multiple listeners, we need multiple Run calls in goroutines.
 
+	// If we have many listeners (e.g. port range), enable mass mode optimization
+	massMode := len(e.Listeners) > 64
+
 	for _, l := range e.Listeners {
 		wg.Add(1)
 		go func(conf *ListenerConfig) {
 			defer wg.Done()
-			e.runListener(conf)
+			e.runListener(conf, massMode)
 		}(l)
 	}
 
@@ -97,23 +100,26 @@ func (e *Engine) Start(ctx context.Context) error {
 	return nil
 }
 
-func (e *Engine) runListener(conf *ListenerConfig) {
+func (e *Engine) runListener(conf *ListenerConfig, mass bool) {
 	p := "tcp"
 	if conf.Protocol == "udp" {
 		p = "udp"
 	}
 	addr := fmt.Sprintf("%s://%s", p, conf.Addr)
 
-	log.Printf("Starting listener %s on %s", conf.Name, addr)
+	log.Printf("Starting listener %s on %s (mass=%t)", conf.Name, addr, mass)
 
 	handler := &ProxyEventHandler{
 		engine:   e,
 		listener: conf,
 	}
 
-	// Multicore true means utilizing generic standard Go scheduler with multiple threads?
-	// gnet Multicore=true uses SO_REUSEPORT (on Linux) or multiple reactors.
-	err := gnet.Run(handler, addr, gnet.WithMulticore(true), gnet.WithReusePort(true))
+	// For mass listeners (e.g. port ranges), we disable Multicore/ReusePort to avoid
+	// spawning NumCPU goroutines per port, which would lead to resource exhaustion.
+	multicore := !mass
+	reusePort := !mass
+
+	err := gnet.Run(handler, addr, gnet.WithMulticore(multicore), gnet.WithReusePort(reusePort))
 	if err != nil {
 		log.Printf("Listener %s failed: %v", conf.Name, err)
 	}
