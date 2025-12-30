@@ -21,8 +21,8 @@ const (
 
 type ProxyEventHandler struct {
 	gnet.BuiltinEventEngine
-	engine   *Engine
-	listener *ListenerConfig
+	engine      *Engine
+	listenerMap map[string]*ListenerConfig // Addr -> Config
 
 	// UDP Session Table: remoteAddr(string) -> *net.UDPConn (for backend)
 	udpSessions sync.Map
@@ -30,21 +30,34 @@ type ProxyEventHandler struct {
 
 // OnTraffic fires when data is available.
 func (h *ProxyEventHandler) OnTraffic(c gnet.Conn) (action gnet.Action) {
-	if h.listener.Protocol == "udp" {
-		return h.handleUDP(c)
+	// Find listener for this connection
+	l := h.getListenerConfig(c)
+	if l == nil {
+		logging.Error("Unknown listener for connection on %s", c.LocalAddr())
+		return gnet.Close
 	}
-	return h.handleTCP(c)
+
+	if l.Protocol == "udp" {
+		return h.handleUDP(c, l)
+	}
+	return h.handleTCP(c, l)
 }
 
 // OnBoot fires when the engine starts.
 func (h *ProxyEventHandler) OnBoot(eng gnet.Engine) (action gnet.Action) {
-	logging.Info("Server started on %s", h.listener.Addr)
+	logging.Info("Shared Server Engine Started")
 	return gnet.None
 }
 
 // OnOpen fires when a new connection is opened.
 func (h *ProxyEventHandler) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
-	logging.Info("[CONN] New connection from %s on %s", c.RemoteAddr(), h.listener.Addr)
+	l := h.getListenerConfig(c)
+	if l == nil {
+		logging.Error("Unknown listener for connection on %s", c.LocalAddr())
+		return nil, gnet.Close
+	}
+
+	logging.Info("[CONN] New connection from %s on %s (Listener: %s)", c.RemoteAddr(), c.LocalAddr(), l.Name)
 
 	ctx := &ConnContext{
 		StartTime: time.Now(),
@@ -53,9 +66,27 @@ func (h *ProxyEventHandler) OnOpen(c gnet.Conn) (out []byte, action gnet.Action)
 	c.SetContext(ctx)
 
 	// Initiate connection to backend asynchronously
-	go h.connectBackend(c, ctx)
+	go h.connectBackend(c, ctx, l)
 
 	return nil, gnet.None
+}
+
+func (h *ProxyEventHandler) getListenerConfig(c gnet.Conn) *ListenerConfig {
+	// Address matching logic
+	// LocalAddr() returns specific IP "127.0.0.1:9090"
+	// Config might be ":9090"
+
+	// Fast path: Try exact match first (if map was populated with full address?)
+	_, port, _ := net.SplitHostPort(c.LocalAddr().String())
+
+	// Safe fallback: Match by Port
+	for _, l := range h.listenerMap {
+		_, lPort, _ := net.SplitHostPort(l.Addr)
+		if lPort == port {
+			return l
+		}
+	}
+	return nil
 }
 
 // OnClose fires when a connection is closed.
@@ -89,8 +120,8 @@ type ConnContext struct {
 	closed    bool
 }
 
-func (h *ProxyEventHandler) connectBackend(c gnet.Conn, ctx *ConnContext) {
-	backendName := h.listener.DefaultBackend
+func (h *ProxyEventHandler) connectBackend(c gnet.Conn, ctx *ConnContext, l *ListenerConfig) {
+	backendName := l.DefaultBackend
 	balancer, ok := h.engine.Balancers[backendName]
 	if !ok {
 		logging.Error("[ERR] backend not found: %s", backendName)
@@ -140,6 +171,7 @@ func (h *ProxyEventHandler) connectBackend(c gnet.Conn, ctx *ConnContext) {
 	buf := make([]byte, copyBufferSize)
 	for {
 		n, err := rc.Read(buf)
+
 		if n > 0 {
 			// Copy data for safe async usage
 			data := make([]byte, n)
@@ -190,7 +222,7 @@ func (h *ProxyEventHandler) safeClose(c gnet.Conn, ctx *ConnContext) {
 }
 
 // handleTCP handles TCP traffic.
-func (h *ProxyEventHandler) handleTCP(c gnet.Conn) gnet.Action {
+func (h *ProxyEventHandler) handleTCP(c gnet.Conn, l *ListenerConfig) gnet.Action {
 	val := c.Context()
 	if val == nil {
 		// Should not happen if OnOpen works
@@ -224,7 +256,7 @@ func (h *ProxyEventHandler) handleTCP(c gnet.Conn) gnet.Action {
 }
 
 // handleUDP handles UDP traffic.
-func (h *ProxyEventHandler) handleUDP(c gnet.Conn) gnet.Action {
+func (h *ProxyEventHandler) handleUDP(c gnet.Conn, l *ListenerConfig) gnet.Action {
 	buf, _ := c.Next(-1)
 	if len(buf) == 0 {
 		return gnet.None
@@ -240,12 +272,12 @@ func (h *ProxyEventHandler) handleUDP(c gnet.Conn) gnet.Action {
 	if !ok {
 		isNewSession = true
 		// Resolve Backend
-		balancer, ok := h.engine.Balancers[h.listener.DefaultBackend]
+		balancer, ok := h.engine.Balancers[l.DefaultBackend]
 		if !ok {
 			return gnet.None
 		}
-		backendName := h.listener.DefaultBackend
-		bkConf := h.engine.Backends[backendName]
+		backendName := l.DefaultBackend
+		bkConf, hasBE := h.engine.Backends[backendName]
 
 		target, err := balancer.Next()
 		if err != nil {
@@ -289,7 +321,7 @@ func (h *ProxyEventHandler) handleUDP(c gnet.Conn) gnet.Action {
 		}()
 
 		// Send PROXY header if configured
-		if bkConf != nil && bkConf.SendProxyV2 && isNewSession {
+		if hasBE && bkConf != nil && bkConf.SendProxyV2 && isNewSession {
 			_ = proxy.WriteProxyHeaderV2(conn, c.RemoteAddr(), c.LocalAddr())
 		}
 	} else {

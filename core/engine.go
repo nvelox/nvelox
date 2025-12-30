@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"sync"
 
 	"nvelox/config"
 	"nvelox/core/health"
@@ -44,15 +43,6 @@ func NewEngine(cfg *config.Config) *Engine {
 }
 
 func (e *Engine) Start(ctx context.Context) error {
-	var wg sync.WaitGroup
-	// In a real implementation with gnet, we might run one engine managing multiple listeners
-	// or multiple engines. gnet supports multiple listeners.
-	// We will start one gnet engine per listener for simplicity in this "HAProxy-like" model
-	// where we want distinct loops or just to follow the "distinct gnet listener" plan.
-
-	// Actually gnet can bind to multiple addrs. But they all share the same EventHandler.
-	// So we need to map the listener address back to the config in the handler.
-
 	// Initialize Backends & Health Checkers
 	for i := range e.Config.Backends {
 		be := &e.Config.Backends[i]
@@ -82,45 +72,45 @@ func (e *Engine) Start(ctx context.Context) error {
 		}
 	}
 
-	// Issue: gnet.Run taking a "proto://addr" only takes one.
-	// If we want multiple listeners, we need multiple Run calls in goroutines.
-
-	// If we have many listeners (e.g. port range), enable mass mode optimization
-	massMode := len(e.Listeners) > 64
+	// Shared Event Loop Implementation
+	// 1. Collect all addresses
+	addrs := make([]string, 0, len(e.Listeners))
+	listenerMap := make(map[string]*ListenerConfig) // Addr -> Config
 
 	for _, l := range e.Listeners {
-		wg.Add(1)
-		go func(conf *ListenerConfig) {
-			defer wg.Done()
-			e.runListener(conf, massMode)
-		}(l)
+		p := "tcp"
+		if l.Protocol == "udp" {
+			p = "udp"
+		}
+		// Format: proto://host:port
+		fullAddr := fmt.Sprintf("%s://%s", p, l.Addr)
+		addrs = append(addrs, fullAddr)
+
+		// Map for lookup in Handler
+		// Note: gnet.Conn.LocalAddr().String() returns "127.0.0.1:9090" (no proto)
+		// So we map the raw address "127.0.0.1:9090" to the config
+		// If bind is ":9090", LocalAddr might return "[::]:9090" or "0.0.0.0:9090" depending on OS.
+		// We need robust matching. For now, we map the config Addr directly.
+		listenerMap[l.Addr] = l
+		logging.Info("Registering listener %s on %s", l.Name, fullAddr)
 	}
 
-	wg.Wait()
+	handler := &ProxyEventHandler{
+		engine:      e,
+		listenerMap: listenerMap,
+	}
+
+	logging.Info("Starting Shared Event Loop on %d listeners...", len(addrs))
+
+	// 2. Start Global Engine
+	// We establish ONE engine for ALL ports.
+	// This invokes Multicore=true so we use NumCPU threads total, regardless of port count.
+	err := gnet.Rotate(handler, addrs, gnet.WithMulticore(true), gnet.WithReusePort(true))
+	if err != nil {
+		return fmt.Errorf("gnet.Rotate failed: %v", err)
+	}
+
 	return nil
 }
 
-func (e *Engine) runListener(conf *ListenerConfig, mass bool) {
-	p := "tcp"
-	if conf.Protocol == "udp" {
-		p = "udp"
-	}
-	addr := fmt.Sprintf("%s://%s", p, conf.Addr)
-
-	log.Printf("Starting listener %s on %s (mass=%t)", conf.Name, addr, mass)
-
-	handler := &ProxyEventHandler{
-		engine:   e,
-		listener: conf,
-	}
-
-	// For mass listeners (e.g. port ranges), we disable Multicore/ReusePort to avoid
-	// spawning NumCPU goroutines per port, which would lead to resource exhaustion.
-	multicore := !mass
-	reusePort := !mass
-
-	err := gnet.Run(handler, addr, gnet.WithMulticore(multicore), gnet.WithReusePort(reusePort))
-	if err != nil {
-		log.Printf("Listener %s failed: %v", conf.Name, err)
-	}
-}
+// runListener is deprecated/removed in Shared Loop model

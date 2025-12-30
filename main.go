@@ -16,8 +16,9 @@ import (
 	"nvelox/core/logging"
 )
 
-const (
-	Version = "v0.2.0"
+var (
+	// Version is injected by build flags: -ldflags "-X main.Version=vX.Y.Z"
+	Version = "v0.2.1"
 )
 
 func main() {
@@ -26,7 +27,7 @@ func main() {
 	flag.Parse()
 
 	if *versionFlag {
-		fmt.Println("nvelox", Version)
+		fmt.Printf("nvelox %s\n", Version)
 		os.Exit(0)
 	}
 
@@ -39,7 +40,7 @@ func main() {
 	if err := logging.Init(cfg.Logging.Level, cfg.Logging.AccessLog, cfg.Logging.ErrorLog); err != nil {
 		log.Fatalf("Failed to init logger: %v", err)
 	}
-	logging.Info("Nvelox Server v0.1.0 starting...")
+	logging.Info("Nvelox Server %s starting...", Version)
 	logging.Info("Loaded configuration from %s", *configPath)
 
 	// Expand port ranges in listeners
