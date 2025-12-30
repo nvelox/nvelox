@@ -1,0 +1,24 @@
+# Git
+.git
+.gitignore
+
+# Go
+bin/
+*.exe
+*.test
+*.out
+go.work.sum
+
+# IDEs
+.vscode
+.idea
+
+# Build Artifacts
+nvelox
+access.log
+error.log
+
+# Test Artifacts
+test_config/
+backend*.log
+*.pcap
