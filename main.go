@@ -13,6 +13,7 @@ import (
 
 	"nvelox/config"
 	"nvelox/core"
+	"nvelox/core/logging"
 )
 
 func main() {
@@ -25,12 +26,17 @@ func main() {
 		os.Exit(0)
 	}
 
-	log.Println("Starting Nvelox Server v0.1.0...")
-
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+
+	// Init Logger
+	if err := logging.Init(cfg.Logging.Level, cfg.Logging.AccessLog, cfg.Logging.ErrorLog); err != nil {
+		log.Fatalf("Failed to init logger: %v", err)
+	}
+	logging.Info("Nvelox Server v0.1.0 starting...")
+	logging.Info("Loaded configuration from %s", *configPath)
 
 	// Expand port ranges in listeners
 	// The implementation plan states we should iterate ranges and create distinct listeners.

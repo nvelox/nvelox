@@ -22,6 +22,8 @@ Nvelox is a lightweight, high-performance TCP/UDP load balancer and proxy server
   > **Note:** When using port ranges, the **destination port is preserved** if a specific backend port is not mapped. This is ideal for gaming and VoIP applications requiring direct 1:1 port mapping.
 - **Load Balancing**: Supports `roundrobin`, `leastconn`, and `random`.
 - **PROXY Protocol v2**: Transparently passes client IP information to backends (TCP & UDP supported).
+- **Advanced Logging**: Structured file-based logging with configurable levels (`debug`, `info`, `warn`, `error`).
+- **Modular Configuration**: Support for split configuration files via `include`.
 - **Zero-Dependency**: Static binary, easy to deploy.
 
 ## Architecture
@@ -81,6 +83,20 @@ Nvelox uses a YAML configuration file.
 ### Example `nvelox.yaml`
 
 ```yaml
+# Server Settings
+server:
+  user: "nvelox"
+  group: "nvelox"
+
+# Logging
+logging:
+  level: "info"
+  access_log: "/var/log/nvelox/access.log"
+  error_log: "/var/log/nvelox/error.log"
+
+# Modular Config
+include: "/etc/nvelox/config.d/*.yaml"
+
 listeners:
   # Single Port
   - name: "api-gateway"

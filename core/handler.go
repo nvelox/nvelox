@@ -2,11 +2,11 @@ package core
 
 import (
 	"io"
-	"log"
 	"net"
 	"sync"
 	"time"
 
+	"nvelox/core/logging"
 	"nvelox/proxy"
 
 	"github.com/panjf2000/gnet/v2"
@@ -38,13 +38,13 @@ func (h *ProxyEventHandler) OnTraffic(c gnet.Conn) (action gnet.Action) {
 
 // OnBoot fires when the engine starts.
 func (h *ProxyEventHandler) OnBoot(eng gnet.Engine) (action gnet.Action) {
-	log.Printf("Server started on %s", h.listener.Addr)
+	logging.Info("Server started on %s", h.listener.Addr)
 	return gnet.None
 }
 
 // OnOpen fires when a new connection is opened.
 func (h *ProxyEventHandler) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
-	log.Printf("[CONN] New connection from %s on %s", c.RemoteAddr(), h.listener.Addr)
+	logging.Info("[CONN] New connection from %s on %s", c.RemoteAddr(), h.listener.Addr)
 
 	ctx := &ConnContext{
 		StartTime: time.Now(),
@@ -75,7 +75,7 @@ func (h *ProxyEventHandler) OnClose(c gnet.Conn, err error) (action gnet.Action)
 		conn.Close()
 	}
 
-	log.Printf("[CONN] Closed connection from %s (Duration: %v, Err: %v)", c.RemoteAddr(), duration, err)
+	logging.Info("[CONN] Closed connection from %s (Duration: %v, Err: %v)", c.RemoteAddr(), duration, err)
 	return gnet.None
 }
 
@@ -93,14 +93,14 @@ func (h *ProxyEventHandler) connectBackend(c gnet.Conn, ctx *ConnContext) {
 	backendName := h.listener.DefaultBackend
 	balancer, ok := h.engine.Balancers[backendName]
 	if !ok {
-		log.Printf("[ERR] backend not found: %s", backendName)
+		logging.Error("[ERR] backend not found: %s", backendName)
 		c.Close()
 		return
 	}
 
 	target, err := balancer.Next()
 	if err != nil {
-		log.Printf("[ERR] failed to pick backend: %v", err)
+		logging.Error("[ERR] failed to pick backend: %v", err)
 		h.safeClose(c, ctx)
 		return
 	}
@@ -108,7 +108,7 @@ func (h *ProxyEventHandler) connectBackend(c gnet.Conn, ctx *ConnContext) {
 	// Blocking dial
 	rc, err := net.DialTimeout("tcp", target, tcpDialTimeout)
 	if err != nil {
-		log.Printf("[ERR] backend connect failed: %v", err)
+		logging.Error("[ERR] backend connect failed: %v", err)
 		h.safeClose(c, ctx)
 		return
 	}
@@ -126,7 +126,7 @@ func (h *ProxyEventHandler) connectBackend(c gnet.Conn, ctx *ConnContext) {
 	if len(ctx.buffer) > 0 {
 		_, err := rc.Write(ctx.buffer)
 		if err != nil {
-			log.Printf("[ERR] failed to flush buffer: %v", err)
+			logging.Error("[ERR] failed to flush buffer: %v", err)
 			rc.Close()
 			ctx.mu.Unlock()
 			h.safeClose(c, ctx)
@@ -165,7 +165,7 @@ func (h *ProxyEventHandler) connectBackend(c gnet.Conn, ctx *ConnContext) {
 		}
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("[CONN] Backend read error: %v", err)
+				logging.Error("[CONN] Backend read error: %v", err)
 			}
 			break
 		}
