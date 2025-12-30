@@ -1,6 +1,7 @@
 ![License](https://img.shields.io/github/license/nvelox/nvelox)
 ![Go Version](https://img.shields.io/github/go-mod/go-version/nvelox/nvelox)
-![Build Status](https://img.shields.io/github/actions/workflow/status/nvelox/nvelox/go.yml)
+![Latest Release](https://img.shields.io/github/v/release/nvelox/nvelox?include_prereleases&label=latest%20release&color=blue)
+![Build Status](https://github.com/nvelox/nvelox/actions/workflows/release.yml/badge.svg)
 
 # Nvelox
 
