@@ -83,6 +83,20 @@ Nvelox uses a YAML configuration file.
 ### Example `nvelox.yaml`
 
 ```yaml
+# Server Settings
+server:
+  user: "nvelox"
+  group: "nvelox"
+
+# Logging
+logging:
+  level: "info"
+  access_log: "/var/log/nvelox/access.log"
+  error_log: "/var/log/nvelox/error.log"
+
+# Modular Config
+include: "/etc/nvelox/config.d/*.yaml"
+
 listeners:
   # Single Port
   - name: "api-gateway"
