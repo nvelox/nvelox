@@ -87,12 +87,11 @@ func (e *Engine) Start(ctx context.Context) error {
 		addrs = append(addrs, fullAddr)
 
 		// Map for lookup in Handler
-		// Note: gnet.Conn.LocalAddr().String() returns "127.0.0.1:9090" (no proto)
-		// So we map the raw address "127.0.0.1:9090" to the config
-		// If bind is ":9090", LocalAddr might return "[::]:9090" or "0.0.0.0:9090" depending on OS.
-		// We need robust matching. For now, we map the config Addr directly.
-		listenerMap[l.Addr] = l
-		logging.Info("Registering listener %s on %s", l.Name, fullAddr)
+		// Use "proto:port" as key to avoid collision between TCP/UDP on same port
+		// and to handle different bind IPs (0.0.0.0 vs 127.0.0.1) resolving to the same port.
+		key := fmt.Sprintf("%s:%d", l.Protocol, l.Port)
+		listenerMap[key] = l
+		logging.Info("Registering listener %s on %s (Key: %s)", l.Name, fullAddr, key)
 	}
 
 	handler := &ProxyEventHandler{

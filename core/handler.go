@@ -73,20 +73,29 @@ func (h *ProxyEventHandler) OnOpen(c gnet.Conn) (out []byte, action gnet.Action)
 }
 
 func (h *ProxyEventHandler) getListenerConfig(c gnet.Conn) *ListenerConfig {
-	// Address matching logic
-	// LocalAddr() returns specific IP "127.0.0.1:9090"
-	// Config might be ":9090"
-
-	// Fast path: Try exact match first (if map was populated with full address?)
-	_, port, _ := net.SplitHostPort(c.LocalAddr().String())
-
-	// Safe fallback: Match by Port
-	for _, l := range h.listenerMap {
-		_, lPort, _ := net.SplitHostPort(l.Addr)
-		if lPort == port {
-			return l
-		}
+	// Address matching logic via "proto:port" key
+	if c.LocalAddr() == nil {
+		return nil
 	}
+
+	_, port, err := net.SplitHostPort(c.LocalAddr().String())
+	if err != nil {
+		return nil
+	}
+
+	// Normalize network (tcp4/tcp6 -> tcp)
+	netType := c.LocalAddr().Network()
+	proto := "tcp"
+	if len(netType) >= 3 && netType[:3] == "udp" {
+		proto = "udp"
+	}
+
+	key := fmt.Sprintf("%s:%s", proto, port)
+
+	if l, ok := h.listenerMap[key]; ok {
+		return l
+	}
+
 	return nil
 }
 
