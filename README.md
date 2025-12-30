@@ -4,6 +4,8 @@
 
 # Nvelox
 
+![alt text](image.png)
+
 **High-Performance L4 Load Balancer & Proxy (Go + gnet)**
 
 Nvelox is a lightweight, high-performance TCP/UDP load balancer and proxy server written in Go, powered by [gnet](https://github.com/panjf2000/gnet). It is designed to handle high concurrency with minimal resource usage, offering features similar to HAProxy but with a simplified configuration and modern Go architecture.
