@@ -31,8 +31,8 @@ RUN addgroup -S nvelox && adduser -S nvelox -G nvelox
 # Copy Binary
 COPY --from=builder /app/nvelox /usr/local/bin/nvelox
 
-# Copy Example Config (Optional, but useful)
-COPY nvelox.example.yaml /etc/nvelox/nvelox.example.yaml
+# Copy Example Config as Default
+COPY nvelox.example.yaml /etc/nvelox/nvelox.conf
 
 # Create Config and Log Directories
 RUN mkdir -p /etc/nvelox/config.d && \
