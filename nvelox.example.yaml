@@ -1,0 +1,32 @@
+# /etc/nvelox/nvelox.conf
+# Main Configuration File
+
+# Server Settings
+server:
+  user: "nvelox"
+  group: "nvelox"
+  pid_file: "/var/run/nvelox.pid"
+
+# Logging Configuration
+logging:
+  level: "info" # debug, info, warning, error
+  access_log: "/var/log/nvelox/access.log"
+  error_log: "/var/log/nvelox/error.log"
+
+# Modular Includes
+# Include additional configuration files (e.g., listeners, backends)
+include: "/etc/nvelox/config.d/*.yaml"
+
+# Listeners and Backends can also be defined here directly
+listeners:
+  - name: "web-traffic"
+    bind: ":80"
+    protocol: "tcp"
+    default_backend: "web-cluster"
+
+backends:
+  - name: "web-cluster"
+    balance: "roundrobin"
+    servers:
+      - "10.0.0.1:8080"
+      - "10.0.0.2:8080"
