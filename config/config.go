@@ -10,6 +10,7 @@ import (
 
 // Config represents the top-level configuration for the proxy server.
 type Config struct {
+	Version string        `yaml:"version"`
 	Server  ServerConfig  `yaml:"server"`
 	Logging LoggingConfig `yaml:"logging"`
 	Include string        `yaml:"include"`
@@ -119,6 +120,16 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
+	// Apply Defaults
+	if cfg.Logging.Level == "" {
+		cfg.Logging.Level = "info"
+	}
+	for i := range cfg.Listeners {
+		if cfg.Listeners[i].Protocol == "" {
+			cfg.Listeners[i].Protocol = "tcp"
+		}
+	}
+
 	if err := validate(&cfg); err != nil {
 		return nil, fmt.Errorf("config validation failed: %w", err)
 	}
@@ -127,6 +138,10 @@ func Load(path string) (*Config, error) {
 }
 
 func validate(cfg *Config) error {
+	if cfg.Version != "2" {
+		return fmt.Errorf("unsupported version: %s (expected '2')", cfg.Version)
+	}
+
 	backendNames := make(map[string]bool)
 	for _, b := range cfg.Backends {
 		if b.Name == "" {

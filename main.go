@@ -22,29 +22,42 @@ var (
 )
 
 func main() {
-	versionFlag := flag.Bool("version", false, "Print version and exit")
-	configPath := flag.String("config", "nvelox.yaml", "Path to configuration file")
-	flag.Parse()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(os.Args, ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string, ctx context.Context) error {
+	fs := flag.NewFlagSet("nvelox", flag.ContinueOnError)
+	versionFlag := fs.Bool("version", false, "Print version and exit")
+	configPath := fs.String("config", "nvelox.yaml", "Path to configuration file")
+
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
 
 	if *versionFlag {
 		fmt.Printf("nvelox %s\n", Version)
-		os.Exit(0)
+		return nil
 	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		return fmt.Errorf("failed to load config: %v", err)
 	}
 
 	// Init Logger
 	if err := logging.Init(cfg.Logging.Level, cfg.Logging.AccessLog, cfg.Logging.ErrorLog); err != nil {
-		log.Fatalf("Failed to init logger: %v", err)
+		return fmt.Errorf("failed to init logger: %v", err)
 	}
 	logging.Info("Nvelox Server %s starting...", Version)
 	logging.Info("Loaded configuration from %s", *configPath)
 
 	// Expand port ranges in listeners
-	// The implementation plan states we should iterate ranges and create distinct listeners.
 	expandedListeners := make([]*core.ListenerConfig, 0)
 
 	for _, l := range cfg.Listeners {
@@ -62,12 +75,6 @@ func main() {
 			end, _ := strconv.Atoi(parts[1])
 
 			for p := start; p <= end; p++ {
-				// Copy listener default backend logic for range
-				// Check backend to see if it needs port mapping
-
-				// Re-lookup backend to check for implicit IP-only servers?
-				// The Handler does dynamic lookup, so we just pass the names.
-
 				expandedListeners = append(expandedListeners, &core.ListenerConfig{
 					Name:           fmt.Sprintf("%s-%d", l.Name, p),
 					Addr:           fmt.Sprintf("%s:%d", host, p),
@@ -94,17 +101,27 @@ func main() {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = expandedListeners
 
+	errCh := make(chan error, 1)
 	go func() {
-		if err := engine.Start(context.Background()); err != nil {
-			log.Fatalf("Engine stopped: %v", err)
+		if err := engine.Start(ctx); err != nil {
+			errCh <- err
 		}
+		close(errCh)
 	}()
 
-	// Wait for interrupt
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
-	log.Println("Shutting down...")
+	select {
+	case <-ctx.Done():
+		log.Println("Shutting down...")
+		return nil // Success exit (cancelled by context)
+	case err := <-errCh:
+		if err == context.Canceled {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("engine stopped: %v", err)
+		}
+		return nil
+	}
 }
 
 func splitHostPort(addr string) (string, string, error) {
