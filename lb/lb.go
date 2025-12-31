@@ -74,7 +74,8 @@ func (b *RoundRobin) Next() (string, error) {
 	}
 
 	next := atomic.AddUint64(&b.current, 1)
-	return b.healthy[next%uint64(len(b.healthy))], nil
+	idx := (next - 1) % uint64(len(b.healthy))
+	return b.healthy[idx], nil
 }
 
 func (b *RoundRobin) UpdateStatus(server string, healthy bool) {
