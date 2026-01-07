@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"nvelox/config"
 	"nvelox/core/logging"
 
 	"github.com/lesismal/nbio"
@@ -110,6 +111,9 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 		return
 	}
 
+	// Get backend config to check SendProxyV2
+	backend := h.engine.Backends[l.DefaultBackend]
+
 	target, err := balancer.Next()
 	if err != nil {
 		logging.Error("Balancer '%s' error: %v", l.DefaultBackend, err)
@@ -125,11 +129,11 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 	if l.Protocol == "udp" {
 		h.connectBackendUDP(clientConn, target)
 	} else {
-		h.connectBackendTCP(clientConn, target, l)
+		h.connectBackendTCP(clientConn, target, backend)
 	}
 }
 
-func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target string, listenerCfg *ListenerConfig) {
+func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target string, backend *config.Backend) {
 	go func() {
 		// Dial backend synchronously
 		backendConn, err := net.DialTimeout("tcp", target, 10*time.Second)
@@ -139,8 +143,8 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 			return
 		}
 
-		// Send PROXY protocol v2 header if enabled
-		if listenerCfg != nil && listenerCfg.SendProxyV2 {
+		// Send PROXY protocol v2 header if enabled on backend
+		if backend != nil && backend.SendProxyV2 {
 			header := proxyproto.HeaderProxyFromAddrs(2, clientConn.RemoteAddr(), backendConn.LocalAddr())
 			if _, err := header.WriteTo(backendConn); err != nil {
 				logging.Error("Failed to write PROXY v2 header: %v", err)
@@ -148,7 +152,7 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 				clientConn.Close()
 				return
 			}
-			logging.Info("Sent PROXY v2 header for client %s", clientConn.RemoteAddr())
+			logging.Info("Sent PROXY v2 header for client %s -> %s", clientConn.RemoteAddr(), target)
 		}
 
 		// Link client to backend
