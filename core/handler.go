@@ -184,49 +184,40 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 		return
 	}
 
-	// NBIO UDP Client Polling is proving unstable in tests, so we use a Hybrid approach for UDP Backend:
-	// 1. Resolve & Dial UDP
-	raddr, err := net.ResolveUDPAddr("udp", target)
-	if err != nil {
-		logging.Error("UDP Resolve failed: %v", err)
-		clientConn.Close()
-		return
-	}
-
-	uc, err := net.DialUDP("udp", nil, raddr)
-	if err != nil {
-		logging.Error("UDP Dial failed: %v", err)
-		clientConn.Close()
-		return
-	}
-
-	// 2. Link Session
-	h.setupSession(clientConn, uc)
-
-	// 3. Start Goroutine to pump data from Backend -> Client
-	go func() {
-		defer uc.Close()
-		buf := make([]byte, 4096)
-		for {
-			// Keep client alive check? NBIO handles client timeout on its own if configured.
-			uc.SetReadDeadline(time.Now().Add(60 * time.Second))
-			n, err := uc.Read(buf)
-			if err != nil {
-				// Backend closed or error
-				logging.Debug("UDP Backend read error: %v", err)
-				clientConn.Close()
-				return
-			}
-
-			// Forward to client (nbio conn is thread safe for Write)
-			_, err = clientConn.Write(buf[:n])
-			if err != nil {
-				logging.Debug("UDP Client write error: %v", err)
-				clientConn.Close()
-				return
-			}
+	h.engine.UDPEngine.DialAsync("udp", target, func(backendConn *nbio.Conn, err error) {
+		if err != nil {
+			logging.Error("Backend UDP dial failed: %v", err)
+			clientConn.Close()
+			return
 		}
-	}()
+
+		// CRITICAL: Set session on backend IMMEDIATELY in callback
+		backendCtx := &ConnContext{
+			IsBackend: true,
+			PeerConn:  clientConn,
+			StartTime: time.Now(),
+		}
+		backendConn.SetSession(backendCtx)
+
+		// Link client to backend
+		clientCtx := clientConn.Session().(*ConnContext)
+		clientCtx.Mu.Lock()
+		clientCtx.PeerConn = backendConn
+
+		// Flush any buffered data
+		if len(clientCtx.Buffer) > 0 {
+			_, writeErr := backendConn.Write(clientCtx.Buffer)
+			if writeErr != nil {
+				logging.Error("Failed to flush UDP buffer: %v", writeErr)
+				clientCtx.Mu.Unlock()
+				clientConn.Close()
+				backendConn.Close()
+				return
+			}
+			clientCtx.Buffer = nil
+		}
+		clientCtx.Mu.Unlock()
+	})
 }
 
 func (h *ProxyEventHandler) setupSession(client *nbio.Conn, backend net.Conn) {
