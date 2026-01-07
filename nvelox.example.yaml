@@ -2,6 +2,7 @@
 # Main Configuration File
 
 # Server Settings
+version: "2"
 server:
   user: "nvelox"
   group: "nvelox"

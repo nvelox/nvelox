@@ -83,6 +83,7 @@ Nvelox uses a YAML configuration file.
 ### Example `nvelox.yaml`
 
 ```yaml
+version: "2"
 # Server Settings
 server:
   user: "nvelox"

@@ -1,3 +1,4 @@
+version: "2"
 listeners:
   - name: "debug-listener"
     bind: ":9000"
