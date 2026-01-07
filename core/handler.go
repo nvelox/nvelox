@@ -9,6 +9,7 @@ import (
 	"nvelox/core/logging"
 
 	"github.com/lesismal/nbio"
+	"github.com/pires/go-proxyproto"
 )
 
 type ProxyEventHandler struct {
@@ -124,11 +125,11 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 	if l.Protocol == "udp" {
 		h.connectBackendUDP(clientConn, target)
 	} else {
-		h.connectBackendTCP(clientConn, target)
+		h.connectBackendTCP(clientConn, target, l)
 	}
 }
 
-func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target string) {
+func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target string, listenerCfg *ListenerConfig) {
 	go func() {
 		// Dial backend synchronously
 		backendConn, err := net.DialTimeout("tcp", target, 10*time.Second)
@@ -136,6 +137,18 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 			logging.Error("Backend TCP dial failed: %v", err)
 			clientConn.Close()
 			return
+		}
+
+		// Send PROXY protocol v2 header if enabled
+		if listenerCfg != nil && listenerCfg.SendProxyV2 {
+			header := proxyproto.HeaderProxyFromAddrs(2, clientConn.RemoteAddr(), backendConn.LocalAddr())
+			if _, err := header.WriteTo(backendConn); err != nil {
+				logging.Error("Failed to write PROXY v2 header: %v", err)
+				backendConn.Close()
+				clientConn.Close()
+				return
+			}
+			logging.Info("Sent PROXY v2 header for client %s", clientConn.RemoteAddr())
 		}
 
 		// Link client to backend

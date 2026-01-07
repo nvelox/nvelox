@@ -30,6 +30,7 @@ type ListenerConfig struct {
 	Protocol       string
 	ZeroCopy       bool
 	DefaultBackend string
+	SendProxyV2    bool // Send PROXY protocol v2 to backend
 	Port           int
 }
 
