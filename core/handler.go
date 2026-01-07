@@ -62,7 +62,6 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 		StartTime: time.Now(),
 	}
 	c.SetSession(clientCtx)
-	logging.Debug("[TRACE] OnOpen: Linked session, connecting backend...")
 
 	h.connectBackend(c, l)
 }
@@ -79,16 +78,12 @@ func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
 
 	if !ctx.IsBackend {
 		logging.Info("[CONN] Closed %s (Dur: %v, Err: %v)", c.RemoteAddr(), time.Since(ctx.StartTime), err)
-	} else {
-		logging.Info("[TRACE] Backend Closed %s (Err: %v)", c.RemoteAddr(), err)
 	}
 }
 
 func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
-	logging.Debug("[DATA] Len %d from %s", len(data), c.RemoteAddr())
 	ctx, ok := c.Session().(*ConnContext)
 	if !ok || ctx == nil {
-		logging.Debug("[DATA] No session for %s", c.RemoteAddr())
 		return
 	}
 
@@ -110,7 +105,6 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 	balancer, ok := h.engine.Balancers[l.DefaultBackend]
 	if !ok {
 		logging.Error("Balancer '%s' not found for listener '%s'", l.DefaultBackend, l.Name)
-		logging.Debug("Closing client %s due to missing balancer", clientConn.RemoteAddr())
 		clientConn.Close()
 		return
 	}
@@ -118,12 +112,9 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 	target, err := balancer.Next()
 	if err != nil {
 		logging.Error("Balancer '%s' error: %v", l.DefaultBackend, err)
-		logging.Debug("Closing client %s due to balancer error", clientConn.RemoteAddr())
 		clientConn.Close()
 		return
 	}
-
-	logging.Debug("[TRACE] Selected target: %s", target)
 
 	if _, _, err := net.SplitHostPort(target); err != nil {
 		// Valid assumption: missing port, use listener port (1:1 mapping)
@@ -138,27 +129,16 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 }
 
 func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target string) {
-	if h.engine.TCPEngine == nil {
-		return
-	}
-
-	h.engine.TCPEngine.DialAsync("tcp", target, func(backendConn *nbio.Conn, err error) {
+	go func() {
+		// Dial backend synchronously
+		backendConn, err := net.DialTimeout("tcp", target, 10*time.Second)
 		if err != nil {
 			logging.Error("Backend TCP dial failed: %v", err)
 			clientConn.Close()
 			return
 		}
 
-		// CRITICAL: Set session on backend IMMEDIATELY in callback
-		// This happens BEFORE NBIO polls this connection for events
-		backendCtx := &ConnContext{
-			IsBackend: true,
-			PeerConn:  clientConn,
-			StartTime: time.Now(),
-		}
-		backendConn.SetSession(backendCtx)
-
-		// Now link client to backend
+		// Link client to backend
 		clientCtx := clientConn.Session().(*ConnContext)
 		clientCtx.Mu.Lock()
 		clientCtx.PeerConn = backendConn
@@ -176,28 +156,43 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 			clientCtx.Buffer = nil
 		}
 		clientCtx.Mu.Unlock()
-	})
+
+		// Read from backend and write to client
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := backendConn.Read(buf)
+			if err != nil {
+				backendConn.Close()
+				clientConn.Close()
+				return
+			}
+
+			_, err = clientConn.Write(buf[:n])
+			if err != nil {
+				backendConn.Close()
+				clientConn.Close()
+				return
+			}
+		}
+	}()
 }
 
 func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target string) {
-	if h.engine.UDPEngine == nil {
-		return
-	}
-
-	h.engine.UDPEngine.DialAsync("udp", target, func(backendConn *nbio.Conn, err error) {
+	go func() {
+		// Resolve and dial UDP
+		raddr, err := net.ResolveUDPAddr("udp", target)
 		if err != nil {
-			logging.Error("Backend UDP dial failed: %v", err)
+			logging.Error("UDP Resolve failed: %v", err)
 			clientConn.Close()
 			return
 		}
 
-		// CRITICAL: Set session on backend IMMEDIATELY in callback
-		backendCtx := &ConnContext{
-			IsBackend: true,
-			PeerConn:  clientConn,
-			StartTime: time.Now(),
+		backendConn, err := net.DialUDP("udp", nil, raddr)
+		if err != nil {
+			logging.Error("UDP Dial failed: %v", err)
+			clientConn.Close()
+			return
 		}
-		backendConn.SetSession(backendCtx)
 
 		// Link client to backend
 		clientCtx := clientConn.Session().(*ConnContext)
@@ -217,37 +212,26 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 			clientCtx.Buffer = nil
 		}
 		clientCtx.Mu.Unlock()
-	})
-}
 
-func (h *ProxyEventHandler) setupSession(client *nbio.Conn, backend net.Conn) {
-	backendCtx := &ConnContext{
-		IsBackend: true,
-		PeerConn:  client,
-	}
-	// If backend is *nbio.Conn, set session. If UDPConn, we can't set session on it (it's raw).
-	// But we need to set session on CLIENT to point to backend.
-	if nbioBackend, ok := backend.(*nbio.Conn); ok {
-		nbioBackend.SetSession(backendCtx)
-	}
+		// Read from backend and write to client
+		buf := make([]byte, 4096)
+		for {
+			backendConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			n, err := backendConn.Read(buf)
+			if err != nil {
+				backendConn.Close()
+				clientConn.Close()
+				return
+			}
 
-	clientCtx := client.Session().(*ConnContext)
-
-	clientCtx.Mu.Lock()
-	defer clientCtx.Mu.Unlock()
-	clientCtx.PeerConn = backend
-
-	// Flush Buffer
-	if len(clientCtx.Buffer) > 0 {
-		_, err := backend.Write(clientCtx.Buffer)
-		if err != nil {
-			logging.Error("Failed to flush buffer to backend: %v", err)
-			logging.Debug("Closing client %s due to flush error", client.RemoteAddr())
-			client.Close()
-			return
+			_, err = clientConn.Write(buf[:n])
+			if err != nil {
+				backendConn.Close()
+				clientConn.Close()
+				return
+			}
 		}
-		clientCtx.Buffer = nil // Clear buffer
-	}
+	}()
 }
 
 func (h *ProxyEventHandler) findListener(localAddr string) *ListenerConfig {
@@ -256,24 +240,4 @@ func (h *ProxyEventHandler) findListener(localAddr string) *ListenerConfig {
 		return l
 	}
 	return nil
-}
-
-// setupSessionTCP links client to a standard net.Conn backend (not NBIO conn)
-func (h *ProxyEventHandler) setupSessionTCP(client *nbio.Conn, backend net.Conn) {
-	clientCtx := client.Session().(*ConnContext)
-
-	clientCtx.Mu.Lock()
-	defer clientCtx.Mu.Unlock()
-	clientCtx.PeerConn = backend
-
-	// Flush Buffer
-	if len(clientCtx.Buffer) > 0 {
-		_, err := backend.Write(clientCtx.Buffer)
-		if err != nil {
-			logging.Error("Failed to flush buffer to backend: %v", err)
-			client.Close()
-			return
-		}
-		clientCtx.Buffer = nil
-	}
 }
