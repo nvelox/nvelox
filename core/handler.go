@@ -2,6 +2,7 @@ package core
 
 import (
 	"net"
+	"sync"
 	"time"
 
 	"nvelox/core/logging"
@@ -32,6 +33,8 @@ type ConnContext struct {
 	IsBackend bool
 	PeerConn  net.Conn
 	StartTime time.Time
+	Buffer    []byte // Buffer for data received before backend is connected
+	Mu        sync.Mutex
 }
 
 func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
@@ -84,11 +87,17 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 		return
 	}
 
+	ctx.Mu.Lock()
 	if ctx.PeerConn != nil {
+		ctx.Mu.Unlock()
 		_, err := ctx.PeerConn.Write(data)
 		if err != nil {
 			logging.Error("[DATA] Write failed: %v", err)
 		}
+	} else {
+		// Buffer data until backend connects
+		ctx.Buffer = append(ctx.Buffer, data...)
+		ctx.Mu.Unlock()
 	}
 }
 
@@ -193,7 +202,21 @@ func (h *ProxyEventHandler) setupSession(client *nbio.Conn, backend net.Conn) {
 	}
 
 	clientCtx := client.Session().(*ConnContext)
+
+	clientCtx.Mu.Lock()
+	defer clientCtx.Mu.Unlock()
 	clientCtx.PeerConn = backend
+
+	// Flush Buffer
+	if len(clientCtx.Buffer) > 0 {
+		_, err := backend.Write(clientCtx.Buffer)
+		if err != nil {
+			logging.Error("Failed to flush buffer to backend: %v", err)
+			client.Close()
+			return
+		}
+		clientCtx.Buffer = nil // Clear buffer
+	}
 }
 
 func (h *ProxyEventHandler) findListener(localAddr string) *ListenerConfig {
