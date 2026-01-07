@@ -52,7 +52,7 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 	if l == nil {
 		// If no listener found, it's likely a Backend connection (DialAsync).
 		// Do not close it; let DialAsync callback handle it.
-		// logging.Debug("[TRACE] OnOpen: Ignoring backend connection %s", c.RemoteAddr())
+		logging.Info("[TRACE] OnOpen: Ignoring backend connection %s (No listener match)", c.LocalAddr())
 		return
 	}
 
@@ -80,6 +80,8 @@ func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
 
 	if !ctx.IsBackend {
 		logging.Info("[CONN] Closed %s (Dur: %v, Err: %v)", c.RemoteAddr(), time.Since(ctx.StartTime), err)
+	} else {
+		logging.Info("[TRACE] Backend Closed %s (Err: %v)", c.RemoteAddr(), err)
 	}
 }
 
@@ -137,22 +139,40 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 }
 
 func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target string) {
-	if h.engine.TCPEngine == nil {
-		return
-	}
-	h.engine.TCPEngine.DialAsync("tcp", target, func(c *nbio.Conn, err error) {
-		logging.Debug("[TRACE] DialAsync callback: err=%v", err)
+	// Use hybrid approach: standard net.Dial + goroutine for backend read
+	// This avoids NBIO DialAsync race conditions that cause immediate connection closure
+	go func() {
+		// 1. Dial backend synchronously
+		backendConn, err := net.DialTimeout("tcp", target, 10*time.Second)
 		if err != nil {
 			logging.Error("Backend TCP dial failed: %v", err)
-			if clientConn != nil {
-				logging.Debug("Closing client %s due to dial error", clientConn.RemoteAddr())
-				clientConn.Close()
-			}
+			clientConn.Close()
 			return
 		}
 
-		h.setupSession(clientConn, c)
-	})
+		// 2. Link session (client -> backend direction via NBIO OnData)
+		h.setupSessionTCP(clientConn, backendConn)
+
+		// 3. Read from backend and write to client (backend -> client direction)
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := backendConn.Read(buf)
+			if err != nil {
+				logging.Debug("Backend read error: %v", err)
+				backendConn.Close()
+				clientConn.Close()
+				return
+			}
+
+			_, err = clientConn.Write(buf[:n])
+			if err != nil {
+				logging.Debug("Client write error: %v", err)
+				backendConn.Close()
+				clientConn.Close()
+				return
+			}
+		}
+	}()
 }
 
 func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target string) {
@@ -241,4 +261,24 @@ func (h *ProxyEventHandler) findListener(localAddr string) *ListenerConfig {
 		return l
 	}
 	return nil
+}
+
+// setupSessionTCP links client to a standard net.Conn backend (not NBIO conn)
+func (h *ProxyEventHandler) setupSessionTCP(client *nbio.Conn, backend net.Conn) {
+	clientCtx := client.Session().(*ConnContext)
+
+	clientCtx.Mu.Lock()
+	defer clientCtx.Mu.Unlock()
+	clientCtx.PeerConn = backend
+
+	// Flush Buffer
+	if len(clientCtx.Buffer) > 0 {
+		_, err := backend.Write(clientCtx.Buffer)
+		if err != nil {
+			logging.Error("Failed to flush buffer to backend: %v", err)
+			client.Close()
+			return
+		}
+		clientCtx.Buffer = nil
+	}
 }
