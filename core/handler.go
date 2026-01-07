@@ -1,6 +1,7 @@
 package core
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -114,6 +115,11 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 		logging.Error("Balancer '%s' error: %v", l.DefaultBackend, err)
 		clientConn.Close()
 		return
+	}
+
+	if _, _, err := net.SplitHostPort(target); err != nil {
+		// Valid assumption: missing port, use listener port (1:1 mapping)
+		target = fmt.Sprintf("%s:%d", target, l.Port)
 	}
 
 	if l.Protocol == "udp" {
