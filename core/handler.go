@@ -95,12 +95,14 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerConfig) {
 	balancer, ok := h.engine.Balancers[l.DefaultBackend]
 	if !ok {
+		logging.Error("Balancer '%s' not found for listener '%s'", l.DefaultBackend, l.Name)
 		clientConn.Close()
 		return
 	}
 
 	target, err := balancer.Next()
 	if err != nil {
+		logging.Error("Balancer '%s' error: %v", l.DefaultBackend, err)
 		clientConn.Close()
 		return
 	}
