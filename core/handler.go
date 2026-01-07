@@ -50,9 +50,8 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 
 	l := h.findListener(c.LocalAddr().String())
 	if l == nil {
-		// If no listener found, it's likely a Backend connection (DialAsync).
-		// Do not close it; let DialAsync callback handle it.
-		logging.Info("[TRACE] OnOpen: Ignoring backend connection %s (No listener match)", c.LocalAddr())
+		// Backend connections from DialAsync already have session set in callback.
+		// If we get here with no session and no listener, just ignore.
 		return
 	}
 
@@ -139,40 +138,45 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 }
 
 func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target string) {
-	// Use hybrid approach: standard net.Dial + goroutine for backend read
-	// This avoids NBIO DialAsync race conditions that cause immediate connection closure
-	go func() {
-		// 1. Dial backend synchronously
-		backendConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if h.engine.TCPEngine == nil {
+		return
+	}
+
+	h.engine.TCPEngine.DialAsync("tcp", target, func(backendConn *nbio.Conn, err error) {
 		if err != nil {
 			logging.Error("Backend TCP dial failed: %v", err)
 			clientConn.Close()
 			return
 		}
 
-		// 2. Link session (client -> backend direction via NBIO OnData)
-		h.setupSessionTCP(clientConn, backendConn)
-
-		// 3. Read from backend and write to client (backend -> client direction)
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := backendConn.Read(buf)
-			if err != nil {
-				logging.Debug("Backend read error: %v", err)
-				backendConn.Close()
-				clientConn.Close()
-				return
-			}
-
-			_, err = clientConn.Write(buf[:n])
-			if err != nil {
-				logging.Debug("Client write error: %v", err)
-				backendConn.Close()
-				clientConn.Close()
-				return
-			}
+		// CRITICAL: Set session on backend IMMEDIATELY in callback
+		// This happens BEFORE NBIO polls this connection for events
+		backendCtx := &ConnContext{
+			IsBackend: true,
+			PeerConn:  clientConn,
+			StartTime: time.Now(),
 		}
-	}()
+		backendConn.SetSession(backendCtx)
+
+		// Now link client to backend
+		clientCtx := clientConn.Session().(*ConnContext)
+		clientCtx.Mu.Lock()
+		clientCtx.PeerConn = backendConn
+
+		// Flush any buffered data
+		if len(clientCtx.Buffer) > 0 {
+			_, writeErr := backendConn.Write(clientCtx.Buffer)
+			if writeErr != nil {
+				logging.Error("Failed to flush buffer: %v", writeErr)
+				clientCtx.Mu.Unlock()
+				clientConn.Close()
+				backendConn.Close()
+				return
+			}
+			clientCtx.Buffer = nil
+		}
+		clientCtx.Mu.Unlock()
+	})
 }
 
 func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target string) {
