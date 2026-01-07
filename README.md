@@ -4,20 +4,20 @@
 
 # Nvelox
 
-**High-Performance L4 Load Balancer & Proxy (Go + gnet)**
+**High-Performance L4 Load Balancer & Proxy (Go + nbio)**
 
-Nvelox is a lightweight, high-performance TCP/UDP load balancer and proxy server written in Go, powered by [gnet](https://github.com/panjf2000/gnet). It is designed to handle high concurrency with minimal resource usage, offering features similar to HAProxy but with a simplified configuration and modern Go architecture.
+Nvelox is a lightweight, high-performance TCP/UDP load balancer and proxy server written in Go, powered by [nbio](https://github.com/lesismal/nbio). It is designed to handle high concurrency with minimal resource usage, offering features similar to HAProxy but with a simplified configuration and modern Go architecture.
 
 ## Why Nvelox?
 
 * **Massive Scale:** Bind to 10,000+ ports without the overhead of 10,000+ OS threads.
 * **UDP Session Awareness:** Unlike raw UDP proxies, Nvelox maintains state to ensure consistent routing for datagram streams.
-* **Modern Core:** Built on `gnet` for Linux/epoll and macOS/kqueue performance.
+* **Modern Core:** Built on `nbio` for Linux/epoll and macOS/kqueue performance.
 * **Port Range Mastery:** Efficiency bind thousands of ports with a single config line.
 
 ## Features
 
-- **High Performance**: Built on an event-driven networking engine (Reactor pattern) via `gnet`, minimizing goroutine overhead.
+- **High Performance**: Built on an event-driven networking engine (Reactor pattern) via `nbio`, minimizing goroutine overhead.
 - **Port Ranges**: Efficiently bind to thousands of ports (e.g., `10000-20000`) with a single configuration line.
   > **Note:** When using port ranges, the **destination port is preserved** if a specific backend port is not mapped. This is ideal for gaming and VoIP applications requiring direct 1:1 port mapping.
 - **Load Balancing**: Supports `roundrobin`, `leastconn`, and `random`.
@@ -28,13 +28,13 @@ Nvelox is a lightweight, high-performance TCP/UDP load balancer and proxy server
 
 ## Architecture
 
-Nvelox uses `gnet` to run an event loop on each listener, handling thousands of concurrent connections efficiently.
+Nvelox uses `nbio` to run an event loop on each listener, handling thousands of concurrent connections efficiently.
 
 ```mermaid
 graph TD
     Client(Clients) -->|TCP/UDP| Listeners
     subgraph Nvelox Node
-        Listeners -->|Accepted| EventLoop{gnet Event Loop}
+        Listeners -->|Accepted| EventLoop{nbio Event Loop}
         EventLoop -->|Session Ctx| LB[Load Balancer]
         LB -->|Select| BackendConn[Backend Connection]
     end
@@ -48,7 +48,7 @@ graph TD
 
 | Feature | Nvelox | HAProxy | Nginx |
 | :--- | :--- | :--- | :--- |
-| **Architecture** | **Event-Driven (Go/gnet/epoll)** | Event-Driven (C/epoll) | Event-Driven (C/epoll) |
+| **Architecture** | **Event-Driven (Go/nbio/epoll)** | Event-Driven (C/epoll) | Event-Driven (C/epoll) |
 | **Concurrency Model** | Reactors (Internal Event Loops) | Process-based (Single/Multi-process) | Process-based (Worker Processes) |
 | **Port Binding** | **Range-Optimized (10k ports in <1s)** | Individual Binds (Slow for 10k+) | Individual Binds (Config hell) |
 | **UDP Mode** | **Session-Aware (Stickiness)** | Datagram/Stream | Datagram |
