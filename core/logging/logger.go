@@ -55,7 +55,7 @@ func Init(logLevel string, accessPath, errorPath string) error {
 		if err != nil {
 			return fmt.Errorf("failed to open error log: %w", err)
 		}
-		errWriter = io.MultiWriter(os.Stderr, f)
+		errWriter = f
 	}
 	errorLog = log.New(errWriter, "", log.LstdFlags) // Prefix handled in helpers
 
