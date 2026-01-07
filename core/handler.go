@@ -61,6 +61,7 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 		StartTime: time.Now(),
 	}
 	c.SetSession(clientCtx)
+	logging.Debug("[TRACE] OnOpen: Linked session, connecting backend...")
 
 	h.connectBackend(c, l)
 }
@@ -117,6 +118,8 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 		return
 	}
 
+	logging.Debug("[TRACE] Selected target: %s", target)
+
 	if _, _, err := net.SplitHostPort(target); err != nil {
 		// Valid assumption: missing port, use listener port (1:1 mapping)
 		target = fmt.Sprintf("%s:%d", target, l.Port)
@@ -134,6 +137,7 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 		return
 	}
 	h.engine.TCPEngine.DialAsync("tcp", target, func(c *nbio.Conn, err error) {
+		logging.Debug("[TRACE] DialAsync callback: err=%v", err)
 		if err != nil {
 			logging.Error("Backend TCP dial failed: %v", err)
 			if clientConn != nil {
