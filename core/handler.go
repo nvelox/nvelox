@@ -1,352 +1,203 @@
 package core
 
 import (
-	"fmt"
-	"io"
 	"net"
-	"sync"
 	"time"
 
 	"nvelox/core/logging"
-	"nvelox/proxy"
 
-	"github.com/panjf2000/gnet/v2"
-)
-
-const (
-	tcpDialTimeout = 5 * time.Second
-	udpReadTimeout = 60 * time.Second
-	copyBufferSize = 32 * 1024 // 32KB
-	udpBufferSize  = 4096      // 4KB
+	"github.com/lesismal/nbio"
 )
 
 type ProxyEventHandler struct {
-	gnet.BuiltinEventEngine
 	engine      *Engine
-	listenerMap map[string]*ListenerConfig // Addr -> Config
-
-	// UDP Session Table: remoteAddr(string) -> *net.UDPConn (for backend)
-	udpSessions sync.Map
+	listenerMap map[string]*ListenerConfig
 }
 
-// OnTraffic fires when data is available.
-func (h *ProxyEventHandler) OnTraffic(c gnet.Conn) (action gnet.Action) {
-	// Find listener for this connection
-	l := h.getListenerConfig(c)
-	if l == nil {
-		logging.Error("Unknown listener for connection on %s", c.LocalAddr())
-		return gnet.Close
+func NewProxyEventHandler(e *Engine) *ProxyEventHandler {
+	lm := make(map[string]*ListenerConfig)
+	for _, l := range e.Listeners {
+		_, port, _ := net.SplitHostPort(l.Addr)
+		lm[":"+port] = l
+		lm[l.Addr] = l
 	}
 
-	if l.Protocol == "udp" {
-		return h.handleUDP(c, l)
+	return &ProxyEventHandler{
+		engine:      e,
+		listenerMap: lm,
 	}
-	return h.handleTCP(c, l)
-}
-
-// OnBoot fires when the engine starts.
-func (h *ProxyEventHandler) OnBoot(eng gnet.Engine) (action gnet.Action) {
-	logging.Info("Shared Server Engine Started")
-	return gnet.None
-}
-
-// OnOpen fires when a new connection is opened.
-func (h *ProxyEventHandler) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
-	l := h.getListenerConfig(c)
-	if l == nil {
-		logging.Error("Unknown listener for connection on %s", c.LocalAddr())
-		return nil, gnet.Close
-	}
-
-	logging.Info("[CONN] New connection from %s on %s (Listener: %s)", c.RemoteAddr(), c.LocalAddr(), l.Name)
-
-	ctx := &ConnContext{
-		StartTime: time.Now(),
-		buffer:    make([]byte, 0),
-	}
-	c.SetContext(ctx)
-
-	// Initiate connection to backend asynchronously
-	go h.connectBackend(c, ctx, l)
-
-	return nil, gnet.None
-}
-
-func (h *ProxyEventHandler) getListenerConfig(c gnet.Conn) *ListenerConfig {
-	// Address matching logic via "proto:port" key
-	if c.LocalAddr() == nil {
-		return nil
-	}
-
-	_, port, err := net.SplitHostPort(c.LocalAddr().String())
-	if err != nil {
-		return nil
-	}
-
-	// Normalize network (tcp4/tcp6 -> tcp)
-	netType := c.LocalAddr().Network()
-	proto := "tcp"
-	if len(netType) >= 3 && netType[:3] == "udp" {
-		proto = "udp"
-	}
-
-	key := fmt.Sprintf("%s:%s", proto, port)
-
-	if l, ok := h.listenerMap[key]; ok {
-		return l
-	}
-
-	return nil
-}
-
-// OnClose fires when a connection is closed.
-func (h *ProxyEventHandler) OnClose(c gnet.Conn, err error) (action gnet.Action) {
-	duration := time.Duration(0)
-	if val := c.Context(); val != nil {
-		if ctx, ok := val.(*ConnContext); ok {
-			duration = time.Since(ctx.StartTime)
-			ctx.mu.Lock()
-			if ctx.BackendConn != nil {
-				ctx.BackendConn.Close()
-			}
-			ctx.closed = true // Mark as closed to stop dialer updates
-			ctx.mu.Unlock()
-		}
-	} else if conn, ok := c.Context().(net.Conn); ok {
-		conn.Close()
-	}
-
-	logging.Info("[CONN] Closed connection from %s (Duration: %v, Err: %v)", c.RemoteAddr(), duration, err)
-	return gnet.None
 }
 
 type ConnContext struct {
-	BackendConn net.Conn
-	StartTime   time.Time
-
-	mu        sync.Mutex
-	buffer    []byte
-	connected bool
-	closed    bool
+	IsBackend bool
+	PeerConn  net.Conn
+	StartTime time.Time
 }
 
-func (h *ProxyEventHandler) connectBackend(c gnet.Conn, ctx *ConnContext, l *ListenerConfig) {
-	backendName := l.DefaultBackend
-	balancer, ok := h.engine.Balancers[backendName]
-	if !ok {
-		logging.Error("[ERR] backend not found: %s", backendName)
+func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
+	if c.Session() != nil {
+		return
+	}
+
+	// LocalAddr might be nil for some UDP edge cases?
+	if c.LocalAddr() == nil {
+		return
+	}
+
+	l := h.findListener(c.LocalAddr().String())
+	if l == nil {
 		c.Close()
+		return
+	}
+
+	logging.Info("[CONN] New %s client %s -> %s", l.Protocol, c.RemoteAddr(), c.LocalAddr())
+
+	clientCtx := &ConnContext{
+		IsBackend: false,
+		StartTime: time.Now(),
+	}
+	c.SetSession(clientCtx)
+
+	h.connectBackend(c, l)
+}
+
+func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
+	ctx, ok := c.Session().(*ConnContext)
+	if !ok || ctx == nil {
+		return
+	}
+
+	if ctx.PeerConn != nil {
+		ctx.PeerConn.Close()
+	}
+
+	if !ctx.IsBackend {
+		logging.Info("[CONN] Closed %s (Dur: %v, Err: %v)", c.RemoteAddr(), time.Since(ctx.StartTime), err)
+	}
+}
+
+func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
+	logging.Debug("[DATA] Len %d from %s", len(data), c.RemoteAddr())
+	ctx, ok := c.Session().(*ConnContext)
+	if !ok || ctx == nil {
+		logging.Debug("[DATA] No session for %s", c.RemoteAddr())
+		return
+	}
+
+	if ctx.PeerConn != nil {
+		_, err := ctx.PeerConn.Write(data)
+		if err != nil {
+			logging.Error("[DATA] Write failed: %v", err)
+		}
+	}
+}
+
+func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerConfig) {
+	balancer, ok := h.engine.Balancers[l.DefaultBackend]
+	if !ok {
+		clientConn.Close()
 		return
 	}
 
 	target, err := balancer.Next()
 	if err != nil {
-		logging.Error("[ERR] failed to pick backend: %v", err)
-		h.safeClose(c, ctx)
+		clientConn.Close()
 		return
 	}
 
-	// If target has no port (e.g. "10.0.0.103"), assume 1:1 mapping and append listener port
-	if _, _, err := net.SplitHostPort(target); err != nil {
-		// Verify if it's missing port error or something else
-		// "missing port in address" is the typical error
-		target = fmt.Sprintf("%s:%d", target, l.Port)
+	if l.Protocol == "udp" {
+		h.connectBackendUDP(clientConn, target)
+	} else {
+		h.connectBackendTCP(clientConn, target)
 	}
-
-	// Blocking dial
-	rc, err := net.DialTimeout("tcp", target, tcpDialTimeout)
-	if err != nil {
-		logging.Error("[ERR] backend connect failed: %v", err)
-		h.safeClose(c, ctx)
-		return
-	}
-
-	ctx.mu.Lock()
-	if ctx.closed {
-		rc.Close()
-		ctx.mu.Unlock()
-		return
-	}
-	ctx.BackendConn = rc
-	ctx.connected = true
-
-	// Flush buffer
-	if len(ctx.buffer) > 0 {
-		_, err := rc.Write(ctx.buffer)
-		if err != nil {
-			logging.Error("[ERR] failed to flush buffer: %v", err)
-			rc.Close()
-			ctx.mu.Unlock()
-			h.safeClose(c, ctx)
-			return
-		}
-		ctx.buffer = nil // Clear buffer to free memory
-	}
-	ctx.mu.Unlock()
-
-	// Start Copy Backend -> Frontend
-	buf := make([]byte, copyBufferSize)
-	for {
-		n, err := rc.Read(buf)
-
-		if n > 0 {
-			// Copy data for safe async usage
-			data := make([]byte, n)
-			copy(data, buf[:n])
-
-			// Safe Write: Execute Write only if Context matches
-			errAsync := c.AsyncWrite(nil, func(c gnet.Conn, err error) error {
-				if c.Context() != ctx {
-					return nil // Stale connection, ignore
-				}
-				// If previous error?
-				if err != nil {
-					return err
-				}
-				_, writeErr := c.Write(data)
-				return writeErr
-			})
-
-			if errAsync != nil {
-				// gnet error (closed?)
-				break
-			}
-		}
-		if err != nil {
-			if err != io.EOF {
-				logging.Error("[CONN] Backend read error: %v", err)
-			}
-			break
-		}
-	}
-
-	// Backend finished
-	h.safeClose(c, ctx)
-
-	ctx.mu.Lock()
-	ctx.closed = true
-	ctx.mu.Unlock()
 }
 
-// safeClose closes the connection strictly via AsyncWrite to ensure thread safety and context identity.
-func (h *ProxyEventHandler) safeClose(c gnet.Conn, ctx *ConnContext) {
-	_ = c.AsyncWrite(nil, func(c gnet.Conn, err error) error {
-		if c.Context() != ctx {
-			return nil // Stale
+func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target string) {
+	if h.engine.TCPEngine == nil {
+		return
+	}
+	h.engine.TCPEngine.DialAsync("tcp", target, func(c *nbio.Conn, err error) {
+		if err != nil {
+			logging.Error("Backend TCP dial failed: %v", err)
+			if clientConn != nil {
+				clientConn.Close()
+			}
+			return
 		}
-		return c.Close()
+
+		h.setupSession(clientConn, c)
 	})
 }
 
-// handleTCP handles TCP traffic.
-func (h *ProxyEventHandler) handleTCP(c gnet.Conn, l *ListenerConfig) gnet.Action {
-	val := c.Context()
-	if val == nil {
-		// Should not happen if OnOpen works
-		return gnet.Close
-	}
-	ctx, ok := val.(*ConnContext)
-	if !ok {
-		return gnet.Close
+func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target string) {
+	if h.engine.UDPEngine == nil {
+		return
 	}
 
-	data, _ := c.Next(-1)
-	if len(data) == 0 {
-		return gnet.None
+	// NBIO UDP Client Polling is proving unstable in tests, so we use a Hybrid approach for UDP Backend:
+	// 1. Resolve & Dial UDP
+	raddr, err := net.ResolveUDPAddr("udp", target)
+	if err != nil {
+		logging.Error("UDP Resolve failed: %v", err)
+		clientConn.Close()
+		return
 	}
 
-	ctx.mu.Lock()
-	defer ctx.mu.Unlock()
+	uc, err := net.DialUDP("udp", nil, raddr)
+	if err != nil {
+		logging.Error("UDP Dial failed: %v", err)
+		clientConn.Close()
+		return
+	}
 
-	if ctx.connected {
-		// Fast path
-		_, err := ctx.BackendConn.Write(data)
-		if err != nil {
-			return gnet.Close
+	// 2. Link Session
+	h.setupSession(clientConn, uc)
+
+	// 3. Start Goroutine to pump data from Backend -> Client
+	go func() {
+		defer uc.Close()
+		buf := make([]byte, 4096)
+		for {
+			// Keep client alive check? NBIO handles client timeout on its own if configured.
+			uc.SetReadDeadline(time.Now().Add(60 * time.Second))
+			n, err := uc.Read(buf)
+			if err != nil {
+				// Backend closed or error
+				logging.Debug("UDP Backend read error: %v", err)
+				clientConn.Close()
+				return
+			}
+
+			// Forward to client (nbio conn is thread safe for Write)
+			_, err = clientConn.Write(buf[:n])
+			if err != nil {
+				logging.Debug("UDP Client write error: %v", err)
+				clientConn.Close()
+				return
+			}
 		}
-	} else {
-		// Buffer data
-		ctx.buffer = append(ctx.buffer, data...)
-	}
-
-	return gnet.None
+	}()
 }
 
-// handleUDP handles UDP traffic.
-func (h *ProxyEventHandler) handleUDP(c gnet.Conn, l *ListenerConfig) gnet.Action {
-	buf, _ := c.Next(-1)
-	if len(buf) == 0 {
-		return gnet.None
+func (h *ProxyEventHandler) setupSession(client *nbio.Conn, backend net.Conn) {
+	backendCtx := &ConnContext{
+		IsBackend: true,
+		PeerConn:  client,
+	}
+	// If backend is *nbio.Conn, set session. If UDPConn, we can't set session on it (it's raw).
+	// But we need to set session on CLIENT to point to backend.
+	if nbioBackend, ok := backend.(*nbio.Conn); ok {
+		nbioBackend.SetSession(backendCtx)
 	}
 
-	remoteAddr := c.RemoteAddr().String()
+	clientCtx := client.Session().(*ConnContext)
+	clientCtx.PeerConn = backend
+}
 
-	// Lookup session
-	var conn *net.UDPConn
-	v, ok := h.udpSessions.Load(remoteAddr)
-
-	isNewSession := false
-	if !ok {
-		isNewSession = true
-		// Resolve Backend
-		balancer, ok := h.engine.Balancers[l.DefaultBackend]
-		if !ok {
-			return gnet.None
-		}
-		backendName := l.DefaultBackend
-		bkConf, hasBE := h.engine.Backends[backendName]
-
-		target, err := balancer.Next()
-		if err != nil {
-			return gnet.None
-		}
-
-		raddr, err := net.ResolveUDPAddr("udp", target)
-		if err != nil {
-			return gnet.None
-		}
-
-		// Dial dial UDP to backend (creates connected socket)
-		loc, err := net.DialUDP("udp", nil, raddr)
-		if err != nil {
-			return gnet.None
-		}
-
-		conn = loc
-		h.udpSessions.Store(remoteAddr, conn)
-
-		// Start goroutine to copy back from Backend -> Frontend
-		// Note: UDP is stateless, so "Frontend" is `c`.
-		// gnet `c.Write` sends packet to `c.RemoteAddr`.
-		go func() {
-			defer conn.Close()
-			defer h.udpSessions.Delete(remoteAddr)
-
-			b := make([]byte, udpBufferSize)
-			// Read timeout for auto-cleanup
-			conn.SetReadDeadline(time.Now().Add(udpReadTimeout))
-
-			for {
-				n, _, err := conn.ReadFromUDP(b)
-				if err != nil {
-					break
-				}
-				// Write back to client
-				c.Write(b[:n])
-				conn.SetReadDeadline(time.Now().Add(udpReadTimeout))
-			}
-		}()
-
-		// Send PROXY header if configured
-		if hasBE && bkConf != nil && bkConf.SendProxyV2 && isNewSession {
-			_ = proxy.WriteProxyHeaderV2(conn, c.RemoteAddr(), c.LocalAddr())
-		}
-	} else {
-		conn = v.(*net.UDPConn)
+func (h *ProxyEventHandler) findListener(localAddr string) *ListenerConfig {
+	_, port, _ := net.SplitHostPort(localAddr)
+	if l, ok := h.listenerMap[":"+port]; ok {
+		return l
 	}
-
-	// Forward the payload
-	conn.Write(buf)
-
-	return gnet.None
+	return nil
 }

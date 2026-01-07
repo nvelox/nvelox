@@ -4,17 +4,19 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
 	"nvelox/config"
 	"nvelox/core/health"
 	"nvelox/core/logging"
 	"nvelox/lb"
 
-	"github.com/panjf2000/gnet/v2"
+	"github.com/lesismal/nbio"
 )
 
 type Engine struct {
-	gnet.BuiltinEventEngine
+	TCPEngine *nbio.Engine
+	UDPEngine *nbio.Engine
 	Listeners []*ListenerConfig
 	Config    *config.Config
 	Balancers map[string]lb.Balancer
@@ -43,26 +45,74 @@ func NewEngine(cfg *config.Config) *Engine {
 }
 
 func (e *Engine) Start(ctx context.Context) error {
-	// Initialize Backends & Health Checkers
+	// 1. Initialize Backends & Health Checkers
+	e.initBackends()
+
+	// 2. Setup Handler
+	handler := NewProxyEventHandler(e)
+
+	// 3. Setup TCP Engine
+	tcpAddrs := e.getAddrs("tcp")
+	if len(tcpAddrs) > 0 {
+		conf := nbio.Config{
+			Network:            "tcp",
+			Addrs:              tcpAddrs,
+			MaxWriteBufferSize: 6 * 1024 * 1024,
+		}
+		e.TCPEngine = nbio.NewEngine(conf)
+		e.TCPEngine.OnOpen(handler.OnOpen)
+		e.TCPEngine.OnData(handler.OnData)
+		e.TCPEngine.OnClose(handler.OnClose)
+
+		if err := e.TCPEngine.Start(); err != nil {
+			return fmt.Errorf("TCP Engine start failed: %v", err)
+		}
+		logging.Info("NBIO TCP Engine Started on %d listeners", len(tcpAddrs))
+	}
+
+	// 4. Setup UDP Engine
+	udpAddrs := e.getAddrs("udp")
+	if len(udpAddrs) > 0 {
+		conf := nbio.Config{
+			Network:        "udp",
+			Addrs:          udpAddrs,
+			UDPReadTimeout: 60 * time.Second,
+		}
+		e.UDPEngine = nbio.NewEngine(conf)
+		e.UDPEngine.OnOpen(handler.OnOpen)
+		e.UDPEngine.OnData(handler.OnData)
+		e.UDPEngine.OnClose(handler.OnClose)
+
+		if err := e.UDPEngine.Start(); err != nil {
+			return fmt.Errorf("UDP Engine start failed: %v", err)
+		}
+		logging.Info("NBIO UDP Engine Started on %d listeners", len(udpAddrs))
+	}
+
+	// 5. Wait for Context
+	<-ctx.Done()
+
+	logging.Info("Stopping NBIO Engines...")
+	if e.TCPEngine != nil {
+		e.TCPEngine.Stop()
+	}
+	if e.UDPEngine != nil {
+		e.UDPEngine.Stop()
+	}
+	time.Sleep(time.Second)
+	return nil
+}
+
+func (e *Engine) initBackends() {
 	for i := range e.Config.Backends {
 		be := &e.Config.Backends[i]
-
-		// Create Balancer
 		balancer := lb.NewBalancer(be.Balance, be.Servers)
 		e.Balancers[be.Name] = balancer
-		e.Backends[be.Name] = be // Populate map for fast access
+		e.Backends[be.Name] = be
 		logging.Info("Initialized backend %s with %s balancing", be.Name, be.Balance)
 
-		// Create & Start Health Checker
 		if be.HealthCheck.Active.Interval != "" {
-			// Ensure a balancer exists for this backend
-			balancer, ok := e.Balancers[be.Name]
-			if !ok {
-				log.Printf("Warning: No balancer found for backend %s, health checks will not update balancer status.", be.Name)
-				continue
-			}
-
-			checker := health.NewChecker(be.HealthCheck, be) // Pass the backend config directly
+			checker := health.NewChecker(be.HealthCheck, be)
 			checker.OnStatusChange = func(server string, healthy bool) {
 				log.Printf("Health status change for backend %s, server %s: healthy=%t", be.Name, server, healthy)
 				balancer.UpdateStatus(server, healthy)
@@ -71,45 +121,15 @@ func (e *Engine) Start(ctx context.Context) error {
 			checker.Start()
 		}
 	}
-
-	// Shared Event Loop Implementation
-	// 1. Collect all addresses
-	addrs := make([]string, 0, len(e.Listeners))
-	listenerMap := make(map[string]*ListenerConfig) // Addr -> Config
-
-	for _, l := range e.Listeners {
-		p := "tcp"
-		if l.Protocol == "udp" {
-			p = "udp"
-		}
-		// Format: proto://host:port
-		fullAddr := fmt.Sprintf("%s://%s", p, l.Addr)
-		addrs = append(addrs, fullAddr)
-
-		// Map for lookup in Handler
-		// Use "proto:port" as key to avoid collision between TCP/UDP on same port
-		// and to handle different bind IPs (0.0.0.0 vs 127.0.0.1) resolving to the same port.
-		key := fmt.Sprintf("%s:%d", l.Protocol, l.Port)
-		listenerMap[key] = l
-		logging.Info("Registering listener %s on %s (Key: %s)", l.Name, fullAddr, key)
-	}
-
-	handler := &ProxyEventHandler{
-		engine:      e,
-		listenerMap: listenerMap,
-	}
-
-	logging.Info("Starting Shared Event Loop on %d listeners...", len(addrs))
-
-	// 2. Start Global Engine
-	// We establish ONE engine for ALL ports.
-	// This invokes Multicore=true so we use NumCPU threads total, regardless of port count.
-	err := gnet.Rotate(handler, addrs, gnet.WithMulticore(true), gnet.WithReusePort(true))
-	if err != nil {
-		return fmt.Errorf("gnet.Rotate failed: %v", err)
-	}
-
-	return nil
 }
 
-// runListener is deprecated/removed in Shared Loop model
+func (e *Engine) getAddrs(proto string) []string {
+	addrs := make([]string, 0)
+	for _, l := range e.Listeners {
+		if l.Protocol == proto {
+			addrs = append(addrs, l.Addr)
+			logging.Info("Registering listener %s on %s", l.Name, l.Addr)
+		}
+	}
+	return addrs
+}
