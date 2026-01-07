@@ -109,6 +109,7 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 	balancer, ok := h.engine.Balancers[l.DefaultBackend]
 	if !ok {
 		logging.Error("Balancer '%s' not found for listener '%s'", l.DefaultBackend, l.Name)
+		logging.Debug("Closing client %s due to missing balancer", clientConn.RemoteAddr())
 		clientConn.Close()
 		return
 	}
@@ -116,6 +117,7 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 	target, err := balancer.Next()
 	if err != nil {
 		logging.Error("Balancer '%s' error: %v", l.DefaultBackend, err)
+		logging.Debug("Closing client %s due to balancer error", clientConn.RemoteAddr())
 		clientConn.Close()
 		return
 	}
@@ -143,6 +145,7 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 		if err != nil {
 			logging.Error("Backend TCP dial failed: %v", err)
 			if clientConn != nil {
+				logging.Debug("Closing client %s due to dial error", clientConn.RemoteAddr())
 				clientConn.Close()
 			}
 			return
@@ -224,6 +227,7 @@ func (h *ProxyEventHandler) setupSession(client *nbio.Conn, backend net.Conn) {
 		_, err := backend.Write(clientCtx.Buffer)
 		if err != nil {
 			logging.Error("Failed to flush buffer to backend: %v", err)
+			logging.Debug("Closing client %s due to flush error", client.RemoteAddr())
 			client.Close()
 			return
 		}
