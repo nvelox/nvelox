@@ -22,8 +22,11 @@ func NewProxyEventHandler(e *Engine) *ProxyEventHandler {
 	lm := make(map[string]*ListenerConfig)
 	for _, l := range e.Listeners {
 		_, port, _ := net.SplitHostPort(l.Addr)
-		lm[":"+port] = l
-		lm[l.Addr] = l
+		// Store with protocol prefix to distinguish TCP/UDP on same port
+		key := fmt.Sprintf("%s:%s", l.Protocol, port)
+		lm[key] = l
+		// Also store by addr for exact matches if needed, prefixed with proto
+		lm[fmt.Sprintf("%s:%s", l.Protocol, l.Addr)] = l
 	}
 
 	return &ProxyEventHandler{
@@ -50,7 +53,7 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 		return
 	}
 
-	l := h.findListener(c.LocalAddr().String())
+	l := h.findListener(c.LocalAddr().Network(), c.LocalAddr().String())
 	if l == nil {
 		// Backend connections from DialAsync already have session set in callback.
 		// If we get here with no session and no listener, just ignore.
@@ -251,9 +254,11 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 	}()
 }
 
-func (h *ProxyEventHandler) findListener(localAddr string) *ListenerConfig {
+func (h *ProxyEventHandler) findListener(network, localAddr string) *ListenerConfig {
 	_, port, _ := net.SplitHostPort(localAddr)
-	if l, ok := h.listenerMap[":"+port]; ok {
+	// Lookup with protocol prefix
+	key := fmt.Sprintf("%s:%s", network, port)
+	if l, ok := h.listenerMap[key]; ok {
 		return l
 	}
 	return nil
