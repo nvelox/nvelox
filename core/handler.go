@@ -62,9 +62,6 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 
 	logging.Info("[CONN] New %s client %s -> %s", l.Protocol, c.RemoteAddr(), c.LocalAddr())
 
-	// Enforce TCP_NODELAY on client connection (Agent -> Proxy)
-	_ = c.SetNoDelay(true)
-
 	clientCtx := &ConnContext{
 		IsBackend: false,
 		StartTime: time.Now(),
@@ -147,10 +144,6 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 			logging.Error("Backend TCP dial failed: %v", err)
 			clientConn.Close()
 			return
-		}
-		// Enforce TCP_NODELAY on backend connection to prevent Nagle's algorithm delay
-		if tcpConn, ok := backendConn.(*net.TCPConn); ok {
-			_ = tcpConn.SetNoDelay(true)
 		}
 
 		// Send PROXY protocol v2 header if enabled on backend
