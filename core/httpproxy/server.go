@@ -74,10 +74,11 @@ type HTTPServer struct {
 	CircuitBreakers map[string]CircuitBreakerI
 	MaxBodySize     int64 // 0 = unlimited
 	Compression     config.CompressionConfig
-	ErrorPages    map[int][]byte // status code -> pre-loaded HTML content
-	ResponseCache *Cache
-	BufferPool    *BufferPool
-	altSvcHeader  string
+	ErrorPages      map[int][]byte // status code -> pre-loaded HTML content
+	ResponseCache   *Cache
+	BufferPool      *BufferPool
+	backendTransport *http.Transport // shared transport with connection pooling
+	altSvcHeader    string
 }
 
 // ListenerConfig mirrors core.ListenerConfig to avoid circular imports.
@@ -161,9 +162,23 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 		s.IPRateLimiter = middleware.NewIPRateLimiter(l.IPRateLimit.RequestsPerSecond, l.IPRateLimit.Burst)
 	}
 
+	// Shared transport with connection pooling to backends
+	s.backendTransport = &http.Transport{
+		MaxIdleConns:        1024,
+		MaxIdleConnsPerHost: 256,
+		MaxConnsPerHost:     0, // unlimited
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		DisableCompression:  true, // we handle compression ourselves
+		ForceAttemptHTTP2:   true,
+	}
+
 	s.httpServer = &http.Server{
-		Addr:    l.Addr,
-		Handler: s,
+		Addr:         l.Addr,
+		Handler:      s,
+		ReadTimeout:  60 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	return s
@@ -447,6 +462,7 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		proxyErr := make(chan error, 1)
 		proxy := &httputil.ReverseProxy{
+			Transport: s.backendTransport,
 			Director: func(req *http.Request) {
 				req.URL.Scheme = "http"
 				req.URL.Host = target
