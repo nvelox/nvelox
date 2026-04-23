@@ -10,6 +10,7 @@ import (
 
 	"nvelox/config"
 	"nvelox/core/health"
+	"nvelox/core/httpproxy"
 	"nvelox/core/logging"
 	"nvelox/lb"
 
@@ -27,6 +28,7 @@ type Engine struct {
 	Checkers     map[string]*health.Checker
 	RateLimiters map[string]*RateLimiter   // keyed by listener name
 	UDPPool      *UDPPool                  // UDP session affinity pool
+	HTTPServers  []*httpproxy.HTTPServer   // L7 HTTP servers
 	tlsListeners []net.Listener            // TLS listeners to close on shutdown
 }
 
@@ -40,6 +42,9 @@ type ListenerConfig struct {
 	Port           int
 	RateLimit      config.RateLimitConfig
 	TLS            *config.TLSConfig
+	HTTP3          bool
+	Routes         []config.RouteConfig
+	Headers        config.HeadersConfig
 }
 
 func NewEngine(cfg *config.Config) *Engine {
@@ -68,6 +73,34 @@ func (e *Engine) Start(ctx context.Context) error {
 
 	// 1c. Initialize UDP Pool
 	e.UDPPool = NewUDPPool(60 * time.Second)
+
+	// 1d. Start HTTP/HTTPS listeners (L7)
+	for _, l := range e.Listeners {
+		if l.Protocol != "http" && l.Protocol != "https" {
+			continue
+		}
+		var rl interface{ Allow() bool }
+		if limiter, ok := e.RateLimiters[l.Name]; ok {
+			rl = limiter
+		}
+		httpL := &httpproxy.ListenerConfig{
+			Name:           l.Name,
+			Addr:           l.Addr,
+			Protocol:       l.Protocol,
+			DefaultBackend: l.DefaultBackend,
+			Port:           l.Port,
+			TLS:            l.TLS,
+			HTTP3:          l.HTTP3,
+			Routes:         l.Routes,
+			Headers:        l.Headers,
+		}
+		srv := httpproxy.NewHTTPServer(httpL, e.Balancers, e.Backends, rl)
+		if err := srv.Start(); err != nil {
+			return fmt.Errorf("HTTP listener %s start failed: %v", l.Name, err)
+		}
+		e.HTTPServers = append(e.HTTPServers, srv)
+		logging.Info("HTTP listener %s started on %s (protocol: %s)", l.Name, l.Addr, l.Protocol)
+	}
 
 	// 2. Setup Handler
 	handler := NewProxyEventHandler(e)
@@ -123,7 +156,13 @@ func (e *Engine) Start(ctx context.Context) error {
 	// 5. Wait for Context
 	<-ctx.Done()
 
-	logging.Info("Stopping NBIO Engines...")
+	logging.Info("Stopping Engines...")
+	// Stop HTTP servers
+	for _, srv := range e.HTTPServers {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		srv.Stop(shutdownCtx)
+		cancel()
+	}
 	// Close TLS listeners first to stop accepting new connections
 	for _, l := range e.tlsListeners {
 		l.Close()
@@ -164,6 +203,10 @@ func (e *Engine) initBackends() {
 func (e *Engine) getAddrs(proto string) []string {
 	addrs := make([]string, 0)
 	for _, l := range e.Listeners {
+		// Skip HTTP/HTTPS listeners (handled by HTTPServer) and TLS TCP listeners
+		if l.Protocol == "http" || l.Protocol == "https" {
+			continue
+		}
 		if l.Protocol == proto && l.TLS == nil {
 			addrs = append(addrs, l.Addr)
 			logging.Info("Registering listener %s on %s", l.Name, l.Addr)

@@ -427,3 +427,120 @@ func TestValidation_FullValid(t *testing.T) {
 		t.Errorf("expected no error for valid config, got: %v", err)
 	}
 }
+
+func TestValidation_HTTPListener(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			Version:  "2",
+			Backends: []Backend{{Name: "web", Servers: []string{"10.0.0.1:80"}}},
+		}
+	}
+
+	t.Run("http requires backend or routes", func(t *testing.T) {
+		cfg := base()
+		cfg.Listeners = []Listener{{Name: "l1", Bind: ":80", Protocol: "http"}}
+		if err := validate(cfg); err == nil {
+			t.Error("expected error for HTTP listener without backend or routes")
+		}
+	})
+
+	t.Run("http with default_backend is valid", func(t *testing.T) {
+		cfg := base()
+		cfg.Listeners = []Listener{{Name: "l1", Bind: ":80", Protocol: "http", DefaultBackend: "web"}}
+		if err := validate(cfg); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("http with routes is valid", func(t *testing.T) {
+		cfg := base()
+		cfg.Listeners = []Listener{{
+			Name: "l1", Bind: ":80", Protocol: "http",
+			Routes: []RouteConfig{{
+				Match:   RouteMatch{Host: "api.example.com"},
+				Backend: "web",
+			}},
+		}}
+		if err := validate(cfg); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("route with unknown backend", func(t *testing.T) {
+		cfg := base()
+		cfg.Listeners = []Listener{{
+			Name: "l1", Bind: ":80", Protocol: "http",
+			Routes: []RouteConfig{{
+				Match:   RouteMatch{Host: "api.example.com"},
+				Backend: "nonexistent",
+			}},
+		}}
+		if err := validate(cfg); err == nil {
+			t.Error("expected error for route referencing unknown backend")
+		}
+	})
+
+	t.Run("route without match fields", func(t *testing.T) {
+		cfg := base()
+		cfg.Listeners = []Listener{{
+			Name: "l1", Bind: ":80", Protocol: "http",
+			Routes: []RouteConfig{{
+				Match:   RouteMatch{},
+				Backend: "web",
+			}},
+		}}
+		if err := validate(cfg); err == nil {
+			t.Error("expected error for route without host or path_prefix")
+		}
+	})
+
+	t.Run("route without backend", func(t *testing.T) {
+		cfg := base()
+		cfg.Listeners = []Listener{{
+			Name: "l1", Bind: ":80", Protocol: "http",
+			Routes: []RouteConfig{{
+				Match: RouteMatch{Host: "example.com"},
+			}},
+		}}
+		if err := validate(cfg); err == nil {
+			t.Error("expected error for route without backend")
+		}
+	})
+}
+
+func TestValidation_HTTP3(t *testing.T) {
+	t.Run("http3 requires https", func(t *testing.T) {
+		cfg := &Config{
+			Version:  "2",
+			Backends: []Backend{{Name: "web", Servers: []string{"10.0.0.1:80"}}},
+			Listeners: []Listener{{
+				Name: "l1", Bind: ":80", Protocol: "http",
+				HTTP3: true, DefaultBackend: "web",
+			}},
+		}
+		if err := validate(cfg); err == nil {
+			t.Error("expected error for http3 without https protocol")
+		}
+	})
+
+	t.Run("http3 with https is valid", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		certFile := filepath.Join(tmpDir, "cert.pem")
+		keyFile := filepath.Join(tmpDir, "key.pem")
+		os.WriteFile(certFile, []byte("cert"), 0644)
+		os.WriteFile(keyFile, []byte("key"), 0644)
+
+		cfg := &Config{
+			Version:  "2",
+			Backends: []Backend{{Name: "web", Servers: []string{"10.0.0.1:80"}}},
+			Listeners: []Listener{{
+				Name: "l1", Bind: ":443", Protocol: "https",
+				HTTP3: true, DefaultBackend: "web",
+				TLS: TLSConfig{Cert: certFile, Key: keyFile},
+			}},
+		}
+		if err := validate(cfg); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+}

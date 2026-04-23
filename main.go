@@ -89,6 +89,9 @@ func run(args []string, ctx context.Context) error {
 					DefaultBackend: l.DefaultBackend,
 					RateLimit:      l.RateLimit,
 					TLS:            tlsCfg,
+					HTTP3:          l.HTTP3,
+					Routes:         l.Routes,
+					Headers:        l.Headers,
 					Port:           p,
 				})
 			}
@@ -103,6 +106,9 @@ func run(args []string, ctx context.Context) error {
 				DefaultBackend: l.DefaultBackend,
 				RateLimit:      l.RateLimit,
 				TLS:            tlsCfg,
+				HTTP3:          l.HTTP3,
+				Routes:         l.Routes,
+				Headers:        l.Headers,
 				Port:           p,
 			})
 		}

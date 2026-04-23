@@ -46,9 +46,13 @@ type Listener struct {
 	// Rate limiting
 	RateLimit RateLimitConfig `yaml:"rate_limit,omitempty"`
 
-	// L7 fields (Placeholder for future)
-	TLS    TLSConfig     `yaml:"tls,omitempty"`
-	Routes []RouteConfig `yaml:"routes,omitempty"`
+	// TLS
+	TLS TLSConfig `yaml:"tls,omitempty"`
+
+	// L7 fields
+	HTTP3   bool          `yaml:"http3,omitempty"`   // Enable QUIC/HTTP3 on same port
+	Routes  []RouteConfig `yaml:"routes,omitempty"`  // L7 route matching
+	Headers HeadersConfig `yaml:"headers,omitempty"` // Global header manipulation
 }
 
 // RateLimitConfig defines per-listener connection rate limiting.
@@ -57,17 +61,34 @@ type RateLimitConfig struct {
 	Burst                int     `yaml:"burst"`
 }
 
-// TLSConfig placeholder
+// TLSConfig defines TLS certificate configuration.
 type TLSConfig struct {
 	Cert     string `yaml:"cert"`
 	Key      string `yaml:"key"`
 	AutoCert bool   `yaml:"auto_cert"`
 }
 
-// RouteConfig placeholder
+// RouteConfig defines an L7 route matching rule.
 type RouteConfig struct {
-	Match   map[string]string `yaml:"match"`
-	Backend string            `yaml:"backend"`
+	Match   RouteMatch    `yaml:"match"`
+	Backend string        `yaml:"backend"`
+	Headers HeadersConfig `yaml:"headers,omitempty"`
+}
+
+// RouteMatch defines the conditions for matching an HTTP request.
+type RouteMatch struct {
+	Host       string `yaml:"host,omitempty"`        // Exact host match (case-insensitive)
+	PathPrefix string `yaml:"path_prefix,omitempty"` // URL path prefix match
+}
+
+// HeadersConfig defines request/response header manipulation.
+type HeadersConfig struct {
+	RequestAdd     map[string]string `yaml:"request_add,omitempty"`
+	RequestSet     map[string]string `yaml:"request_set,omitempty"`
+	RequestRemove  []string          `yaml:"request_remove,omitempty"`
+	ResponseAdd    map[string]string `yaml:"response_add,omitempty"`
+	ResponseSet    map[string]string `yaml:"response_set,omitempty"`
+	ResponseRemove []string          `yaml:"response_remove,omitempty"`
 }
 
 // Backend defines a server pool.
@@ -223,6 +244,32 @@ func validate(cfg *Config) error {
 			if _, err := os.Stat(l.TLS.Key); err != nil {
 				return fmt.Errorf("listener %s: TLS key file not found: %v", l.Name, err)
 			}
+		}
+
+		// Validate HTTP/HTTPS listener requirements
+		if l.Protocol == "http" || l.Protocol == "https" {
+			if l.DefaultBackend == "" && len(l.Routes) == 0 {
+				return fmt.Errorf("listener %s: HTTP listener requires default_backend or routes", l.Name)
+			}
+			if l.Protocol == "https" && l.TLS.Cert == "" {
+				return fmt.Errorf("listener %s: HTTPS listener requires TLS cert/key", l.Name)
+			}
+			for i, r := range l.Routes {
+				if r.Backend == "" {
+					return fmt.Errorf("listener %s: route %d must have a backend", l.Name, i)
+				}
+				if !backendNames[r.Backend] {
+					return fmt.Errorf("listener %s: route %d references unknown backend: %s", l.Name, i, r.Backend)
+				}
+				if r.Match.Host == "" && r.Match.PathPrefix == "" {
+					return fmt.Errorf("listener %s: route %d must have at least host or path_prefix", l.Name, i)
+				}
+			}
+		}
+
+		// Validate HTTP3 requires HTTPS
+		if l.HTTP3 && l.Protocol != "https" {
+			return fmt.Errorf("listener %s: http3 requires protocol 'https'", l.Name)
 		}
 	}
 
