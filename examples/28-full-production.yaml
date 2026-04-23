@@ -30,7 +30,7 @@ listeners:
       - match:
           path_prefix: "/"
         redirect:
-          url: "https://localhost:9443"
+          url: "https://${host}:9443${path}"
           code: 301
 
   # HTTPS with HTTP/2 + routing
@@ -68,8 +68,8 @@ backends:
   - name: "web"
     balance: "roundrobin"
     servers:
-      - "127.0.0.1:8081"
-      - "127.0.0.1:8082"
+      - "127.0.0.1:8084"
+#      - "127.0.0.1:8082"
     health_check:
       active:
         type: "http"

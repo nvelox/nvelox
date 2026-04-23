@@ -320,13 +320,17 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		backendName = routeResult.Backend
 		routeHeaders = routeResult.Headers
 
-		// Handle redirect
+		// Handle redirect with variable substitution
 		if routeResult.Redirect.URL != "" {
 			code := routeResult.Redirect.Code
 			if code == 0 {
 				code = 302
 			}
-			http.Redirect(w, r, routeResult.Redirect.URL, code)
+			redirectURL := expandRedirectVars(routeResult.Redirect.URL, r)
+			if len(routeResult.RegexMatches) > 0 {
+				redirectURL = ApplyRewrite(redirectURL, routeResult.RegexMatches)
+			}
+			http.Redirect(w, r, redirectURL, code)
 			return
 		}
 
@@ -619,6 +623,40 @@ func setForwardedHeaders(r *http.Request) {
 }
 
 // applyRequestHeaders applies header add/set/remove to the request.
+// expandRedirectVars substitutes variables in redirect URLs.
+// Supported: ${host}, ${path}, ${query}, ${scheme}, ${uri}, ${port}
+func expandRedirectVars(url string, r *http.Request) string {
+	if !strings.Contains(url, "${") {
+		return url
+	}
+
+	host := r.Host
+	// Strip port from host for ${host}
+	hostOnly := host
+	port := ""
+	if h, p, err := net.SplitHostPort(host); err == nil {
+		hostOnly = h
+		port = p
+	}
+
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+
+	uri := r.URL.RequestURI()
+
+	replacer := strings.NewReplacer(
+		"${host}", hostOnly,
+		"${path}", r.URL.Path,
+		"${query}", r.URL.RawQuery,
+		"${scheme}", scheme,
+		"${uri}", uri,
+		"${port}", port,
+	)
+	return replacer.Replace(url)
+}
+
 func applyRequestHeaders(r *http.Request, h *config.HeadersConfig) {
 	for k, v := range h.RequestAdd {
 		r.Header.Add(k, v)

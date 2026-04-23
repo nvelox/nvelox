@@ -119,6 +119,35 @@ func TestSetForwardedHeaders_Chain(t *testing.T) {
 	}
 }
 
+func TestExpandRedirectVars(t *testing.T) {
+	tests := []struct {
+		name     string
+		url      string
+		reqURL   string
+		host     string
+		expected string
+	}{
+		{"host+path", "https://${host}${path}", "/page", "example.com", "https://example.com/page"},
+		{"scheme", "${scheme}://${host}/", "/", "example.com", "http://example.com/"},
+		{"host with port", "https://${host}${path}", "/x", "example.com:8080", "https://example.com/x"},
+		{"port var", "https://${host}:${port}${path}", "/x", "example.com:8080", "https://example.com:8080/x"},
+		{"query", "https://${host}${path}?${query}", "/search?q=test", "example.com", "https://example.com/search?q=test"},
+		{"no vars", "https://static.example.com/", "/anything", "whatever.com", "https://static.example.com/"},
+		{"uri", "https://new.com${uri}", "/path?q=1", "old.com", "https://new.com/path?q=1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest("GET", "http://"+tt.host+tt.reqURL, nil)
+			r.Host = tt.host
+			got := expandRedirectVars(tt.url, r)
+			if got != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, got)
+			}
+		})
+	}
+}
+
 func TestApplyRequestHeaders_EmptyConfig(t *testing.T) {
 	r := httptest.NewRequest("GET", "/", nil)
 	r.Header.Set("Keep", "me")

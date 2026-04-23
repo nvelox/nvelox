@@ -1,5 +1,6 @@
 ## 11 — Redirect Rules
-## Redirects /old/* to /new with 301, proxies everything else.
+## Redirects /old/* to /new with 301, HTTP→HTTPS with variable substitution.
+## Supported variables: ${host}, ${path}, ${query}, ${scheme}, ${uri}, ${port}
 version: "2"
 logging:
   level: "debug"
@@ -15,9 +16,14 @@ listeners:
           url: "/new"
           code: 301
       - match:
+          path_prefix: "/secure"
+        redirect:
+          url: "https://${host}${path}"
+          code: 301
+      - match:
           path_prefix: "/moved"
         redirect:
-          url: "https://example.com"
+          url: "https://example.com${uri}"
           code: 302
 backends:
   - name: "backend"
