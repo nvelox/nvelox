@@ -52,10 +52,36 @@ type Listener struct {
 	// TLS
 	TLS TLSConfig `yaml:"tls,omitempty"`
 
+	// Security
+	IPAllowlist []string          `yaml:"ip_allowlist,omitempty"` // CIDR allow list
+	IPDenylist  []string          `yaml:"ip_denylist,omitempty"`  // CIDR deny list
+	MaxBodySize string            `yaml:"max_body_size,omitempty"` // e.g., "10MB"
+	IPRateLimit IPRateLimitConfig `yaml:"ip_rate_limit,omitempty"`
+	ACL         []ACLRule         `yaml:"acl,omitempty"`
+
 	// L7 fields
-	HTTP3   bool          `yaml:"http3,omitempty"`   // Enable QUIC/HTTP3 on same port
-	Routes  []RouteConfig `yaml:"routes,omitempty"`  // L7 route matching
-	Headers HeadersConfig `yaml:"headers,omitempty"` // Global header manipulation
+	HTTP3   bool          `yaml:"http3,omitempty"`
+	Routes  []RouteConfig `yaml:"routes,omitempty"`
+	Headers HeadersConfig `yaml:"headers,omitempty"`
+}
+
+// IPRateLimitConfig defines per-IP rate limiting.
+type IPRateLimitConfig struct {
+	RequestsPerSecond float64 `yaml:"requests_per_second"`
+	Burst             int     `yaml:"burst"`
+}
+
+// ACLRule defines an access control rule.
+type ACLRule struct {
+	Match  ACLMatch `yaml:"match"`
+	Action string   `yaml:"action"` // "allow" or "deny"
+}
+
+// ACLMatch defines conditions for an ACL rule.
+type ACLMatch struct {
+	SourceIP []string          `yaml:"source_ip,omitempty"` // CIDR notation
+	Method   []string          `yaml:"method,omitempty"`
+	Headers  map[string]string `yaml:"headers,omitempty"`
 }
 
 // RateLimitConfig defines per-listener connection rate limiting.
@@ -152,7 +178,17 @@ type Backend struct {
 	Timeouts      TimeoutConfig     `yaml:"timeouts,omitempty"`
 	Retry         RetryConfig       `yaml:"retry,omitempty"`
 	StickySession StickyConfig      `yaml:"sticky_session,omitempty"`
+	BackendTLS    BackendTLSConfig  `yaml:"backend_tls,omitempty"`
 	HealthCheck   HealthCheckConfig `yaml:"health_check,omitempty"`
+}
+
+// BackendTLSConfig defines TLS settings for connecting to backend servers.
+type BackendTLSConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	CACert     string `yaml:"ca_cert,omitempty"`
+	ClientCert string `yaml:"client_cert,omitempty"`
+	ClientKey  string `yaml:"client_key,omitempty"`
+	Insecure   bool   `yaml:"insecure,omitempty"` // skip certificate verification
 }
 
 // RetryConfig defines retry behavior on backend failure.

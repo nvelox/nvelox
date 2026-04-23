@@ -54,6 +54,11 @@ type ListenerConfig struct {
 	HTTP3          bool
 	Routes         []config.RouteConfig
 	Headers        config.HeadersConfig
+	IPAllowlist    []string
+	IPDenylist     []string
+	MaxBodySize    string
+	IPRateLimit    config.IPRateLimitConfig
+	ACL            []config.ACLRule
 }
 
 func NewEngine(cfg *config.Config) *Engine {
@@ -105,6 +110,11 @@ func (e *Engine) Start(ctx context.Context) error {
 			HTTP3:          l.HTTP3,
 			Routes:         l.Routes,
 			Headers:        l.Headers,
+			IPAllowlist:    l.IPAllowlist,
+			IPDenylist:     l.IPDenylist,
+			MaxBodySize:    l.MaxBodySize,
+			IPRateLimit:    l.IPRateLimit,
+			ACL:            l.ACL,
 		}
 		// Build interface maps for httpproxy
 		connLimiters := make(map[string]httpproxy.ConnLimiterI)

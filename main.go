@@ -97,6 +97,11 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 					HTTP3:          l.HTTP3,
 					Routes:         l.Routes,
 					Headers:        l.Headers,
+					IPAllowlist:    l.IPAllowlist,
+					IPDenylist:     l.IPDenylist,
+					MaxBodySize:    l.MaxBodySize,
+					IPRateLimit:    l.IPRateLimit,
+					ACL:            l.ACL,
 					Port:           p,
 				})
 			}

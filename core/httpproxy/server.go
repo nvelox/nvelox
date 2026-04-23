@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"nvelox/config"
+	"nvelox/core/acl"
 	"nvelox/core/logging"
+	"nvelox/core/middleware"
 	"nvelox/core/sticky"
 	"nvelox/lb"
 
@@ -50,6 +52,11 @@ type HTTPServer struct {
 	ConnLimiters  map[string]ConnLimiterI
 	PassiveHealth map[string]PassiveHealthI
 	StickyStores  map[string]*sticky.Store
+	ACLEngine     *acl.Engine
+	IPAllowlist   []*net.IPNet
+	IPDenylist    []*net.IPNet
+	IPRateLimiter *middleware.IPRateLimiter
+	MaxBodySize   int64 // 0 = unlimited
 	altSvcHeader  string
 }
 
@@ -64,6 +71,11 @@ type ListenerConfig struct {
 	HTTP3          bool
 	Routes         []config.RouteConfig
 	Headers        config.HeadersConfig
+	IPAllowlist    []string
+	IPDenylist     []string
+	MaxBodySize    string
+	IPRateLimit    config.IPRateLimitConfig
+	ACL            []config.ACLRule
 }
 
 // NewHTTPServer creates an HTTP server for the given listener.
@@ -76,7 +88,17 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 		ConnLimiters:  connLimiters,
 		PassiveHealth: passiveHealth,
 		StickyStores:  stickyStores,
+		IPAllowlist:   acl.ParseCIDRList(l.IPAllowlist),
+		IPDenylist:    acl.ParseCIDRList(l.IPDenylist),
+		MaxBodySize:   parseByteSize(l.MaxBodySize),
 		RateLimiter: rateLimiter,
+	}
+
+	if len(l.ACL) > 0 {
+		s.ACLEngine = acl.NewEngine(l.ACL)
+	}
+	if l.IPRateLimit.RequestsPerSecond > 0 {
+		s.IPRateLimiter = middleware.NewIPRateLimiter(l.IPRateLimit.RequestsPerSecond, l.IPRateLimit.Burst)
 	}
 
 	s.httpServer = &http.Server{
@@ -85,6 +107,29 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 	}
 
 	return s
+}
+
+func parseByteSize(s string) int64 {
+	if s == "" {
+		return 0
+	}
+	s = strings.TrimSpace(strings.ToUpper(s))
+	multiplier := int64(1)
+	if strings.HasSuffix(s, "KB") {
+		multiplier = 1024
+		s = strings.TrimSuffix(s, "KB")
+	} else if strings.HasSuffix(s, "MB") {
+		multiplier = 1024 * 1024
+		s = strings.TrimSuffix(s, "MB")
+	} else if strings.HasSuffix(s, "GB") {
+		multiplier = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(s, "GB")
+	} else if strings.HasSuffix(s, "B") {
+		s = strings.TrimSuffix(s, "B")
+	}
+	n := int64(0)
+	fmt.Sscanf(s, "%d", &n)
+	return n * multiplier
 }
 
 // Start begins listening for HTTP/HTTPS connections.
@@ -156,12 +201,46 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Alt-Svc", s.altSvcHeader)
 	}
 
-	// Rate limiting
+	// IP denylist check
+	if len(s.IPDenylist) > 0 && acl.CheckIPList(r.RemoteAddr, s.IPDenylist) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	// IP allowlist check (if set, only listed IPs are allowed)
+	if len(s.IPAllowlist) > 0 && !acl.CheckIPList(r.RemoteAddr, s.IPAllowlist) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Per-listener rate limiting
 	if s.RateLimiter != nil {
 		if !s.RateLimiter.Allow() {
 			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
+	}
+
+	// Per-IP rate limiting
+	if s.IPRateLimiter != nil {
+		if !s.IPRateLimiter.Allow(r.RemoteAddr) {
+			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+	}
+
+	// ACL check
+	if s.ACLEngine != nil {
+		action := s.ACLEngine.Check(r)
+		if action == "deny" {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+	}
+
+	// Request body size limit
+	if s.MaxBodySize > 0 && r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, s.MaxBodySize)
 	}
 
 	// Route matching
