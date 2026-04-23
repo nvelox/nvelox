@@ -165,8 +165,15 @@ type RouteConfig struct {
 	Match    RouteMatch    `yaml:"match"`
 	Backend  string        `yaml:"backend,omitempty"`
 	Headers  HeadersConfig `yaml:"headers,omitempty"`
-	Rewrite  RewriteConfig `yaml:"rewrite,omitempty"`
+	Rewrite  RewriteConfig  `yaml:"rewrite,omitempty"`
 	Redirect RedirectConfig `yaml:"redirect,omitempty"`
+	Scripts  ScriptsConfig  `yaml:"scripts,omitempty"`
+}
+
+// ScriptsConfig defines Lua script hooks for a route.
+type ScriptsConfig struct {
+	RequestScript  string `yaml:"request_script,omitempty"`  // path to Lua file
+	ResponseScript string `yaml:"response_script,omitempty"` // path to Lua file
 }
 
 // RouteMatch defines the conditions for matching an HTTP request.

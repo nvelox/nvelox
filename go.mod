@@ -6,6 +6,7 @@ require (
 	github.com/lesismal/nbio v1.6.8
 	github.com/pires/go-proxyproto v0.8.1
 	github.com/quic-go/quic-go v0.59.0
+	github.com/yuin/gopher-lua v1.1.2
 	golang.org/x/crypto v0.50.0
 	gopkg.in/yaml.v3 v3.0.1
 )
