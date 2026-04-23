@@ -1,6 +1,7 @@
 package httpproxy
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -202,8 +203,47 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	logging.Info("[HTTP] %s %s %s -> %s (%s)", r.Proto, r.Method, r.URL.Path, target, backendName)
-	proxy.ServeHTTP(w, r)
+	// Wrap ResponseWriter to capture status and bytes for access logging
+	rec := &statusRecorder{ResponseWriter: w, status: 200}
+	start := time.Now()
+	proxy.ServeHTTP(rec, r)
+	duration := float64(time.Since(start).Microseconds()) / 1000.0 // ms
+
+	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+	logging.AccessHTTP(clientIP, r.Method, r.URL.Path, r.Proto, rec.status, rec.bytes, duration, target)
+}
+
+// statusRecorder wraps http.ResponseWriter to capture status code and bytes written.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	n, err := r.ResponseWriter.Write(b)
+	r.bytes += int64(n)
+	return n, err
+}
+
+// Implement http.Hijacker for WebSocket support
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := r.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("hijack not supported")
+}
+
+// Implement http.Flusher for streaming
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // isWebSocketUpgrade checks if the request is a WebSocket upgrade.

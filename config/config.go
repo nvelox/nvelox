@@ -46,6 +46,9 @@ type Listener struct {
 	// Rate limiting
 	RateLimit RateLimitConfig `yaml:"rate_limit,omitempty"`
 
+	// Timeouts
+	Timeouts TimeoutConfig `yaml:"timeouts,omitempty"`
+
 	// TLS
 	TLS TLSConfig `yaml:"tls,omitempty"`
 
@@ -81,6 +84,53 @@ type RouteMatch struct {
 	PathPrefix string `yaml:"path_prefix,omitempty"` // URL path prefix match
 }
 
+// TimeoutConfig defines configurable timeouts for listeners and backends.
+type TimeoutConfig struct {
+	Connect string `yaml:"connect,omitempty"` // dial timeout (default "10s")
+	Read    string `yaml:"read,omitempty"`    // read timeout
+	Write   string `yaml:"write,omitempty"`   // write timeout
+	Idle    string `yaml:"idle,omitempty"`    // idle connection timeout
+}
+
+// ParseConnect returns the connect timeout duration, defaulting to 10s.
+func (t TimeoutConfig) ParseConnect() time.Duration {
+	if t.Connect == "" {
+		return 10 * time.Second
+	}
+	d, err := time.ParseDuration(t.Connect)
+	if err != nil {
+		return 10 * time.Second
+	}
+	return d
+}
+
+// ParseRead returns the read timeout duration, or 0 (no timeout) if not set.
+func (t TimeoutConfig) ParseRead() time.Duration {
+	if t.Read == "" {
+		return 0
+	}
+	d, _ := time.ParseDuration(t.Read)
+	return d
+}
+
+// ParseWrite returns the write timeout duration, or 0 (no timeout) if not set.
+func (t TimeoutConfig) ParseWrite() time.Duration {
+	if t.Write == "" {
+		return 0
+	}
+	d, _ := time.ParseDuration(t.Write)
+	return d
+}
+
+// ParseIdle returns the idle timeout duration, or 0 (no timeout) if not set.
+func (t TimeoutConfig) ParseIdle() time.Duration {
+	if t.Idle == "" {
+		return 0
+	}
+	d, _ := time.ParseDuration(t.Idle)
+	return d
+}
+
 // HeadersConfig defines request/response header manipulation.
 type HeadersConfig struct {
 	RequestAdd     map[string]string `yaml:"request_add,omitempty"`
@@ -98,6 +148,7 @@ type Backend struct {
 	SendProxyV2 bool     `yaml:"send_proxy_v2"` // Send PROXY Protocol v2 header to backend
 	Servers     []string `yaml:"servers"`       // List of server addresses
 
+	Timeouts    TimeoutConfig     `yaml:"timeouts,omitempty"`
 	HealthCheck HealthCheckConfig `yaml:"health_check,omitempty"`
 }
 
@@ -212,6 +263,13 @@ func validate(cfg *Config) error {
 				return fmt.Errorf("backend %s has invalid health check timeout %q: %v", b.Name, b.HealthCheck.Active.Timeout, err)
 			}
 		}
+
+		// Validate backend timeouts
+		if b.Timeouts.Connect != "" {
+			if _, err := time.ParseDuration(b.Timeouts.Connect); err != nil {
+				return fmt.Errorf("backend %s has invalid connect timeout %q: %v", b.Name, b.Timeouts.Connect, err)
+			}
+		}
 	}
 
 	for _, l := range cfg.Listeners {
@@ -243,6 +301,18 @@ func validate(cfg *Config) error {
 			}
 			if _, err := os.Stat(l.TLS.Key); err != nil {
 				return fmt.Errorf("listener %s: TLS key file not found: %v", l.Name, err)
+			}
+		}
+
+		// Validate listener timeouts
+		for _, field := range []struct{ name, val string }{
+			{"connect", l.Timeouts.Connect}, {"read", l.Timeouts.Read},
+			{"write", l.Timeouts.Write}, {"idle", l.Timeouts.Idle},
+		} {
+			if field.val != "" {
+				if _, err := time.ParseDuration(field.val); err != nil {
+					return fmt.Errorf("listener %s has invalid %s timeout %q: %v", l.Name, field.name, field.val, err)
+				}
 			}
 		}
 

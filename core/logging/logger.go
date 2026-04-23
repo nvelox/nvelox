@@ -104,6 +104,12 @@ func Access(format string, v ...interface{}) {
 	accessLog.Printf(format, v...)
 }
 
+// AccessHTTP logs an HTTP request in CLF-like format.
+func AccessHTTP(clientIP, method, path, proto string, status int, bytes int64, duration float64, backend string) {
+	accessLog.Printf("%s - \"%s %s %s\" %d %d %.3fms -> %s",
+		clientIP, method, path, proto, status, bytes, duration, backend)
+}
+
 func Fatal(format string, v ...interface{}) {
 	errorLog.Output(2, fmt.Sprintf("[FATAL] "+format, v...))
 	os.Exit(1)

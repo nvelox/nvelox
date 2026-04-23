@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"nvelox/config"
@@ -29,7 +30,10 @@ type Engine struct {
 	RateLimiters map[string]*RateLimiter   // keyed by listener name
 	UDPPool      *UDPPool                  // UDP session affinity pool
 	HTTPServers  []*httpproxy.HTTPServer   // L7 HTTP servers
+	ActiveConns  sync.WaitGroup            // tracks in-flight connections for graceful drain
+	DrainTimeout time.Duration             // max wait on shutdown (default 30s)
 	tlsListeners []net.Listener            // TLS listeners to close on shutdown
+	configPath   string                    // path for reload
 }
 
 type ListenerConfig struct {
@@ -41,6 +45,7 @@ type ListenerConfig struct {
 	SendProxyV2    bool // Send PROXY protocol v2 to backend
 	Port           int
 	RateLimit      config.RateLimitConfig
+	Timeouts       config.TimeoutConfig
 	TLS            *config.TLSConfig
 	HTTP3          bool
 	Routes         []config.RouteConfig
@@ -157,27 +162,67 @@ func (e *Engine) Start(ctx context.Context) error {
 	<-ctx.Done()
 
 	logging.Info("Stopping Engines...")
-	// Stop HTTP servers
+
+	// Stop HTTP servers (graceful with drain)
 	for _, srv := range e.HTTPServers {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		srv.Stop(shutdownCtx)
 		cancel()
 	}
-	// Close TLS listeners first to stop accepting new connections
+
+	// Close TLS listeners to stop accepting new connections
 	for _, l := range e.tlsListeners {
 		l.Close()
 	}
-	if e.UDPPool != nil {
-		e.UDPPool.Stop()
-	}
+
+	// Stop nbio engines (stops accepting new L4 connections)
 	if e.TCPEngine != nil {
 		e.TCPEngine.Stop()
 	}
 	if e.UDPEngine != nil {
 		e.UDPEngine.Stop()
 	}
-	time.Sleep(time.Second)
+
+	// Drain active L4 connections
+	drainTimeout := e.DrainTimeout
+	if drainTimeout == 0 {
+		drainTimeout = 30 * time.Second
+	}
+	drainDone := make(chan struct{})
+	go func() {
+		e.ActiveConns.Wait()
+		close(drainDone)
+	}()
+	select {
+	case <-drainDone:
+		logging.Info("All connections drained")
+	case <-time.After(drainTimeout):
+		logging.Warn("Drain timeout reached (%v), forcing shutdown", drainTimeout)
+	}
+
+	if e.UDPPool != nil {
+		e.UDPPool.Stop()
+	}
+
 	return nil
+}
+
+// Reload updates backends and health checkers from a new config.
+// Listeners are not changed at runtime (requires restart for listener changes).
+func (e *Engine) Reload(cfg *config.Config) {
+	logging.Info("Reloading backends...")
+
+	// Stop existing health checkers
+	for name, checker := range e.Checkers {
+		checker.Stop()
+		delete(e.Checkers, name)
+	}
+
+	// Update config and re-initialize backends
+	e.Config = cfg
+	e.initBackends()
+
+	logging.Info("Reload complete: %d backends configured", len(cfg.Backends))
 }
 
 func (e *Engine) initBackends() {
@@ -292,8 +337,12 @@ func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *
 		dialTarget = fmt.Sprintf("%s:%d", dialTarget, l.Port)
 	}
 
-	// Dial backend
-	backendConn, err := net.DialTimeout("tcp", dialTarget, 10*time.Second)
+	// Dial backend with configurable timeout
+	connectTimeout := l.Timeouts.ParseConnect()
+	if backend != nil && backend.Timeouts.Connect != "" {
+		connectTimeout = backend.Timeouts.ParseConnect()
+	}
+	backendConn, err := net.DialTimeout("tcp", dialTarget, connectTimeout)
 	if err != nil {
 		logging.Error("TLS backend dial failed: %v", err)
 		return

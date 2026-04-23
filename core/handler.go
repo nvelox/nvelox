@@ -90,6 +90,8 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 
 	logging.Info("[CONN] New %s client %s -> %s", l.Protocol, c.RemoteAddr(), c.LocalAddr())
 
+	h.engine.ActiveConns.Add(1)
+
 	clientCtx := &ConnContext{
 		IsBackend: false,
 		StartTime: time.Now(),
@@ -125,6 +127,7 @@ func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
 
 	if !isBackend {
 		logging.Info("[CONN] Closed %s (Dur: %v, Err: %v)", c.RemoteAddr(), time.Since(ctx.StartTime), err)
+		h.engine.ActiveConns.Done()
 	}
 }
 
@@ -184,12 +187,16 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 	if l.Protocol == "udp" {
 		h.connectBackendUDP(clientConn, dialTarget)
 	} else {
-		// Pass balancer info through closure to avoid reading from ConnContext across goroutines
-		h.connectBackendTCP(clientConn, dialTarget, backend, balancer, target)
+		h.connectBackendTCP(clientConn, dialTarget, backend, balancer, target, l)
 	}
 }
 
-func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target string, backend *config.Backend, balancer lb.Balancer, balancerKey string) {
+func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target string, backend *config.Backend, balancer lb.Balancer, balancerKey string, l *ListenerConfig) {
+	// Use configurable timeout: prefer backend timeout, fall back to listener timeout, default 10s
+	connectTimeout := l.Timeouts.ParseConnect()
+	if backend != nil && backend.Timeouts.Connect != "" {
+		connectTimeout = backend.Timeouts.ParseConnect()
+	}
 	onConnected := func(backendConn *nbio.Conn, err error) {
 		if err != nil {
 			logging.Error("Backend TCP async dial failed: %v", err)
@@ -243,7 +250,7 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 		// backend data to client via the backendCtx.PeerConn
 	}
 
-	if err := h.engine.TCPEngine.DialAsyncTimeout("tcp", target, 10*time.Second, onConnected); err != nil {
+	if err := h.engine.TCPEngine.DialAsyncTimeout("tcp", target, connectTimeout, onConnected); err != nil {
 		logging.Error("Backend TCP DialAsync failed: %v", err)
 		clientConn.Close()
 	}

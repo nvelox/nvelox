@@ -38,21 +38,21 @@ func TestSplitHostPort(t *testing.T) {
 }
 
 func TestRun_Version(t *testing.T) {
-	err := run([]string{"cmd", "-version"}, context.Background())
+	err := run([]string{"cmd", "-version"}, context.Background(), nil)
 	if err != nil {
 		t.Errorf("run -version failed: %v", err)
 	}
 }
 
 func TestRun_BadFlags(t *testing.T) {
-	err := run([]string{"cmd", "-unknown"}, context.Background())
+	err := run([]string{"cmd", "-unknown"}, context.Background(), nil)
 	if err == nil {
 		t.Error("run with unknown flag should fail")
 	}
 }
 
 func TestRun_BadConfig(t *testing.T) {
-	err := run([]string{"cmd", "-config", "non-existent.yaml"}, context.Background())
+	err := run([]string{"cmd", "-config", "non-existent.yaml"}, context.Background(), nil)
 	if err == nil {
 		t.Error("run with missing config should fail")
 	}
@@ -88,7 +88,7 @@ logging:
 	defer cancel()
 
 	// 3. Expect nil error (graceful shutdown)
-	err := run([]string{"cmd", "-config", configPath}, ctx)
+	err := run([]string{"cmd", "-config", configPath}, ctx, nil)
 	if err != nil {
 		t.Errorf("run failed: %v", err)
 	}
@@ -115,7 +115,7 @@ listeners:
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	err := run([]string{"cmd", "-config", configPath}, ctx)
+	err := run([]string{"cmd", "-config", configPath}, ctx, nil)
 	if err != nil {
 		t.Errorf("run failed: %v", err)
 	}
@@ -143,7 +143,7 @@ listeners:
 	defer cancel()
 
 	// Should fail at config validation now
-	err := run([]string{"cmd", "-config", configPath}, ctx)
+	err := run([]string{"cmd", "-config", configPath}, ctx, nil)
 	if err == nil {
 		t.Error("expected error for invalid bind address, got nil")
 	}
@@ -167,7 +167,7 @@ listeners:
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond) // Longer timeout
 	defer cancel()
 
-	err := run([]string{"cmd", "-config", configPath}, ctx)
+	err := run([]string{"cmd", "-config", configPath}, ctx, nil)
 	if err == nil {
 		t.Error("run should fail due to engine start error")
 	}

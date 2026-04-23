@@ -25,13 +25,17 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(os.Args, ctx); err != nil {
+	// SIGHUP reload channel
+	reloadCh := make(chan os.Signal, 1)
+	signal.Notify(reloadCh, syscall.SIGHUP)
+
+	if err := run(os.Args, ctx, reloadCh); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(args []string, ctx context.Context) error {
+func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 	fs := flag.NewFlagSet("nvelox", flag.ContinueOnError)
 	versionFlag := fs.Bool("version", false, "Print version and exit")
 	configPath := fs.String("config", "nvelox.yaml", "Path to configuration file")
@@ -88,6 +92,7 @@ func run(args []string, ctx context.Context) error {
 					ZeroCopy:       l.ZeroCopy,
 					DefaultBackend: l.DefaultBackend,
 					RateLimit:      l.RateLimit,
+					Timeouts:       l.Timeouts,
 					TLS:            tlsCfg,
 					HTTP3:          l.HTTP3,
 					Routes:         l.Routes,
@@ -125,10 +130,32 @@ func run(args []string, ctx context.Context) error {
 		close(errCh)
 	}()
 
+	// Handle SIGHUP reload
+	if reloadCh != nil {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-reloadCh:
+					logging.Info("Received SIGHUP, reloading configuration from %s", *configPath)
+					newCfg, err := config.Load(*configPath)
+					if err != nil {
+						logging.Error("Config reload failed: %v (keeping current config)", err)
+						continue
+					}
+					logging.Info("Configuration reloaded successfully")
+					// Re-initialize backends with new config
+					engine.Reload(newCfg)
+				}
+			}
+		}()
+	}
+
 	select {
 	case <-ctx.Done():
 		log.Println("Shutting down...")
-		return nil // Success exit (cancelled by context)
+		return nil
 	case err := <-errCh:
 		if err == context.Canceled {
 			return nil
