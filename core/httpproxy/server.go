@@ -34,6 +34,20 @@ type PassiveHealthI interface {
 	RecordSuccess(server string)
 }
 
+// CircuitBreakerI is the interface for circuit breakers.
+type CircuitBreakerI interface {
+	Allow() bool
+	RecordSuccess()
+	RecordFailure()
+}
+
+// MetricsI is the interface for metrics recording.
+type MetricsI interface {
+	GetCounter(name string, labels map[string]string) interface{ Inc() }
+	GetHistogram(name string) interface{ Observe(float64) }
+	GetGauge(name string, labels map[string]string) interface{ Inc(); Dec() }
+}
+
 // EngineRef provides access to shared engine components without circular imports.
 type EngineRef struct {
 	Balancers    map[string]lb.Balancer
@@ -57,8 +71,9 @@ type HTTPServer struct {
 	IPAllowlist   []*net.IPNet
 	IPDenylist    []*net.IPNet
 	IPRateLimiter *middleware.IPRateLimiter
-	MaxBodySize   int64 // 0 = unlimited
-	Compression   config.CompressionConfig
+	CircuitBreakers map[string]CircuitBreakerI
+	MaxBodySize     int64 // 0 = unlimited
+	Compression     config.CompressionConfig
 	ErrorPages    map[int][]byte // status code -> pre-loaded HTML content
 	altSvcHeader  string
 }
@@ -84,7 +99,7 @@ type ListenerConfig struct {
 }
 
 // NewHTTPServer creates an HTTP server for the given listener.
-func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends map[string]*config.Backend, rateLimiter interface{ Allow() bool }, connLimiters map[string]ConnLimiterI, passiveHealth map[string]PassiveHealthI, stickyStores map[string]*sticky.Store) *HTTPServer {
+func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends map[string]*config.Backend, rateLimiter interface{ Allow() bool }, connLimiters map[string]ConnLimiterI, passiveHealth map[string]PassiveHealthI, stickyStores map[string]*sticky.Store, circuitBreakers map[string]CircuitBreakerI) *HTTPServer {
 	s := &HTTPServer{
 		Listener:      l,
 		router:        NewRouter(l.Routes, l.DefaultBackend),
@@ -92,8 +107,9 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 		Backends:      backends,
 		ConnLimiters:  connLimiters,
 		PassiveHealth: passiveHealth,
-		StickyStores:  stickyStores,
-		IPAllowlist:   acl.ParseCIDRList(l.IPAllowlist),
+		StickyStores:    stickyStores,
+		CircuitBreakers: circuitBreakers,
+		IPAllowlist:     acl.ParseCIDRList(l.IPAllowlist),
 		IPDenylist:    acl.ParseCIDRList(l.IPDenylist),
 		MaxBodySize:   parseByteSize(l.MaxBodySize),
 		RateLimiter: rateLimiter,
@@ -306,6 +322,14 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	backend := s.Backends[backendName]
 
+	// Circuit breaker check
+	if cb, ok := s.CircuitBreakers[backendName]; ok {
+		if !cb.Allow() {
+			http.Error(w, "Service Unavailable (circuit open)", http.StatusServiceUnavailable)
+			return
+		}
+	}
+
 	// Connection limit check
 	if cl, ok := s.ConnLimiters[backendName]; ok {
 		if !cl.Acquire() {
@@ -393,9 +417,12 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			},
 			ModifyResponse: func(resp *http.Response) error {
 				balancer.OnDisconnect(target)
-				// Track passive health on success
+				// Track passive health + circuit breaker on success
 				if ph, ok := s.PassiveHealth[backendName]; ok {
 					ph.RecordSuccess(target)
+				}
+				if cb, ok := s.CircuitBreakers[backendName]; ok {
+					cb.RecordSuccess()
 				}
 				// Check if we should retry on this status
 				if attempt < maxAttempts-1 {
@@ -435,6 +462,9 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				balancer.OnDisconnect(target)
 				if ph, ok := s.PassiveHealth[backendName]; ok {
 					ph.RecordFailure(target)
+				}
+				if cb, ok := s.CircuitBreakers[backendName]; ok {
+					cb.RecordFailure()
 				}
 				proxyErr <- err
 			},

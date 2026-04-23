@@ -17,10 +17,18 @@ type Config struct {
 	Version string        `yaml:"version"`
 	Server  ServerConfig  `yaml:"server"`
 	Logging LoggingConfig `yaml:"logging"`
+	Metrics MetricsConfig `yaml:"metrics,omitempty"`
 	Include string        `yaml:"include"`
 
 	Listeners []Listener `yaml:"listeners"`
 	Backends  []Backend  `yaml:"backends"`
+}
+
+// MetricsConfig defines the Prometheus metrics endpoint.
+type MetricsConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Bind    string `yaml:"bind"` // e.g., ":9090"
+	Path    string `yaml:"path"` // default "/metrics"
 }
 
 type ServerConfig struct {
@@ -201,8 +209,17 @@ type Backend struct {
 	Timeouts      TimeoutConfig     `yaml:"timeouts,omitempty"`
 	Retry         RetryConfig       `yaml:"retry,omitempty"`
 	StickySession StickyConfig      `yaml:"sticky_session,omitempty"`
-	BackendTLS    BackendTLSConfig  `yaml:"backend_tls,omitempty"`
-	HealthCheck   HealthCheckConfig `yaml:"health_check,omitempty"`
+	BackendTLS     BackendTLSConfig  `yaml:"backend_tls,omitempty"`
+	CircuitBreaker CBConfig         `yaml:"circuit_breaker,omitempty"`
+	HealthCheck    HealthCheckConfig `yaml:"health_check,omitempty"`
+}
+
+// CBConfig defines circuit breaker settings per backend.
+type CBConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	Threshold   int    `yaml:"threshold"`       // failures to open
+	Timeout     string `yaml:"timeout"`          // time in open state before half-open
+	HalfOpenMax int    `yaml:"half_open_max"`    // max requests in half-open
 }
 
 // BackendTLSConfig defines TLS settings for connecting to backend servers.

@@ -6,13 +6,16 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
 	"nvelox/config"
+	"nvelox/core/circuitbreaker"
 	"nvelox/core/health"
 	"nvelox/core/httpproxy"
 	"nvelox/core/logging"
+	"nvelox/core/metrics"
 	"nvelox/core/sticky"
 	"nvelox/lb"
 
@@ -32,6 +35,9 @@ type Engine struct {
 	ConnLimiters    map[string]*ConnLimiter           // keyed by backend name
 	PassiveHealth   map[string]*PassiveHealthTracker  // keyed by backend name
 	StickyStores    map[string]*sticky.Store          // keyed by backend name
+	CircuitBreakers map[string]*circuitbreaker.Breaker // keyed by backend name
+	Metrics         *metrics.Registry
+	metricsServer   *http.Server
 	UDPPool         *UDPPool                          // UDP session affinity pool
 	HTTPServers     []*httpproxy.HTTPServer           // L7 HTTP servers
 	ActiveConns  sync.WaitGroup            // tracks in-flight connections for graceful drain
@@ -70,10 +76,12 @@ func NewEngine(cfg *config.Config) *Engine {
 		Balancers:     make(map[string]lb.Balancer),
 		Backends:      make(map[string]*config.Backend),
 		Checkers:      make(map[string]*health.Checker),
-		RateLimiters:  make(map[string]*RateLimiter),
-		ConnLimiters:  make(map[string]*ConnLimiter),
-		PassiveHealth: make(map[string]*PassiveHealthTracker),
-		StickyStores:  make(map[string]*sticky.Store),
+		RateLimiters:    make(map[string]*RateLimiter),
+		ConnLimiters:    make(map[string]*ConnLimiter),
+		PassiveHealth:   make(map[string]*PassiveHealthTracker),
+		StickyStores:    make(map[string]*sticky.Store),
+		CircuitBreakers: make(map[string]*circuitbreaker.Breaker),
+		Metrics:         metrics.Default,
 	}
 	return e
 }
@@ -92,6 +100,26 @@ func (e *Engine) Start(ctx context.Context) error {
 
 	// 1c. Initialize UDP Pool
 	e.UDPPool = NewUDPPool(60 * time.Second)
+
+	// 1e. Start metrics server
+	if e.Config.Metrics.Enabled {
+		metricsPath := e.Config.Metrics.Path
+		if metricsPath == "" {
+			metricsPath = "/metrics"
+		}
+		mux := http.NewServeMux()
+		mux.Handle(metricsPath, e.Metrics.Handler())
+		e.metricsServer = &http.Server{
+			Addr:    e.Config.Metrics.Bind,
+			Handler: mux,
+		}
+		go func() {
+			if err := e.metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logging.Error("[METRICS] Server error: %v", err)
+			}
+		}()
+		logging.Info("Metrics endpoint started on %s%s", e.Config.Metrics.Bind, metricsPath)
+	}
 
 	// 1d. Start HTTP/HTTPS listeners (L7)
 	for _, l := range e.Listeners {
@@ -129,7 +157,11 @@ func (e *Engine) Start(ctx context.Context) error {
 		for k, v := range e.PassiveHealth {
 			passiveHealth[k] = v
 		}
-		srv := httpproxy.NewHTTPServer(httpL, e.Balancers, e.Backends, rl, connLimiters, passiveHealth, e.StickyStores)
+		cbs := make(map[string]httpproxy.CircuitBreakerI)
+		for k, v := range e.CircuitBreakers {
+			cbs[k] = v
+		}
+		srv := httpproxy.NewHTTPServer(httpL, e.Balancers, e.Backends, rl, connLimiters, passiveHealth, e.StickyStores, cbs)
 		if err := srv.Start(); err != nil {
 			return fmt.Errorf("HTTP listener %s start failed: %v", l.Name, err)
 		}
@@ -192,6 +224,11 @@ func (e *Engine) Start(ctx context.Context) error {
 	<-ctx.Done()
 
 	logging.Info("Stopping Engines...")
+
+	// Stop metrics server
+	if e.metricsServer != nil {
+		e.metricsServer.Close()
+	}
 
 	// Stop HTTP servers (graceful with drain)
 	for _, srv := range e.HTTPServers {
@@ -285,6 +322,22 @@ func (e *Engine) initBackends() {
 			}
 			e.StickyStores[be.Name] = sticky.NewStore(ttl)
 			logging.Info("Sticky session for %s: type=%s, ttl=%v", be.Name, be.StickySession.Type, ttl)
+		}
+
+		// Circuit breaker
+		if be.CircuitBreaker.Enabled {
+			cbTimeout := 30 * time.Second
+			if be.CircuitBreaker.Timeout != "" {
+				if d, err := time.ParseDuration(be.CircuitBreaker.Timeout); err == nil {
+					cbTimeout = d
+				}
+			}
+			e.CircuitBreakers[be.Name] = circuitbreaker.New(
+				be.CircuitBreaker.Threshold,
+				cbTimeout,
+				be.CircuitBreaker.HalfOpenMax,
+			)
+			logging.Info("Circuit breaker for %s: threshold=%d, timeout=%v", be.Name, be.CircuitBreaker.Threshold, cbTimeout)
 		}
 
 		// Active health checks
