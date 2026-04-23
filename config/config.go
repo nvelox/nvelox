@@ -129,9 +129,12 @@ type RateLimitConfig struct {
 
 // TLSConfig defines TLS certificate configuration.
 type TLSConfig struct {
-	Cert     string `yaml:"cert"`
-	Key      string `yaml:"key"`
-	AutoCert bool   `yaml:"auto_cert"`
+	Cert          string `yaml:"cert"`
+	Key           string `yaml:"key"`
+	AutoCert      bool   `yaml:"auto_cert"`
+	OCSPStapling  bool   `yaml:"ocsp_stapling,omitempty"`  // Enable OCSP stapling
+	ClientAuth    string `yaml:"client_auth,omitempty"`     // "require", "request", "none"
+	ClientCA      string `yaml:"client_ca,omitempty"`       // CA cert for client verification
 }
 
 // RouteConfig defines an L7 route matching rule.
