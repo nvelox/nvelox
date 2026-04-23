@@ -13,6 +13,7 @@ import (
 	"nvelox/core/health"
 	"nvelox/core/httpproxy"
 	"nvelox/core/logging"
+	"nvelox/core/sticky"
 	"nvelox/lb"
 
 	"github.com/lesismal/nbio"
@@ -27,9 +28,12 @@ type Engine struct {
 	Balancers    map[string]lb.Balancer
 	Backends     map[string]*config.Backend
 	Checkers     map[string]*health.Checker
-	RateLimiters map[string]*RateLimiter   // keyed by listener name
-	UDPPool      *UDPPool                  // UDP session affinity pool
-	HTTPServers  []*httpproxy.HTTPServer   // L7 HTTP servers
+	RateLimiters    map[string]*RateLimiter           // keyed by listener name
+	ConnLimiters    map[string]*ConnLimiter           // keyed by backend name
+	PassiveHealth   map[string]*PassiveHealthTracker  // keyed by backend name
+	StickyStores    map[string]*sticky.Store          // keyed by backend name
+	UDPPool         *UDPPool                          // UDP session affinity pool
+	HTTPServers     []*httpproxy.HTTPServer           // L7 HTTP servers
 	ActiveConns  sync.WaitGroup            // tracks in-flight connections for graceful drain
 	DrainTimeout time.Duration             // max wait on shutdown (default 30s)
 	tlsListeners []net.Listener            // TLS listeners to close on shutdown
@@ -54,12 +58,15 @@ type ListenerConfig struct {
 
 func NewEngine(cfg *config.Config) *Engine {
 	e := &Engine{
-		Listeners:    make([]*ListenerConfig, 0),
-		Config:       cfg,
-		Balancers:    make(map[string]lb.Balancer),
-		Backends:     make(map[string]*config.Backend),
-		Checkers:     make(map[string]*health.Checker),
-		RateLimiters: make(map[string]*RateLimiter),
+		Listeners:     make([]*ListenerConfig, 0),
+		Config:        cfg,
+		Balancers:     make(map[string]lb.Balancer),
+		Backends:      make(map[string]*config.Backend),
+		Checkers:      make(map[string]*health.Checker),
+		RateLimiters:  make(map[string]*RateLimiter),
+		ConnLimiters:  make(map[string]*ConnLimiter),
+		PassiveHealth: make(map[string]*PassiveHealthTracker),
+		StickyStores:  make(map[string]*sticky.Store),
 	}
 	return e
 }
@@ -99,7 +106,16 @@ func (e *Engine) Start(ctx context.Context) error {
 			Routes:         l.Routes,
 			Headers:        l.Headers,
 		}
-		srv := httpproxy.NewHTTPServer(httpL, e.Balancers, e.Backends, rl)
+		// Build interface maps for httpproxy
+		connLimiters := make(map[string]httpproxy.ConnLimiterI)
+		for k, v := range e.ConnLimiters {
+			connLimiters[k] = v
+		}
+		passiveHealth := make(map[string]httpproxy.PassiveHealthI)
+		for k, v := range e.PassiveHealth {
+			passiveHealth[k] = v
+		}
+		srv := httpproxy.NewHTTPServer(httpL, e.Balancers, e.Backends, rl, connLimiters, passiveHealth, e.StickyStores)
 		if err := srv.Start(); err != nil {
 			return fmt.Errorf("HTTP listener %s start failed: %v", l.Name, err)
 		}
@@ -233,6 +249,31 @@ func (e *Engine) initBackends() {
 		e.Backends[be.Name] = be
 		logging.Info("Initialized backend %s with %s balancing", be.Name, be.Balance)
 
+		// Connection limiter
+		if be.MaxConnections > 0 {
+			e.ConnLimiters[be.Name] = NewConnLimiter(be.MaxConnections)
+			logging.Info("Connection limiter for %s: max %d", be.Name, be.MaxConnections)
+		}
+
+		// Passive health checks
+		if be.HealthCheck.Passive.MaxFails > 0 {
+			e.PassiveHealth[be.Name] = NewPassiveHealthTracker(be.Name, be.HealthCheck.Passive.MaxFails, balancer)
+			logging.Info("Passive health for %s: max_fails=%d", be.Name, be.HealthCheck.Passive.MaxFails)
+		}
+
+		// Sticky sessions
+		if be.StickySession.Type != "" {
+			ttl := 1 * time.Hour
+			if be.StickySession.TTL != "" {
+				if d, err := time.ParseDuration(be.StickySession.TTL); err == nil {
+					ttl = d
+				}
+			}
+			e.StickyStores[be.Name] = sticky.NewStore(ttl)
+			logging.Info("Sticky session for %s: type=%s, ttl=%v", be.Name, be.StickySession.Type, ttl)
+		}
+
+		// Active health checks
 		if be.HealthCheck.Active.Interval != "" {
 			checker := health.NewChecker(be.HealthCheck, be)
 			checker.OnStatusChange = func(server string, healthy bool) {

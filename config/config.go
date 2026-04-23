@@ -143,13 +143,30 @@ type HeadersConfig struct {
 
 // Backend defines a server pool.
 type Backend struct {
-	Name        string   `yaml:"name"`
-	Balance     string   `yaml:"balance"`       // "roundrobin", "leastconn", "random"
-	SendProxyV2 bool     `yaml:"send_proxy_v2"` // Send PROXY Protocol v2 header to backend
-	Servers     []string `yaml:"servers"`       // List of server addresses
+	Name           string   `yaml:"name"`
+	Balance        string   `yaml:"balance"`          // "roundrobin", "leastconn", "random"
+	SendProxyV2    bool     `yaml:"send_proxy_v2"`    // Send PROXY Protocol v2 header to backend
+	Servers        []string `yaml:"servers"`          // List of server addresses
+	MaxConnections int      `yaml:"max_connections"`  // Max concurrent connections (0 = unlimited)
 
-	Timeouts    TimeoutConfig     `yaml:"timeouts,omitempty"`
-	HealthCheck HealthCheckConfig `yaml:"health_check,omitempty"`
+	Timeouts      TimeoutConfig     `yaml:"timeouts,omitempty"`
+	Retry         RetryConfig       `yaml:"retry,omitempty"`
+	StickySession StickyConfig      `yaml:"sticky_session,omitempty"`
+	HealthCheck   HealthCheckConfig `yaml:"health_check,omitempty"`
+}
+
+// RetryConfig defines retry behavior on backend failure.
+type RetryConfig struct {
+	Attempts int    `yaml:"attempts"` // max attempts (default 1 = no retry)
+	On       string `yaml:"on"`       // comma-separated: "connect_failure,502,503"
+}
+
+// StickyConfig defines session persistence.
+type StickyConfig struct {
+	Type       string `yaml:"type"`        // "cookie", "header", "ip_hash"
+	CookieName string `yaml:"cookie_name"` // for cookie type (default "NVELOX_SRV")
+	HeaderName string `yaml:"header_name"` // for header type
+	TTL        string `yaml:"ttl"`         // session TTL (default "1h")
 }
 
 type HealthCheckConfig struct {

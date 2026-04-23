@@ -13,10 +13,23 @@ import (
 
 	"nvelox/config"
 	"nvelox/core/logging"
+	"nvelox/core/sticky"
 	"nvelox/lb"
 
 	"github.com/quic-go/quic-go/http3"
 )
+
+// ConnLimiterI is the interface for connection limiting.
+type ConnLimiterI interface {
+	Acquire() bool
+	Release()
+}
+
+// PassiveHealthI is the interface for passive health tracking.
+type PassiveHealthI interface {
+	RecordFailure(server string)
+	RecordSuccess(server string)
+}
 
 // EngineRef provides access to shared engine components without circular imports.
 type EngineRef struct {
@@ -27,14 +40,17 @@ type EngineRef struct {
 
 // HTTPServer manages an HTTP/HTTPS listener with L7 routing.
 type HTTPServer struct {
-	Listener     *ListenerConfig
-	httpServer   *http.Server
-	http3Server  *http3.Server
-	router       *Router
-	Balancers    map[string]lb.Balancer
-	Backends     map[string]*config.Backend
-	RateLimiter  interface{ Allow() bool }
-	altSvcHeader string // set when HTTP/3 is enabled
+	Listener      *ListenerConfig
+	httpServer    *http.Server
+	http3Server   *http3.Server
+	router        *Router
+	Balancers     map[string]lb.Balancer
+	Backends      map[string]*config.Backend
+	RateLimiter   interface{ Allow() bool }
+	ConnLimiters  map[string]ConnLimiterI
+	PassiveHealth map[string]PassiveHealthI
+	StickyStores  map[string]*sticky.Store
+	altSvcHeader  string
 }
 
 // ListenerConfig mirrors core.ListenerConfig to avoid circular imports.
@@ -51,12 +67,15 @@ type ListenerConfig struct {
 }
 
 // NewHTTPServer creates an HTTP server for the given listener.
-func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends map[string]*config.Backend, rateLimiter interface{ Allow() bool }) *HTTPServer {
+func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends map[string]*config.Backend, rateLimiter interface{ Allow() bool }, connLimiters map[string]ConnLimiterI, passiveHealth map[string]PassiveHealthI, stickyStores map[string]*sticky.Store) *HTTPServer {
 	s := &HTTPServer{
-		Listener:    l,
-		router:      NewRouter(l.Routes, l.DefaultBackend),
-		Balancers:   balancers,
-		Backends:    backends,
+		Listener:      l,
+		router:        NewRouter(l.Routes, l.DefaultBackend),
+		Balancers:     balancers,
+		Backends:      backends,
+		ConnLimiters:  connLimiters,
+		PassiveHealth: passiveHealth,
+		StickyStores:  stickyStores,
 		RateLimiter: rateLimiter,
 	}
 
@@ -158,21 +177,44 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	backend := s.Backends[backendName]
+
+	// Connection limit check
+	if cl, ok := s.ConnLimiters[backendName]; ok {
+		if !cl.Acquire() {
+			http.Error(w, "Backend at capacity", http.StatusServiceUnavailable)
+			return
+		}
+		defer cl.Release()
+	}
+
 	// WebSocket upgrade detection
 	if isWebSocketUpgrade(r) {
 		s.handleWebSocket(w, r, balancer, backendName)
 		return
 	}
 
-	// Select backend server
-	target, err := balancer.Next()
-	if err != nil {
-		http.Error(w, "No healthy backends", http.StatusServiceUnavailable)
-		return
+	// Sticky session lookup
+	var stickyTarget string
+	if store, ok := s.StickyStores[backendName]; ok && backend != nil {
+		key := s.getStickyKey(r, backend.StickySession)
+		if key != "" {
+			stickyTarget = store.Get(key)
+			if stickyTarget != "" && !balancer.IsHealthy(stickyTarget) {
+				stickyTarget = "" // sticky server is down, pick new
+			}
+		}
 	}
 
-	// LeastConn tracking
-	balancer.OnConnect(target)
+	// Determine retry config
+	maxAttempts := 1
+	retryOn502 := false
+	retryOn503 := false
+	if backend != nil && backend.Retry.Attempts > 1 {
+		maxAttempts = backend.Retry.Attempts
+		retryOn502 = strings.Contains(backend.Retry.On, "502")
+		retryOn503 = strings.Contains(backend.Retry.On, "503")
+	}
 
 	// Apply request headers
 	setForwardedHeaders(r)
@@ -181,36 +223,127 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		applyRequestHeaders(r, routeHeaders)
 	}
 
-	// Create reverse proxy
-	proxy := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = "http"
-			req.URL.Host = target
-			req.Host = r.Host // preserve original Host header
-		},
-		ModifyResponse: func(resp *http.Response) error {
-			balancer.OnDisconnect(target)
-			applyResponseHeaders(resp.Header, &s.Listener.Headers)
-			if routeHeaders != nil {
-				applyResponseHeaders(resp.Header, routeHeaders)
-			}
-			return nil
-		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			balancer.OnDisconnect(target)
-			logging.Error("[HTTP] proxy error for %s: %v", r.URL.Path, err)
-			http.Error(w, "Bad Gateway", http.StatusBadGateway)
-		},
-	}
-
-	// Wrap ResponseWriter to capture status and bytes for access logging
+	// Retry loop
+	var excluded []string
+	var lastTarget string
 	rec := &statusRecorder{ResponseWriter: w, status: 200}
 	start := time.Now()
-	proxy.ServeHTTP(rec, r)
-	duration := float64(time.Since(start).Microseconds()) / 1000.0 // ms
 
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		var target string
+		var err error
+
+		if attempt == 0 && stickyTarget != "" {
+			target = stickyTarget
+		} else if attempt == 0 {
+			target, err = balancer.Next()
+		} else {
+			target, err = balancer.NextExcluding(excluded)
+		}
+		if err != nil {
+			http.Error(w, "No healthy backends", http.StatusServiceUnavailable)
+			return
+		}
+
+		lastTarget = target
+		balancer.OnConnect(target)
+
+		proxyErr := make(chan error, 1)
+		proxy := &httputil.ReverseProxy{
+			Director: func(req *http.Request) {
+				req.URL.Scheme = "http"
+				req.URL.Host = target
+				req.Host = r.Host
+			},
+			ModifyResponse: func(resp *http.Response) error {
+				balancer.OnDisconnect(target)
+				// Track passive health on success
+				if ph, ok := s.PassiveHealth[backendName]; ok {
+					ph.RecordSuccess(target)
+				}
+				// Check if we should retry on this status
+				if attempt < maxAttempts-1 {
+					if (resp.StatusCode == 502 && retryOn502) || (resp.StatusCode == 503 && retryOn503) {
+						if ph, ok := s.PassiveHealth[backendName]; ok {
+							ph.RecordFailure(target)
+						}
+						return fmt.Errorf("retry: status %d", resp.StatusCode)
+					}
+				}
+				applyResponseHeaders(resp.Header, &s.Listener.Headers)
+				if routeHeaders != nil {
+					applyResponseHeaders(resp.Header, routeHeaders)
+				}
+				// Set sticky session cookie
+				if store, ok := s.StickyStores[backendName]; ok && backend != nil {
+					key := s.getStickyKey(r, backend.StickySession)
+					if key != "" {
+						store.Set(key, target)
+						if backend.StickySession.Type == "cookie" {
+							cookieName := backend.StickySession.CookieName
+							if cookieName == "" {
+								cookieName = "NVELOX_SRV"
+							}
+							http.SetCookie(rec, &http.Cookie{
+								Name:     cookieName,
+								Value:    sticky.ServerToToken(target),
+								Path:     "/",
+								HttpOnly: true,
+							})
+						}
+					}
+				}
+				return nil
+			},
+			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+				balancer.OnDisconnect(target)
+				if ph, ok := s.PassiveHealth[backendName]; ok {
+					ph.RecordFailure(target)
+				}
+				proxyErr <- err
+			},
+		}
+
+		proxy.ServeHTTP(rec, r)
+
+		// Check if we need to retry
+		select {
+		case err := <-proxyErr:
+			excluded = append(excluded, target)
+			if attempt < maxAttempts-1 {
+				logging.Warn("[HTTP] Retry %d/%d for %s: %v", attempt+1, maxAttempts, r.URL.Path, err)
+				rec = &statusRecorder{ResponseWriter: w, status: 200} // reset recorder
+				continue
+			}
+			logging.Error("[HTTP] All retries exhausted for %s: %v", r.URL.Path, err)
+			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		default:
+			// Success or non-retryable response
+		}
+		break
+	}
+
+	duration := float64(time.Since(start).Microseconds()) / 1000.0
 	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-	logging.AccessHTTP(clientIP, r.Method, r.URL.Path, r.Proto, rec.status, rec.bytes, duration, target)
+	logging.AccessHTTP(clientIP, r.Method, r.URL.Path, r.Proto, rec.status, rec.bytes, duration, lastTarget)
+}
+
+// getStickyKey returns the session key based on the sticky session config.
+func (s *HTTPServer) getStickyKey(r *http.Request, cfg config.StickyConfig) string {
+	switch cfg.Type {
+	case "cookie":
+		cookieName := cfg.CookieName
+		if cookieName == "" {
+			cookieName = "NVELOX_SRV"
+		}
+		return sticky.KeyFromCookie(r, cookieName)
+	case "header":
+		return sticky.KeyFromHeader(r, cfg.HeaderName)
+	case "ip_hash":
+		return sticky.KeyFromIPHash(r)
+	default:
+		return ""
+	}
 }
 
 // statusRecorder wraps http.ResponseWriter to capture status code and bytes written.
