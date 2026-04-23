@@ -20,10 +20,42 @@ include: "/etc/nvelox/config.d/*.yaml"
 
 # Listeners and Backends can also be defined here directly
 listeners:
+  # Basic TCP listener
   - name: "web-traffic"
     bind: ":80"
     protocol: "tcp"
     default_backend: "web-cluster"
+
+  # TLS-terminated listener
+  - name: "web-traffic-tls"
+    bind: ":443"
+    protocol: "tcp"
+    default_backend: "web-cluster"
+    tls:
+      cert: "/etc/ssl/certs/server.pem"
+      key: "/etc/ssl/private/server.key"
+
+  # Rate-limited listener
+  - name: "api-gateway"
+    bind: ":8080"
+    protocol: "tcp"
+    default_backend: "api-servers"
+    rate_limit:
+      connections_per_second: 100
+      burst: 50
+
+  # Port range with zero-copy (gaming / VoIP)
+  - name: "dynamic-ports"
+    bind: ":10000-11000"
+    protocol: "tcp"
+    zero_copy: true
+    default_backend: "tunnel-nodes"
+
+  # UDP listener (session affinity via connection pool)
+  - name: "dns-proxy"
+    bind: ":5353"
+    protocol: "udp"
+    default_backend: "dns-servers"
 
 backends:
   - name: "web-cluster"
@@ -31,15 +63,33 @@ backends:
     servers:
       - "10.0.0.1:8080"
       - "10.0.0.2:8080"
+    health_check:
+      active:
+        type: "http"
+        interval: "5s"
+        timeout: "1s"
+        path: "/health"
+
   - name: "api-servers"
-    balance: "roundrobin"
+    balance: "leastconn"
     send_proxy_v2: true
-    # Health Check Configuration
-    # active:
-    #   type: "tcp" # or "http"
-    #   interval: "5s"
-    #   timeout: "1s"
-    #   path: "/health" # only for http
     servers:
       - "10.0.0.1:8080"
       - "10.0.0.2:8080"
+    health_check:
+      active:
+        type: "tcp"
+        interval: "5s"
+        timeout: "1s"
+
+  - name: "tunnel-nodes"
+    balance: "leastconn"
+    servers:
+      - "10.0.1.5" # 1:1 Port Mapping (e.g. 10001 -> 10.0.1.5:10001)
+      - "10.0.1.6"
+
+  - name: "dns-servers"
+    balance: "random"
+    servers:
+      - "10.0.2.1:53"
+      - "10.0.2.2:53"

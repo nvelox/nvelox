@@ -18,10 +18,15 @@ Nvelox is a lightweight, high-performance TCP/UDP load balancer and proxy server
 ## Features
 
 - **High Performance**: Built on an event-driven networking engine (Reactor pattern) via `nbio`, minimizing goroutine overhead.
+- **Async Backend Dial**: TCP backend connections use `nbio.DialAsync` — no goroutine-per-connection overhead.
 - **Port Ranges**: Efficiently bind to thousands of ports (e.g., `10000-20000`) with a single configuration line.
   > **Note:** When using port ranges, the **destination port is preserved** if a specific backend port is not mapped. This is ideal for gaming and VoIP applications requiring direct 1:1 port mapping.
-- **Load Balancing**: Supports `roundrobin`, `leastconn`, and `random`.
+- **Load Balancing**: Supports `roundrobin`, `leastconn`, and `random` with accurate connection tracking.
+- **TLS Termination**: Native TLS support on any listener with cert/key configuration.
+- **Rate Limiting**: Per-listener token bucket rate limiter to protect against connection floods.
 - **PROXY Protocol v2**: Transparently passes client IP information to backends (TCP & UDP supported).
+- **UDP Session Affinity**: Connection pool ensures packets from the same client route to the same backend with TTL-based cleanup.
+- **Config Validation**: Comprehensive validation at load time — server addresses, ports, health check durations, TLS files, and balance algorithms.
 - **Advanced Logging**: Structured file-based logging with configurable levels (`debug`, `info`, `warn`, `error`).
 - **Modular Configuration**: Support for split configuration files via `include`.
 - **Zero-Dependency**: Static binary, easy to deploy.
@@ -34,15 +39,19 @@ Nvelox uses `nbio` to run an event loop on each listener, handling thousands of 
 graph TD
     Client(Clients) -->|TCP/UDP| Listeners
     subgraph Nvelox Node
-        Listeners -->|Accepted| EventLoop{nbio Event Loop}
+        Listeners -->|Accepted| RateLimit{Rate Limiter}
+        RateLimit -->|Allowed| EventLoop{nbio Event Loop}
+        RateLimit -->|Rejected| Drop[Connection Dropped]
         EventLoop -->|Session Ctx| LB[Load Balancer]
         LB -->|Select| BackendConn[Backend Connection]
+        TLS[TLS Listener] -->|Handshake| EventLoop
     end
     BackendConn -->|PROXY v2 + Data| AppServers(Application Servers)
 ```
 
-- **TCP**: Connections are accepted asynchronously. Data is forwarded using an optimized buffer path.
-- **UDP**: Packets are processed in batches. A session table tracks "connections" to maintain stickiness.
+- **TCP**: Connections are accepted asynchronously. Backend connections use `nbio.DialAsync` for non-blocking dial — no goroutine-per-connection. Data is forwarded bidirectionally via the event loop.
+- **UDP**: Packets are processed with session affinity. A connection pool maps each client to its backend, ensuring consistent routing with TTL-based cleanup.
+- **TLS**: TLS listeners perform the handshake in a dedicated accept loop, then hand the decrypted connection to the main proxy path.
 
 ## Nvelox vs. The Giants
 
@@ -51,9 +60,11 @@ graph TD
 | **Architecture** | **Event-Driven (Go/nbio/epoll)** | Event-Driven (C/epoll) | Event-Driven (C/epoll) |
 | **Concurrency Model** | Reactors (Internal Event Loops) | Process-based (Single/Multi-process) | Process-based (Worker Processes) |
 | **Port Binding** | **Range-Optimized (10k ports in <1s)** | Individual Binds (Slow for 10k+) | Individual Binds (Config hell) |
-| **UDP Mode** | **Session-Aware (Stickiness)** | Datagram/Stream | Datagram |
+| **UDP Mode** | **Session-Aware (Pool + Affinity)** | Datagram/Stream | Datagram |
+| **TLS Termination** | **Yes (crypto/tls)** | Yes (OpenSSL) | Yes (OpenSSL) |
+| **Rate Limiting** | **Yes (Token Bucket)** | Yes (stick-tables) | Yes (limit_conn) |
 | **Zero-Copy** | **Native (Splice/Sendfile)** | Yes (Splice) | Yes (Sendfile) |
-| **Configuration** | **Simple YAML** | Complex HCL-like | Directive-based |
+| **Configuration** | **Simple YAML + Validation** | Complex HCL-like | Directive-based |
 | **Binary Size** | ~10MB (Static) | ~2-5MB (Dynamic) | ~1-3MB (Dynamic) |
 | **Hot Reload** | Planned | Yes (Hitless) | Yes |
 | **Memory (10k Conns)** | **Low (~40MB)** | Low (~150MB) | Medium |
@@ -105,6 +116,18 @@ listeners:
     protocol: "tcp"
     zero_copy: true # Enable zero-copy splice (linux only)
     default_backend: "api-servers"
+    rate_limit:
+      connections_per_second: 100  # Max 100 new connections/sec
+      burst: 50                    # Allow burst of 50
+
+  # TLS-Terminated Listener
+  - name: "api-secure"
+    bind: ":8443"
+    protocol: "tcp"
+    default_backend: "api-servers"
+    tls:
+      cert: "/etc/ssl/certs/server.pem"
+      key: "/etc/ssl/private/server.key"
 
   # Port Range (Mass Binding)
   - name: "dynamic-ports"
@@ -112,10 +135,16 @@ listeners:
     protocol: "tcp"
     default_backend: "tunnel-nodes"
 
+  # UDP with Session Affinity
+  - name: "dns-proxy"
+    bind: ":5353"
+    protocol: "udp"
+    default_backend: "dns-servers"
+
 backends:
   - name: "api-servers"
-    balance: "roundrobin"
-    send_proxy_v2: true # Enable PROXY Protocol v2 to pass client IP
+    balance: "leastconn"  # Accurate connection tracking
+    send_proxy_v2: true   # Enable PROXY Protocol v2 to pass client IP
     
     # Active Health Check
     health_check:
@@ -134,6 +163,12 @@ backends:
     servers:
       - "10.0.1.5" # 1:1 Port Mapping (e.g. 10001 -> 10.0.1.5:10001)
       - "10.0.1.6"
+
+  - name: "dns-servers"
+    balance: "random"
+    servers:
+      - "10.0.2.1:53"
+      - "10.0.2.2:53"
 ```
 
 ## Load Balancing Algorithms
@@ -144,10 +179,17 @@ backends:
 
 ## Roadmap
 
-- [ ] **Health Checks**: Active (TCP/HTTP) and Passive health checks for backends.
+- [x] **Health Checks**: Active (TCP/HTTP) health checks for backends.
+- [x] **TLS Termination**: Native SSL/TLS support for listeners.
+- [x] **Rate Limiting**: Per-listener token bucket rate limiter.
+- [x] **LeastConn Tracking**: Accurate connection counting for load balancing.
+- [x] **Async Backend Dial**: Non-blocking TCP backend connections via nbio.
+- [x] **UDP Connection Pooling**: Session affinity with TTL-based cleanup.
+- [x] **Config Validation**: Comprehensive validation at load time.
+- [ ] **Passive Health Checks**: Failure-based backend marking.
 - [ ] **Web Dashboard**: Real-time metrics and configuration monitoring.
-- [ ] **TLS Termination**: Native SSL/TLS support for listeners.
 - [ ] **Hot Reloading**: Update configuration without dropping connections.
+- [ ] **Auto TLS**: Automatic certificate management (Let's Encrypt / ACME).
 
 ## Contributing
 
@@ -178,9 +220,13 @@ We welcome contributions from the community! Whether it's reporting a bug, impro
 ### Development Plan
 
 Nvelox uses **Go 1.25+**. Key areas to explore:
-* `core/`: The heart of the event loop.
-* `proxy/`: Protocol parsing (PROXY v2, etc.).
-* `lb/`: Load balancing logic.
+* `core/engine.go`: Engine orchestration, TLS listener setup, rate limiter init.
+* `core/handler.go`: Connection handling, async dial, data forwarding.
+* `core/ratelimit.go`: Token bucket rate limiter.
+* `core/udppool.go`: UDP session affinity pool.
+* `config/`: YAML parsing and validation.
+* `proxy/`: Protocol parsing (PROXY v2).
+* `lb/`: Load balancing algorithms (roundrobin, leastconn, random).
 
 ## License
 
