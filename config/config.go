@@ -60,9 +60,18 @@ type Listener struct {
 	ACL         []ACLRule         `yaml:"acl,omitempty"`
 
 	// L7 fields
-	HTTP3   bool          `yaml:"http3,omitempty"`
-	Routes  []RouteConfig `yaml:"routes,omitempty"`
-	Headers HeadersConfig `yaml:"headers,omitempty"`
+	HTTP3       bool              `yaml:"http3,omitempty"`
+	Routes      []RouteConfig     `yaml:"routes,omitempty"`
+	Headers     HeadersConfig     `yaml:"headers,omitempty"`
+	Compression CompressionConfig `yaml:"compression,omitempty"`
+	ErrorPages  map[int]string    `yaml:"error_pages,omitempty"` // status code -> file path
+}
+
+// CompressionConfig defines response compression settings.
+type CompressionConfig struct {
+	Enabled   bool     `yaml:"enabled"`
+	Types     []string `yaml:"types,omitempty"`      // content types to compress
+	MinLength int      `yaml:"min_length,omitempty"` // minimum response size in bytes
 }
 
 // IPRateLimitConfig defines per-IP rate limiting.
@@ -99,15 +108,29 @@ type TLSConfig struct {
 
 // RouteConfig defines an L7 route matching rule.
 type RouteConfig struct {
-	Match   RouteMatch    `yaml:"match"`
-	Backend string        `yaml:"backend"`
-	Headers HeadersConfig `yaml:"headers,omitempty"`
+	Match    RouteMatch    `yaml:"match"`
+	Backend  string        `yaml:"backend,omitempty"`
+	Headers  HeadersConfig `yaml:"headers,omitempty"`
+	Rewrite  RewriteConfig `yaml:"rewrite,omitempty"`
+	Redirect RedirectConfig `yaml:"redirect,omitempty"`
 }
 
 // RouteMatch defines the conditions for matching an HTTP request.
 type RouteMatch struct {
 	Host       string `yaml:"host,omitempty"`        // Exact host match (case-insensitive)
 	PathPrefix string `yaml:"path_prefix,omitempty"` // URL path prefix match
+	PathRegex  string `yaml:"path_regex,omitempty"`  // Regex path match (captures available for rewrite)
+}
+
+// RewriteConfig defines URL rewriting.
+type RewriteConfig struct {
+	Path string `yaml:"path,omitempty"` // Replace path (supports $1 captures from regex)
+}
+
+// RedirectConfig defines HTTP redirect responses.
+type RedirectConfig struct {
+	URL  string `yaml:"url,omitempty"`
+	Code int    `yaml:"code,omitempty"` // 301 or 302 (default 302)
 }
 
 // TimeoutConfig defines configurable timeouts for listeners and backends.

@@ -102,6 +102,8 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 					MaxBodySize:    l.MaxBodySize,
 					IPRateLimit:    l.IPRateLimit,
 					ACL:            l.ACL,
+					Compression:    l.Compression,
+					ErrorPages:     l.ErrorPages,
 					Port:           p,
 				})
 			}

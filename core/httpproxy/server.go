@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"os"
 	"strings"
 	"time"
 
@@ -57,6 +58,8 @@ type HTTPServer struct {
 	IPDenylist    []*net.IPNet
 	IPRateLimiter *middleware.IPRateLimiter
 	MaxBodySize   int64 // 0 = unlimited
+	Compression   config.CompressionConfig
+	ErrorPages    map[int][]byte // status code -> pre-loaded HTML content
 	altSvcHeader  string
 }
 
@@ -76,6 +79,8 @@ type ListenerConfig struct {
 	MaxBodySize    string
 	IPRateLimit    config.IPRateLimitConfig
 	ACL            []config.ACLRule
+	Compression    config.CompressionConfig
+	ErrorPages     map[int]string // status code -> file path
 }
 
 // NewHTTPServer creates an HTTP server for the given listener.
@@ -92,6 +97,21 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 		IPDenylist:    acl.ParseCIDRList(l.IPDenylist),
 		MaxBodySize:   parseByteSize(l.MaxBodySize),
 		RateLimiter: rateLimiter,
+	}
+
+	s.Compression = l.Compression
+
+	// Load error pages
+	if len(l.ErrorPages) > 0 {
+		s.ErrorPages = make(map[int][]byte)
+		for code, path := range l.ErrorPages {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				logging.Error("[HTTP] Failed to load error page for %d from %s: %v", code, path, err)
+				continue
+			}
+			s.ErrorPages[code] = data
+		}
 	}
 
 	if len(l.ACL) > 0 {
@@ -244,7 +264,35 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Route matching
-	backendName, routeHeaders := s.router.Match(r.Host, r.URL.Path)
+	routeResult := s.router.MatchFull(r.Host, r.URL.Path)
+	var backendName string
+	var routeHeaders *config.HeadersConfig
+	if routeResult != nil {
+		backendName = routeResult.Backend
+		routeHeaders = routeResult.Headers
+
+		// Handle redirect
+		if routeResult.Redirect.URL != "" {
+			code := routeResult.Redirect.Code
+			if code == 0 {
+				code = 302
+			}
+			http.Redirect(w, r, routeResult.Redirect.URL, code)
+			return
+		}
+
+		// Handle rewrite
+		if routeResult.Rewrite.Path != "" {
+			newPath := routeResult.Rewrite.Path
+			if len(routeResult.RegexMatches) > 0 {
+				newPath = ApplyRewrite(newPath, routeResult.RegexMatches)
+			}
+			r.URL.Path = newPath
+		}
+	} else {
+		backendName = s.router.defaultBackend
+	}
+
 	if backendName == "" {
 		http.Error(w, "No backend available", http.StatusServiceUnavailable)
 		return
@@ -302,10 +350,19 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		applyRequestHeaders(r, routeHeaders)
 	}
 
+	// Compression wrapping
+	var cw *compressWriter
+	responseWriter := w
+	if shouldCompress(r, s.Compression) {
+		cw = newCompressWriter(w, s.Compression)
+		responseWriter = cw
+		defer cw.Close()
+	}
+
 	// Retry loop
 	var excluded []string
 	var lastTarget string
-	rec := &statusRecorder{ResponseWriter: w, status: 200}
+	rec := &statusRecorder{ResponseWriter: responseWriter, status: 200}
 	start := time.Now()
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {

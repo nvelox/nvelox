@@ -138,3 +138,83 @@ func TestRouter_RouteHeaders(t *testing.T) {
 		t.Error("expected nil headers for default backend")
 	}
 }
+
+func TestRouter_RegexMatch(t *testing.T) {
+	r := NewRouter([]config.RouteConfig{
+		{Match: config.RouteMatch{PathRegex: `^/api/v(\d+)/(.*)`}, Backend: "api"},
+	}, "default")
+
+	result := r.MatchFull("any.com", "/api/v2/users")
+	if result == nil {
+		t.Fatal("expected match")
+	}
+	if result.Backend != "api" {
+		t.Errorf("expected api, got %s", result.Backend)
+	}
+	if len(result.RegexMatches) < 3 {
+		t.Fatalf("expected 3 captures, got %d", len(result.RegexMatches))
+	}
+	if result.RegexMatches[1] != "2" {
+		t.Errorf("expected capture $1=2, got %s", result.RegexMatches[1])
+	}
+	if result.RegexMatches[2] != "users" {
+		t.Errorf("expected capture $2=users, got %s", result.RegexMatches[2])
+	}
+}
+
+func TestRouter_RegexNoMatch(t *testing.T) {
+	r := NewRouter([]config.RouteConfig{
+		{Match: config.RouteMatch{PathRegex: `^/special/\d+$`}, Backend: "special"},
+	}, "default")
+
+	result := r.MatchFull("any.com", "/other/path")
+	if result != nil {
+		t.Error("expected no match for non-matching regex")
+	}
+}
+
+func TestRouter_Redirect(t *testing.T) {
+	r := NewRouter([]config.RouteConfig{
+		{
+			Match:    config.RouteMatch{PathPrefix: "/old"},
+			Redirect: config.RedirectConfig{URL: "/new", Code: 301},
+		},
+	}, "default")
+
+	result := r.MatchFull("any.com", "/old/page")
+	if result == nil {
+		t.Fatal("expected match")
+	}
+	if result.Redirect.URL != "/new" {
+		t.Errorf("expected redirect to /new, got %s", result.Redirect.URL)
+	}
+	if result.Redirect.Code != 301 {
+		t.Errorf("expected 301, got %d", result.Redirect.Code)
+	}
+}
+
+func TestRouter_Rewrite(t *testing.T) {
+	r := NewRouter([]config.RouteConfig{
+		{
+			Match:   config.RouteMatch{PathRegex: `^/api/v(\d+)/(.*)`},
+			Backend: "api",
+			Rewrite: config.RewriteConfig{Path: "/v$1/$2"},
+		},
+	}, "default")
+
+	result := r.MatchFull("any.com", "/api/v2/users")
+	if result == nil {
+		t.Fatal("expected match")
+	}
+	rewritten := ApplyRewrite(result.Rewrite.Path, result.RegexMatches)
+	if rewritten != "/v2/users" {
+		t.Errorf("expected /v2/users, got %s", rewritten)
+	}
+}
+
+func TestApplyRewrite_NoCaptures(t *testing.T) {
+	result := ApplyRewrite("/static/path", nil)
+	if result != "/static/path" {
+		t.Errorf("expected /static/path, got %s", result)
+	}
+}

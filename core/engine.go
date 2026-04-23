@@ -59,6 +59,8 @@ type ListenerConfig struct {
 	MaxBodySize    string
 	IPRateLimit    config.IPRateLimitConfig
 	ACL            []config.ACLRule
+	Compression    config.CompressionConfig
+	ErrorPages     map[int]string
 }
 
 func NewEngine(cfg *config.Config) *Engine {
@@ -115,6 +117,8 @@ func (e *Engine) Start(ctx context.Context) error {
 			MaxBodySize:    l.MaxBodySize,
 			IPRateLimit:    l.IPRateLimit,
 			ACL:            l.ACL,
+			Compression:    l.Compression,
+			ErrorPages:     l.ErrorPages,
 		}
 		// Build interface maps for httpproxy
 		connLimiters := make(map[string]httpproxy.ConnLimiterI)
