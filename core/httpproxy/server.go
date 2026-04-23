@@ -14,6 +14,7 @@ import (
 
 	"nvelox/config"
 	"nvelox/core/acl"
+	"nvelox/core/httpproxy/errorhtml"
 	"nvelox/core/logging"
 	"nvelox/core/middleware"
 	"nvelox/core/sticky"
@@ -278,20 +279,20 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// IP denylist check
 	if len(s.IPDenylist) > 0 && acl.CheckIPList(r.RemoteAddr, s.IPDenylist) {
-		http.Error(w, "Forbidden", http.StatusForbidden)
+		s.serveError(w, http.StatusForbidden)
 		return
 	}
 
 	// IP allowlist check (if set, only listed IPs are allowed)
 	if len(s.IPAllowlist) > 0 && !acl.CheckIPList(r.RemoteAddr, s.IPAllowlist) {
-		http.Error(w, "Forbidden", http.StatusForbidden)
+		s.serveError(w, http.StatusForbidden)
 		return
 	}
 
 	// Per-listener rate limiting
 	if s.RateLimiter != nil {
 		if !s.RateLimiter.Allow() {
-			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			s.serveError(w, http.StatusTooManyRequests)
 			return
 		}
 	}
@@ -299,7 +300,7 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Per-IP rate limiting
 	if s.IPRateLimiter != nil {
 		if !s.IPRateLimiter.Allow(r.RemoteAddr) {
-			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			s.serveError(w, http.StatusTooManyRequests)
 			return
 		}
 	}
@@ -308,7 +309,7 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.ACLEngine != nil {
 		action := s.ACLEngine.Check(r)
 		if action == "deny" {
-			http.Error(w, "Forbidden", http.StatusForbidden)
+			s.serveError(w, http.StatusForbidden)
 			return
 		}
 	}
@@ -362,13 +363,13 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if backendName == "" {
-		http.Error(w, "No backend available", http.StatusServiceUnavailable)
+		s.serveError(w, http.StatusServiceUnavailable)
 		return
 	}
 
 	balancer, ok := s.Balancers[backendName]
 	if !ok {
-		http.Error(w, "Backend not found", http.StatusBadGateway)
+		s.serveError(w, http.StatusBadGateway)
 		return
 	}
 
@@ -377,7 +378,7 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Circuit breaker check
 	if cb, ok := s.CircuitBreakers[backendName]; ok {
 		if !cb.Allow() {
-			http.Error(w, "Service Unavailable (circuit open)", http.StatusServiceUnavailable)
+			s.serveError(w, http.StatusServiceUnavailable)
 			return
 		}
 	}
@@ -385,7 +386,7 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Connection limit check
 	if cl, ok := s.ConnLimiters[backendName]; ok {
 		if !cl.Acquire() {
-			http.Error(w, "Backend at capacity", http.StatusServiceUnavailable)
+			s.serveError(w, http.StatusServiceUnavailable)
 			return
 		}
 		defer cl.Release()
@@ -453,7 +454,7 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			target, err = balancer.NextExcluding(excluded)
 		}
 		if err != nil {
-			http.Error(w, "No healthy backends", http.StatusServiceUnavailable)
+			s.serveError(w, http.StatusServiceUnavailable)
 			return
 		}
 
@@ -553,7 +554,7 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			logging.Error("[HTTP] All retries exhausted for %s: %v", r.URL.Path, err)
-			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+			s.serveError(w, http.StatusBadGateway)
 		default:
 			// Success or non-retryable response
 		}
@@ -641,6 +642,26 @@ func setForwardedHeaders(r *http.Request) {
 // applyRequestHeaders applies header add/set/remove to the request.
 // expandRedirectVars substitutes variables in redirect URLs.
 // Supported: ${host}, ${path}, ${query}, ${scheme}, ${uri}, ${port}
+// serveError writes an HTML error page. Uses custom error page if configured,
+// otherwise falls back to the built-in styled template.
+func (s *HTTPServer) serveError(w http.ResponseWriter, statusCode int) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	// Check for custom error page
+	if s.ErrorPages != nil {
+		if page, ok := s.ErrorPages[statusCode]; ok {
+			w.WriteHeader(statusCode)
+			w.Write(page)
+			return
+		}
+	}
+
+	// Default styled error page
+	w.WriteHeader(statusCode)
+	w.Write(errorhtml.DefaultErrorPage(statusCode))
+}
+
 func expandRedirectVars(url string, r *http.Request) string {
 	if !strings.Contains(url, "${") {
 		return url
@@ -702,7 +723,7 @@ func applyResponseHeaders(h http.Header, cfg *config.HeadersConfig) {
 func (s *HTTPServer) handleWebSocket(w http.ResponseWriter, r *http.Request, balancer lb.Balancer, backendName string) {
 	target, err := balancer.Next()
 	if err != nil {
-		http.Error(w, "No healthy backends", http.StatusServiceUnavailable)
+		s.serveError(w, http.StatusServiceUnavailable)
 		return
 	}
 	balancer.OnConnect(target)
@@ -712,7 +733,7 @@ func (s *HTTPServer) handleWebSocket(w http.ResponseWriter, r *http.Request, bal
 	backendConn, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
 		logging.Error("[WS] Backend dial failed: %v", err)
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		s.serveError(w, http.StatusBadGateway)
 		return
 	}
 	defer backendConn.Close()
@@ -720,14 +741,14 @@ func (s *HTTPServer) handleWebSocket(w http.ResponseWriter, r *http.Request, bal
 	// Forward the original upgrade request to backend
 	if err := r.Write(backendConn); err != nil {
 		logging.Error("[WS] Failed to write upgrade request: %v", err)
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		s.serveError(w, http.StatusBadGateway)
 		return
 	}
 
 	// Hijack client connection
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		http.Error(w, "WebSocket hijack not supported", http.StatusInternalServerError)
+		s.serveError(w, http.StatusInternalServerError)
 		return
 	}
 	clientConn, clientBuf, err := hijacker.Hijack()
