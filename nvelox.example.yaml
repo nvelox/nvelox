@@ -51,6 +51,32 @@ listeners:
     zero_copy: true
     default_backend: "tunnel-nodes"
 
+  # HTTP/HTTPS L7 reverse proxy with routing
+  - name: "web-gateway"
+    bind: ":443"
+    protocol: "https"
+    http3: true  # Enable QUIC/HTTP3 on same port
+    tls:
+      cert: "/etc/ssl/certs/server.pem"
+      key: "/etc/ssl/private/server.key"
+    default_backend: "web-cluster"
+    headers:
+      response_add:
+        Strict-Transport-Security: "max-age=31536000"
+    routes:
+      - match:
+          host: "api.example.com"
+        backend: "api-servers"
+      - match:
+          path_prefix: "/static"
+        backend: "web-cluster"
+
+  # Plain HTTP listener
+  - name: "http-redirect"
+    bind: ":80"
+    protocol: "http"
+    default_backend: "web-cluster"
+
   # UDP listener (session affinity via connection pool)
   - name: "dns-proxy"
     bind: ":5353"

@@ -26,6 +26,10 @@ Nvelox is a lightweight, high-performance TCP/UDP load balancer and proxy server
 - **Rate Limiting**: Per-listener token bucket rate limiter to protect against connection floods.
 - **PROXY Protocol v2**: Transparently passes client IP information to backends (TCP & UDP supported).
 - **UDP Session Affinity**: Connection pool ensures packets from the same client route to the same backend with TTL-based cleanup.
+- **HTTP/1.1 + HTTP/2 Reverse Proxy**: L7 reverse proxy with Host and path-prefix routing, header manipulation, and automatic HTTP/2 via ALPN.
+- **HTTP/3 (QUIC)**: Native HTTP/3 support via quic-go with Alt-Svc header advertisement for client discovery.
+- **WebSocket Proxying**: Transparent WebSocket upgrade detection and bidirectional relay.
+- **Header Manipulation**: Add/set/remove headers on requests and responses, with automatic X-Forwarded-For, X-Real-IP, and X-Forwarded-Proto injection.
 - **Config Validation**: Comprehensive validation at load time — server addresses, ports, health check durations, TLS files, and balance algorithms.
 - **Advanced Logging**: Structured file-based logging with configurable levels (`debug`, `info`, `warn`, `error`).
 - **Modular Configuration**: Support for split configuration files via `include`.
@@ -171,6 +175,33 @@ backends:
       - "10.0.2.2:53"
 ```
 
+### HTTP/HTTPS Listener with L7 Routing
+
+```yaml
+listeners:
+  - name: "web-gateway"
+    bind: ":443"
+    protocol: "https"
+    http3: true  # Enable QUIC/HTTP3
+    tls:
+      cert: "/etc/ssl/cert.pem"
+      key: "/etc/ssl/key.pem"
+    default_backend: "web-servers"
+    headers:
+      response_add:
+        Strict-Transport-Security: "max-age=31536000"
+    routes:
+      - match:
+          host: "api.example.com"
+        backend: "api-servers"
+      - match:
+          path_prefix: "/static"
+        backend: "cdn-servers"
+      - match:
+          host: "ws.example.com"
+        backend: "websocket-servers"
+```
+
 ## Load Balancing Algorithms
 
 - **roundrobin**: Cycles through backends in order.
@@ -186,6 +217,10 @@ backends:
 - [x] **Async Backend Dial**: Non-blocking TCP backend connections via nbio.
 - [x] **UDP Connection Pooling**: Session affinity with TTL-based cleanup.
 - [x] **Config Validation**: Comprehensive validation at load time.
+- [x] **HTTP/1.1 + HTTP/2 Reverse Proxy**: L7 routing with Host/Path matching.
+- [x] **HTTP/3 (QUIC)**: Native HTTP/3 via quic-go.
+- [x] **WebSocket Proxying**: Transparent upgrade and relay.
+- [x] **Header Manipulation**: Request/response header add/set/remove.
 - [ ] **Passive Health Checks**: Failure-based backend marking.
 - [ ] **Web Dashboard**: Real-time metrics and configuration monitoring.
 - [ ] **Hot Reloading**: Update configuration without dropping connections.
@@ -221,7 +256,8 @@ We welcome contributions from the community! Whether it's reporting a bug, impro
 
 Nvelox uses **Go 1.25+**. Key areas to explore:
 * `core/engine.go`: Engine orchestration, TLS listener setup, rate limiter init.
-* `core/handler.go`: Connection handling, async dial, data forwarding.
+* `core/handler.go`: L4 connection handling, async dial, data forwarding.
+* `core/httpproxy/`: L7 HTTP reverse proxy (router, server, WebSocket).
 * `core/ratelimit.go`: Token bucket rate limiter.
 * `core/udppool.go`: UDP session affinity pool.
 * `config/`: YAML parsing and validation.
