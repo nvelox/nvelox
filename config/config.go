@@ -35,6 +35,7 @@ type ServerConfig struct {
 	User    string `yaml:"user"`
 	Group   string `yaml:"group"`
 	PidFile string `yaml:"pid_file"`
+	Workers int    `yaml:"workers,omitempty"` // SO_REUSEPORT workers (0 = single process)
 }
 
 type LoggingConfig struct {
@@ -59,6 +60,9 @@ type Listener struct {
 
 	// TLS
 	TLS TLSConfig `yaml:"tls,omitempty"`
+
+	// SNI routing (TLS passthrough without termination)
+	SNIRoutes []SNIRoute `yaml:"sni_routes,omitempty"`
 
 	// Security
 	IPAllowlist []string          `yaml:"ip_allowlist,omitempty"` // CIDR allow list
@@ -157,6 +161,12 @@ type RedirectConfig struct {
 	Code int    `yaml:"code,omitempty"` // 301 or 302 (default 302)
 }
 
+// SNIRoute defines TLS passthrough routing based on server name.
+type SNIRoute struct {
+	ServerName string `yaml:"server_name"` // hostname or *.example.com pattern
+	Backend    string `yaml:"backend"`
+}
+
 // TimeoutConfig defines configurable timeouts for listeners and backends.
 type TimeoutConfig struct {
 	Connect string `yaml:"connect,omitempty"` // dial timeout (default "10s")
@@ -225,6 +235,7 @@ type Backend struct {
 	Timeouts      TimeoutConfig     `yaml:"timeouts,omitempty"`
 	Retry         RetryConfig       `yaml:"retry,omitempty"`
 	StickySession StickyConfig      `yaml:"sticky_session,omitempty"`
+	ResolveInterval string           `yaml:"resolve_interval,omitempty"` // DNS re-resolve interval
 	BackendTLS     BackendTLSConfig  `yaml:"backend_tls,omitempty"`
 	CircuitBreaker CBConfig         `yaml:"circuit_breaker,omitempty"`
 	HealthCheck    HealthCheckConfig `yaml:"health_check,omitempty"`

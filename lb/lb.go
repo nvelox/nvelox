@@ -27,6 +27,8 @@ type Balancer interface {
 	MarkDraining(server string)
 	// IsHealthy returns whether a server is currently in the healthy pool.
 	IsHealthy(server string) bool
+	// UpdateServers replaces the server list (for DNS-based discovery).
+	UpdateServers(servers []string)
 }
 
 // NewBalancer creates a new load balancer based on the algorithm name.
@@ -113,6 +115,18 @@ func (b *RoundRobin) IsHealthy(server string) bool {
 	return b.status[server]
 }
 
+func (b *RoundRobin) UpdateServers(servers []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.allServers = make([]string, len(servers))
+	copy(b.allServers, servers)
+	b.status = make(map[string]bool)
+	for _, s := range b.allServers {
+		b.status[s] = true
+	}
+	b.healthy = append([]string{}, b.allServers...)
+}
+
 func (b *RoundRobin) NextExcluding(exclude []string) (string, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -195,6 +209,18 @@ func (r *Random) IsHealthy(server string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.status[server]
+}
+
+func (r *Random) UpdateServers(servers []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.allServers = make([]string, len(servers))
+	copy(r.allServers, servers)
+	r.status = make(map[string]bool)
+	for _, s := range r.allServers {
+		r.status[s] = true
+	}
+	r.healthy = append([]string{}, r.allServers...)
 }
 
 func (r *Random) NextExcluding(exclude []string) (string, error) {
@@ -308,6 +334,21 @@ func (b *LeastConn) IsHealthy(server string) bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.status[server]
+}
+
+func (b *LeastConn) UpdateServers(servers []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.allServers = make([]string, len(servers))
+	copy(b.allServers, servers)
+	b.status = make(map[string]bool)
+	newConns := make(map[string]int64)
+	for _, s := range b.allServers {
+		b.status[s] = true
+		newConns[s] = b.conns[s] // preserve existing counts
+	}
+	b.conns = newConns
+	b.healthy = append([]string{}, b.allServers...)
 }
 
 func (b *LeastConn) NextExcluding(exclude []string) (string, error) {

@@ -12,6 +12,7 @@ import (
 
 	"nvelox/config"
 	"nvelox/core/circuitbreaker"
+	"nvelox/core/discovery"
 	"nvelox/core/health"
 	"nvelox/core/httpproxy"
 	"nvelox/core/logging"
@@ -37,6 +38,7 @@ type Engine struct {
 	StickyStores    map[string]*sticky.Store          // keyed by backend name
 	CircuitBreakers map[string]*circuitbreaker.Breaker // keyed by backend name
 	Metrics         *metrics.Registry
+	DNSResolvers    []*discovery.DNSResolver
 	metricsServer   *http.Server
 	UDPPool         *UDPPool                          // UDP session affinity pool
 	HTTPServers     []*httpproxy.HTTPServer           // L7 HTTP servers
@@ -274,6 +276,9 @@ func (e *Engine) Start(ctx context.Context) error {
 	if e.UDPPool != nil {
 		e.UDPPool.Stop()
 	}
+	for _, r := range e.DNSResolvers {
+		r.Stop()
+	}
 
 	return nil
 }
@@ -342,6 +347,18 @@ func (e *Engine) initBackends() {
 				be.CircuitBreaker.HalfOpenMax,
 			)
 			logging.Info("Circuit breaker for %s: threshold=%d, timeout=%v", be.Name, be.CircuitBreaker.Threshold, cbTimeout)
+		}
+
+		// DNS-based service discovery
+		if be.ResolveInterval != "" {
+			interval, err := time.ParseDuration(be.ResolveInterval)
+			if err == nil && interval > 0 {
+				resolver := discovery.NewDNSResolver(be.Name, be.Servers, interval, func(servers []string) {
+					balancer.UpdateServers(servers)
+				})
+				resolver.Start()
+				e.DNSResolvers = append(e.DNSResolvers, resolver)
+			}
 		}
 
 		// Active health checks
