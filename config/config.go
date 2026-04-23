@@ -478,14 +478,16 @@ func validate(cfg *Config) error {
 				return fmt.Errorf("listener %s: HTTPS listener requires TLS cert/key", l.Name)
 			}
 			for i, r := range l.Routes {
-				if r.Backend == "" {
+				hasRedirect := r.Redirect.URL != ""
+				// Backend is required unless the route is a redirect
+				if r.Backend == "" && !hasRedirect {
 					return fmt.Errorf("listener %s: route %d must have a backend", l.Name, i)
 				}
-				if !backendNames[r.Backend] {
+				if r.Backend != "" && !backendNames[r.Backend] {
 					return fmt.Errorf("listener %s: route %d references unknown backend: %s", l.Name, i, r.Backend)
 				}
-				if r.Match.Host == "" && r.Match.PathPrefix == "" {
-					return fmt.Errorf("listener %s: route %d must have at least host or path_prefix", l.Name, i)
+				if r.Match.Host == "" && r.Match.PathPrefix == "" && r.Match.PathRegex == "" {
+					return fmt.Errorf("listener %s: route %d must have at least host, path_prefix, or path_regex", l.Name, i)
 				}
 			}
 		}
