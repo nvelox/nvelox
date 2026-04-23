@@ -73,6 +73,22 @@ type Listener struct {
 	Headers     HeadersConfig     `yaml:"headers,omitempty"`
 	Compression CompressionConfig `yaml:"compression,omitempty"`
 	ErrorPages  map[int]string    `yaml:"error_pages,omitempty"` // status code -> file path
+	Buffering   BufferingConfig   `yaml:"buffering,omitempty"`
+	Cache       CacheConfig       `yaml:"cache,omitempty"`
+}
+
+// BufferingConfig defines request/response buffer sizes.
+type BufferingConfig struct {
+	RequestBodyBuffer string `yaml:"request_body_buffer,omitempty"` // e.g., "64KB"
+	ResponseBuffer    string `yaml:"response_buffer,omitempty"`     // e.g., "256KB"
+}
+
+// CacheConfig defines response caching settings.
+type CacheConfig struct {
+	Enabled    bool     `yaml:"enabled"`
+	MaxSize    string   `yaml:"max_size,omitempty"`    // e.g., "256MB"
+	DefaultTTL string   `yaml:"default_ttl,omitempty"` // e.g., "5m"
+	Methods    []string `yaml:"methods,omitempty"`     // default ["GET"]
 }
 
 // CompressionConfig defines response compression settings.

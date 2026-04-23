@@ -75,6 +75,8 @@ type HTTPServer struct {
 	MaxBodySize     int64 // 0 = unlimited
 	Compression     config.CompressionConfig
 	ErrorPages    map[int][]byte // status code -> pre-loaded HTML content
+	ResponseCache *Cache
+	BufferPool    *BufferPool
 	altSvcHeader  string
 }
 
@@ -95,7 +97,9 @@ type ListenerConfig struct {
 	IPRateLimit    config.IPRateLimitConfig
 	ACL            []config.ACLRule
 	Compression    config.CompressionConfig
-	ErrorPages     map[int]string // status code -> file path
+	ErrorPages     map[int]string
+	Buffering      config.BufferingConfig
+	Cache          config.CacheConfig
 }
 
 // NewHTTPServer creates an HTTP server for the given listener.
@@ -116,6 +120,26 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 	}
 
 	s.Compression = l.Compression
+
+	// Initialize buffer pool
+	if l.Buffering.ResponseBuffer != "" {
+		bufSize := parseByteSize(l.Buffering.ResponseBuffer)
+		if bufSize > 0 {
+			s.BufferPool = NewBufferPool(int(bufSize))
+		}
+	}
+
+	// Initialize response cache
+	if l.Cache.Enabled {
+		maxSize := parseByteSize(l.Cache.MaxSize)
+		ttl := 5 * time.Minute
+		if l.Cache.DefaultTTL != "" {
+			if d, err := time.ParseDuration(l.Cache.DefaultTTL); err == nil {
+				ttl = d
+			}
+		}
+		s.ResponseCache = NewCache(maxSize, ttl, l.Cache.Methods)
+	}
 
 	// Load error pages
 	if len(l.ErrorPages) > 0 {
@@ -277,6 +301,15 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Request body size limit
 	if s.MaxBodySize > 0 && r.Body != nil {
 		r.Body = http.MaxBytesReader(w, r.Body, s.MaxBodySize)
+	}
+
+	// Cache lookup
+	if s.ResponseCache != nil && s.ResponseCache.ShouldCache(r.Method) && !ShouldSkipCache(r) {
+		key := CacheKey(r)
+		if entry := s.ResponseCache.Get(key); entry != nil {
+			ServeCached(w, entry)
+			return
+		}
 	}
 
 	// Route matching
@@ -469,8 +502,26 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				proxyErr <- err
 			},
 		}
+		if s.BufferPool != nil {
+			proxy.BufferPool = s.BufferPool
+		}
 
-		proxy.ServeHTTP(rec, r)
+		// Wrap with cache writer if caching is enabled for this request
+		var cacheW *cacheWriter
+		proxyTarget := http.ResponseWriter(rec)
+		if s.ResponseCache != nil && s.ResponseCache.ShouldCache(r.Method) && !ShouldSkipCache(r) {
+			cacheW = newCacheWriter(rec)
+			proxyTarget = cacheW
+		}
+
+		proxy.ServeHTTP(proxyTarget, r)
+
+		// Store in cache if applicable
+		if cacheW != nil && cacheW.statusCode >= 200 && cacheW.statusCode < 400 {
+			if !ShouldSkipCacheResponse(cacheW.ResponseWriter.Header()) {
+				s.ResponseCache.Put(CacheKey(r), cacheW.ToCacheEntry())
+			}
+		}
 
 		// Check if we need to retry
 		select {

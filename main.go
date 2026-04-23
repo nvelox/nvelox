@@ -104,6 +104,8 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 					ACL:            l.ACL,
 					Compression:    l.Compression,
 					ErrorPages:     l.ErrorPages,
+					Buffering:      l.Buffering,
+					Cache:          l.Cache,
 					Port:           p,
 				})
 			}

@@ -67,6 +67,8 @@ type ListenerConfig struct {
 	ACL            []config.ACLRule
 	Compression    config.CompressionConfig
 	ErrorPages     map[int]string
+	Buffering      config.BufferingConfig
+	Cache          config.CacheConfig
 }
 
 func NewEngine(cfg *config.Config) *Engine {
@@ -147,6 +149,8 @@ func (e *Engine) Start(ctx context.Context) error {
 			ACL:            l.ACL,
 			Compression:    l.Compression,
 			ErrorPages:     l.ErrorPages,
+			Buffering:      l.Buffering,
+			Cache:          l.Cache,
 		}
 		// Build interface maps for httpproxy
 		connLimiters := make(map[string]httpproxy.ConnLimiterI)
