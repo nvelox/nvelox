@@ -18,6 +18,8 @@ type Config struct {
 	Server  ServerConfig  `yaml:"server"`
 	Logging LoggingConfig `yaml:"logging"`
 	Metrics MetricsConfig `yaml:"metrics,omitempty"`
+	Admin   AdminConfig   `yaml:"admin,omitempty"`
+	Tracing TracingConfig `yaml:"tracing,omitempty"`
 	Include string        `yaml:"include"`
 
 	Listeners []Listener `yaml:"listeners"`
@@ -27,8 +29,27 @@ type Config struct {
 // MetricsConfig defines the Prometheus metrics endpoint.
 type MetricsConfig struct {
 	Enabled bool   `yaml:"enabled"`
-	Bind    string `yaml:"bind"` // e.g., ":9090"
-	Path    string `yaml:"path"` // default "/metrics"
+	Bind    string `yaml:"bind"`
+	Path    string `yaml:"path"`
+}
+
+// AdminConfig defines the admin REST API endpoint.
+type AdminConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Bind    string `yaml:"bind"` // e.g., "127.0.0.1:9091"
+}
+
+// TracingConfig defines OpenTelemetry tracing settings.
+type TracingConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	Endpoint string `yaml:"endpoint"` // OTLP endpoint
+	Service  string `yaml:"service"`  // service name
+}
+
+// ThrottleConfig defines bandwidth throttling settings.
+type ThrottleConfig struct {
+	ReadRate  string `yaml:"read_rate,omitempty"`  // e.g., "10MB/s"
+	WriteRate string `yaml:"write_rate,omitempty"` // e.g., "10MB/s"
 }
 
 type ServerConfig struct {
@@ -79,6 +100,8 @@ type Listener struct {
 	ErrorPages  map[int]string    `yaml:"error_pages,omitempty"` // status code -> file path
 	Buffering   BufferingConfig   `yaml:"buffering,omitempty"`
 	Cache       CacheConfig       `yaml:"cache,omitempty"`
+	GRPC        bool              `yaml:"grpc,omitempty"`        // Enable gRPC-aware proxying
+	Throttle    ThrottleConfig    `yaml:"throttle,omitempty"`    // Bandwidth throttling
 }
 
 // BufferingConfig defines request/response buffer sizes.

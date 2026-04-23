@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"nvelox/config"
+	"nvelox/core/admin"
 	"nvelox/core/circuitbreaker"
 	"nvelox/core/discovery"
 	"nvelox/core/health"
@@ -39,6 +40,7 @@ type Engine struct {
 	CircuitBreakers map[string]*circuitbreaker.Breaker // keyed by backend name
 	Metrics         *metrics.Registry
 	DNSResolvers    []*discovery.DNSResolver
+	AdminServer     *admin.Server
 	metricsServer   *http.Server
 	UDPPool         *UDPPool                          // UDP session affinity pool
 	HTTPServers     []*httpproxy.HTTPServer           // L7 HTTP servers
@@ -105,7 +107,13 @@ func (e *Engine) Start(ctx context.Context) error {
 	// 1c. Initialize UDP Pool
 	e.UDPPool = NewUDPPool(60 * time.Second)
 
-	// 1e. Start metrics server
+	// 1e. Start admin API
+	if e.Config.Admin.Enabled {
+		e.AdminServer = admin.NewServer(e.Config.Admin.Bind, e.Balancers)
+		e.AdminServer.Start()
+	}
+
+	// 1f. Start metrics server
 	if e.Config.Metrics.Enabled {
 		metricsPath := e.Config.Metrics.Path
 		if metricsPath == "" {
@@ -231,6 +239,12 @@ func (e *Engine) Start(ctx context.Context) error {
 
 	logging.Info("Stopping Engines...")
 
+	// Stop admin API
+	if e.AdminServer != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		e.AdminServer.Stop(shutdownCtx)
+		cancel()
+	}
 	// Stop metrics server
 	if e.metricsServer != nil {
 		e.metricsServer.Close()
