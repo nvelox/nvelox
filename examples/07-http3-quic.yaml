@@ -1,0 +1,20 @@
+## 07 — HTTP/3 (QUIC)
+## HTTPS + HTTP/3 on same port. Advertises Alt-Svc for client discovery.
+## Requires: examples/certs/server.pem and server-key.pem (see README).
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "h3-proxy"
+    bind: ":9443"
+    protocol: "https"
+    http3: true
+    default_backend: "backend"
+    tls:
+      cert: "examples/certs/server.pem"
+      key: "examples/certs/server-key.pem"
+backends:
+  - name: "backend"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"

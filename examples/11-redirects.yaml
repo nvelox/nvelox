@@ -1,0 +1,26 @@
+## 11 — Redirect Rules
+## Redirects /old/* to /new with 301, proxies everything else.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "redirector"
+    bind: ":9000"
+    protocol: "http"
+    default_backend: "backend"
+    routes:
+      - match:
+          path_prefix: "/old"
+        redirect:
+          url: "/new"
+          code: 301
+      - match:
+          path_prefix: "/moved"
+        redirect:
+          url: "https://example.com"
+          code: 302
+backends:
+  - name: "backend"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"

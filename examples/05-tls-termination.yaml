@@ -1,0 +1,19 @@
+## 05 — TLS Termination
+## Terminates TLS on :9443 and forwards plaintext to backend.
+## Requires: examples/certs/server.pem and server-key.pem (see README).
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "tls-proxy"
+    bind: ":9443"
+    protocol: "tcp"
+    default_backend: "backend"
+    tls:
+      cert: "examples/certs/server.pem"
+      key: "examples/certs/server-key.pem"
+backends:
+  - name: "backend"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"

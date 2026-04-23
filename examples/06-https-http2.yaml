@@ -1,0 +1,19 @@
+## 06 — HTTPS with HTTP/2
+## HTTPS listener with automatic HTTP/2 via ALPN.
+## Requires: examples/certs/server.pem and server-key.pem (see README).
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "https-h2"
+    bind: ":9443"
+    protocol: "https"
+    default_backend: "backend"
+    tls:
+      cert: "examples/certs/server.pem"
+      key: "examples/certs/server-key.pem"
+backends:
+  - name: "backend"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"

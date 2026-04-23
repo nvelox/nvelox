@@ -1,0 +1,16 @@
+## 27 — UDP Proxy with Session Affinity
+## Proxies UDP traffic with session affinity (same client → same backend).
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "udp-proxy"
+    bind: ":9000"
+    protocol: "udp"
+    default_backend: "udp-pool"
+backends:
+  - name: "udp-pool"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"
+      - "127.0.0.1:8082"

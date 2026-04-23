@@ -1,0 +1,15 @@
+## 01 — Basic TCP Proxy
+## Forwards TCP connections on :9000 to a backend echo server.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "tcp-proxy"
+    bind: ":9000"
+    protocol: "tcp"
+    default_backend: "echo-servers"
+backends:
+  - name: "echo-servers"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"

@@ -1,0 +1,19 @@
+## 14 — Retries and Failover
+## Retries on connect failure or 502/503, up to 3 attempts.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "retry-proxy"
+    bind: ":9000"
+    protocol: "http"
+    default_backend: "pool"
+backends:
+  - name: "pool"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"
+      - "127.0.0.1:8082"
+    retry:
+      attempts: 3
+      on: "connect_failure,502,503"

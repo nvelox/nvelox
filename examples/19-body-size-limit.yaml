@@ -1,0 +1,16 @@
+## 19 — Request Body Size Limit
+## Rejects request bodies larger than 1KB.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "body-limit"
+    bind: ":9000"
+    protocol: "http"
+    default_backend: "backend"
+    max_body_size: "1KB"
+backends:
+  - name: "backend"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"

@@ -1,0 +1,26 @@
+## 12 — Header Manipulation
+## Adds/removes request and response headers.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "headers"
+    bind: ":9000"
+    protocol: "http"
+    default_backend: "backend"
+    headers:
+      request_add:
+        X-Proxy: "nvelox"
+        X-Request-ID: "auto-generated"
+      request_remove:
+        - "X-Debug"
+      response_add:
+        X-Powered-By: "nvelox"
+        Strict-Transport-Security: "max-age=31536000"
+      response_remove:
+        - "Server"
+backends:
+  - name: "backend"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"

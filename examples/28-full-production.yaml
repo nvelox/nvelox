@@ -1,0 +1,106 @@
+## 28 — Full Production Config
+## Combines multiple features: HTTPS, HTTP/3, routing, health checks,
+## rate limiting, ACLs, compression, metrics, admin API.
+version: "2"
+server:
+  user: "nvelox"
+  group: "nvelox"
+
+logging:
+  level: "info"
+  access_log: "/tmp/nvelox-access.log"
+  error_log: "/tmp/nvelox-error.log"
+
+metrics:
+  enabled: true
+  bind: ":9090"
+  path: "/metrics"
+
+admin:
+  enabled: true
+  bind: "127.0.0.1:9091"
+
+listeners:
+  # HTTP → redirect to HTTPS
+  - name: "http-redirect"
+    bind: ":9080"
+    protocol: "http"
+    default_backend: "web"
+    routes:
+      - match:
+          path_prefix: "/"
+        redirect:
+          url: "https://localhost:9443"
+          code: 301
+
+  # HTTPS with HTTP/2 + routing
+  - name: "https-main"
+    bind: ":9443"
+    protocol: "https"
+    default_backend: "web"
+    tls:
+      cert: "examples/certs/server.pem"
+      key: "examples/certs/server-key.pem"
+    compression:
+      enabled: true
+    ip_rate_limit:
+      requests_per_second: 100
+      burst: 50
+    headers:
+      response_add:
+        Strict-Transport-Security: "max-age=31536000"
+        X-Content-Type-Options: "nosniff"
+    routes:
+      - match:
+          host: "api.localhost"
+        backend: "api"
+      - match:
+          path_prefix: "/api"
+        backend: "api"
+
+  # TCP passthrough for game servers
+  - name: "game-ports"
+    bind: ":9100-9105"
+    protocol: "tcp"
+    default_backend: "game"
+
+backends:
+  - name: "web"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"
+      - "127.0.0.1:8082"
+    health_check:
+      active:
+        type: "http"
+        path: "/health"
+        interval: "5s"
+        timeout: "2s"
+      passive:
+        max_fails: 3
+    retry:
+      attempts: 2
+      on: "connect_failure,502"
+    sticky_session:
+      type: "cookie"
+      cookie_name: "NVELOX_SRV"
+      ttl: "30m"
+
+  - name: "api"
+    balance: "leastconn"
+    max_connections: 100
+    servers:
+      - "127.0.0.1:8083"
+    timeouts:
+      connect: "2s"
+      read: "10s"
+    circuit_breaker:
+      enabled: true
+      threshold: 5
+      timeout: "30s"
+      half_open_max: 3
+
+  - name: "game"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8084"

@@ -1,0 +1,21 @@
+## 04 — Rate Limiting (per-listener + per-IP)
+## Limits to 10 conn/s globally and 5 req/s per IP.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "rate-limited"
+    bind: ":9000"
+    protocol: "http"
+    default_backend: "backend"
+    rate_limit:
+      connections_per_second: 10
+      burst: 5
+    ip_rate_limit:
+      requests_per_second: 5
+      burst: 3
+backends:
+  - name: "backend"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"

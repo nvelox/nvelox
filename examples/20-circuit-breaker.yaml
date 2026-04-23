@@ -1,0 +1,20 @@
+## 20 — Circuit Breaker
+## Opens circuit after 3 failures, retries after 10s half-open window.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "cb-proxy"
+    bind: ":9000"
+    protocol: "http"
+    default_backend: "fragile"
+backends:
+  - name: "fragile"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"
+    circuit_breaker:
+      enabled: true
+      threshold: 3
+      timeout: "10s"
+      half_open_max: 2

@@ -1,0 +1,24 @@
+## 03 — Health Checks (active TCP + passive)
+## Active health checks every 3s; passive marks down after 3 failures.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "http-hc"
+    bind: ":9000"
+    protocol: "http"
+    default_backend: "checked-pool"
+backends:
+  - name: "checked-pool"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"
+      - "127.0.0.1:8082"
+    health_check:
+      active:
+        type: "http"
+        path: "/health"
+        interval: "3s"
+        timeout: "1s"
+      passive:
+        max_fails: 3

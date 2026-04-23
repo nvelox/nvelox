@@ -1,0 +1,19 @@
+## 22 — Admin REST API
+## Runtime management API on :9091.
+version: "2"
+logging:
+  level: "debug"
+admin:
+  enabled: true
+  bind: "127.0.0.1:9091"
+listeners:
+  - name: "web"
+    bind: ":9000"
+    protocol: "http"
+    default_backend: "pool"
+backends:
+  - name: "pool"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"
+      - "127.0.0.1:8082"

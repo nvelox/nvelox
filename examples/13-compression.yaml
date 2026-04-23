@@ -1,0 +1,22 @@
+## 13 — Response Compression (gzip)
+## Compresses text/html and application/json responses.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "compressed"
+    bind: ":9000"
+    protocol: "http"
+    default_backend: "backend"
+    compression:
+      enabled: true
+      types:
+        - "text/plain"
+        - "text/html"
+        - "application/json"
+      min_length: 100
+backends:
+  - name: "backend"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"
