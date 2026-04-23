@@ -155,9 +155,11 @@ func TestLoadConfig_Errors(t *testing.T) {
 version: '2'
 backends:
   - name: b1
-    servers: []
+    servers:
+      - "10.0.0.1:80"
   - name: b1
-    servers: []
+    servers:
+      - "10.0.0.2:80"
 `), 0644)
 	if _, err := Load(badBackend); err == nil {
 		t.Error("expected error duplicate backend")
@@ -196,5 +198,232 @@ listeners:
 `), 0644)
 	if _, err := Load(badListener3); err == nil {
 		t.Error("expected error listener unknown backend")
+	}
+}
+
+func TestValidation_ServerAddress(t *testing.T) {
+	tests := []struct {
+		name    string
+		servers []string
+		wantErr bool
+	}{
+		{"valid host:port", []string{"10.0.0.1:80"}, false},
+		{"valid localhost:port", []string{"127.0.0.1:8080"}, false},
+		{"missing port", []string{"10.0.0.1"}, true},
+		{"no colon", []string{"foobar"}, true},
+		{"empty string", []string{""}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				Version:  "2",
+				Backends: []Backend{{Name: "b1", Servers: tt.servers}},
+			}
+			err := validate(cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidation_BindAddress(t *testing.T) {
+	tests := []struct {
+		name    string
+		bind    string
+		wantErr bool
+	}{
+		{"valid :port", ":8080", false},
+		{"valid host:port", "127.0.0.1:80", false},
+		{"valid port range", ":1024-2048", false},
+		{"valid host:range", "0.0.0.0:3000-3005", false},
+		{"port zero", ":0", true},
+		{"port 65536", ":65536", true},
+		{"non-numeric port", ":abc", true},
+		{"range start > end", ":5000-4000", true},
+		{"missing port", "127.0.0.1", true},
+		{"range non-numeric start", ":abc-100", true},
+		{"range non-numeric end", ":100-abc", true},
+		{"range port zero", ":0-100", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				Version:   "2",
+				Listeners: []Listener{{Name: "l1", Bind: tt.bind}},
+			}
+			err := validate(cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validate() bind=%q error = %v, wantErr %v", tt.bind, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidation_HealthCheckDurations(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval string
+		timeout  string
+		wantErr  bool
+	}{
+		{"valid durations", "5s", "1s", false},
+		{"valid interval only", "10s", "", false},
+		{"invalid interval", "abc", "", true},
+		{"invalid timeout", "5s", "xyz", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				Version: "2",
+				Backends: []Backend{{
+					Name:    "b1",
+					Servers: []string{"10.0.0.1:80"},
+					HealthCheck: HealthCheckConfig{
+						Active: ActiveHealthCheck{
+							Interval: tt.interval,
+							Timeout:  tt.timeout,
+						},
+					},
+				}},
+			}
+			err := validate(cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidation_BalanceAlgorithm(t *testing.T) {
+	tests := []struct {
+		name    string
+		balance string
+		wantErr bool
+	}{
+		{"empty (default)", "", false},
+		{"roundrobin", "roundrobin", false},
+		{"leastconn", "leastconn", false},
+		{"random", "random", false},
+		{"invalid", "hash", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				Version:  "2",
+				Backends: []Backend{{Name: "b1", Balance: tt.balance, Servers: []string{"10.0.0.1:80"}}},
+			}
+			err := validate(cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validate() balance=%q error = %v, wantErr %v", tt.balance, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidation_EmptyServers(t *testing.T) {
+	cfg := &Config{
+		Version:  "2",
+		Backends: []Backend{{Name: "b1", Servers: []string{}}},
+	}
+	err := validate(cfg)
+	if err == nil {
+		t.Error("expected error for backend with no servers")
+	}
+}
+
+func TestValidation_TLS(t *testing.T) {
+	tmpDir := t.TempDir()
+	certFile := filepath.Join(tmpDir, "cert.pem")
+	keyFile := filepath.Join(tmpDir, "key.pem")
+	os.WriteFile(certFile, []byte("cert"), 0644)
+	os.WriteFile(keyFile, []byte("key"), 0644)
+
+	tests := []struct {
+		name    string
+		cert    string
+		key     string
+		wantErr bool
+	}{
+		{"no TLS", "", "", false},
+		{"valid TLS", certFile, keyFile, false},
+		{"cert without key", certFile, "", true},
+		{"key without cert", "", keyFile, true},
+		{"cert file not found", "/nonexistent/cert.pem", keyFile, true},
+		{"key file not found", certFile, "/nonexistent/key.pem", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				Version: "2",
+				Listeners: []Listener{{
+					Name: "l1",
+					Bind: ":443",
+					TLS:  TLSConfig{Cert: tt.cert, Key: tt.key},
+				}},
+			}
+			err := validate(cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidation_FullValid(t *testing.T) {
+	tmpDir := t.TempDir()
+	certFile := filepath.Join(tmpDir, "cert.pem")
+	keyFile := filepath.Join(tmpDir, "key.pem")
+	os.WriteFile(certFile, []byte("cert"), 0644)
+	os.WriteFile(keyFile, []byte("key"), 0644)
+
+	cfg := &Config{
+		Version: "2",
+		Logging: LoggingConfig{Level: "info"},
+		Listeners: []Listener{
+			{
+				Name:           "http",
+				Bind:           ":80",
+				Protocol:       "tcp",
+				DefaultBackend: "web",
+			},
+			{
+				Name:           "https",
+				Bind:           ":443",
+				Protocol:       "tcp",
+				DefaultBackend: "web",
+				TLS:            TLSConfig{Cert: certFile, Key: keyFile},
+			},
+			{
+				Name:           "range",
+				Bind:           "0.0.0.0:3000-3005",
+				Protocol:       "tcp",
+				DefaultBackend: "web",
+			},
+		},
+		Backends: []Backend{
+			{
+				Name:    "web",
+				Balance: "leastconn",
+				Servers: []string{"10.0.0.1:80", "10.0.0.2:80"},
+				HealthCheck: HealthCheckConfig{
+					Active: ActiveHealthCheck{
+						Type:     "http",
+						Path:     "/health",
+						Interval: "5s",
+						Timeout:  "1s",
+					},
+				},
+			},
+		},
+	}
+	err := validate(cfg)
+	if err != nil {
+		t.Errorf("expected no error for valid config, got: %v", err)
 	}
 }

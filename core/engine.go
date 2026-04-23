@@ -2,8 +2,10 @@ package core
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
+	"net"
 	"time"
 
 	"nvelox/config"
@@ -12,16 +14,20 @@ import (
 	"nvelox/lb"
 
 	"github.com/lesismal/nbio"
+	"github.com/pires/go-proxyproto"
 )
 
 type Engine struct {
-	TCPEngine *nbio.Engine
-	UDPEngine *nbio.Engine
-	Listeners []*ListenerConfig
-	Config    *config.Config
-	Balancers map[string]lb.Balancer
-	Backends  map[string]*config.Backend
-	Checkers  map[string]*health.Checker
+	TCPEngine    *nbio.Engine
+	UDPEngine    *nbio.Engine
+	Listeners    []*ListenerConfig
+	Config       *config.Config
+	Balancers    map[string]lb.Balancer
+	Backends     map[string]*config.Backend
+	Checkers     map[string]*health.Checker
+	RateLimiters map[string]*RateLimiter   // keyed by listener name
+	UDPPool      *UDPPool                  // UDP session affinity pool
+	tlsListeners []net.Listener            // TLS listeners to close on shutdown
 }
 
 type ListenerConfig struct {
@@ -32,15 +38,18 @@ type ListenerConfig struct {
 	DefaultBackend string
 	SendProxyV2    bool // Send PROXY protocol v2 to backend
 	Port           int
+	RateLimit      config.RateLimitConfig
+	TLS            *config.TLSConfig
 }
 
 func NewEngine(cfg *config.Config) *Engine {
 	e := &Engine{
-		Listeners: make([]*ListenerConfig, 0),
-		Config:    cfg,
-		Balancers: make(map[string]lb.Balancer),
-		Backends:  make(map[string]*config.Backend),
-		Checkers:  make(map[string]*health.Checker),
+		Listeners:    make([]*ListenerConfig, 0),
+		Config:       cfg,
+		Balancers:    make(map[string]lb.Balancer),
+		Backends:     make(map[string]*config.Backend),
+		Checkers:     make(map[string]*health.Checker),
+		RateLimiters: make(map[string]*RateLimiter),
 	}
 	return e
 }
@@ -49,12 +58,26 @@ func (e *Engine) Start(ctx context.Context) error {
 	// 1. Initialize Backends & Health Checkers
 	e.initBackends()
 
+	// 1b. Initialize Rate Limiters
+	for _, l := range e.Listeners {
+		if l.RateLimit.ConnectionsPerSecond > 0 {
+			e.RateLimiters[l.Name] = NewRateLimiter(l.RateLimit.ConnectionsPerSecond, l.RateLimit.Burst)
+			logging.Info("Rate limiter for %s: %.0f conn/s, burst %d", l.Name, l.RateLimit.ConnectionsPerSecond, l.RateLimit.Burst)
+		}
+	}
+
+	// 1c. Initialize UDP Pool
+	e.UDPPool = NewUDPPool(60 * time.Second)
+
 	// 2. Setup Handler
 	handler := NewProxyEventHandler(e)
 
-	// 3. Setup TCP Engine
+	// 3. Setup TCP Engine (non-TLS listeners only; TLS uses separate accept loop)
 	tcpAddrs := e.getAddrs("tcp")
-	if len(tcpAddrs) > 0 {
+	tlsListeners := e.getTLSListeners()
+	needsTCPEngine := len(tcpAddrs) > 0 || len(tlsListeners) > 0
+
+	if needsTCPEngine {
 		conf := nbio.Config{
 			Network:            "tcp",
 			Addrs:              tcpAddrs,
@@ -69,6 +92,13 @@ func (e *Engine) Start(ctx context.Context) error {
 			return fmt.Errorf("TCP Engine start failed: %v", err)
 		}
 		logging.Info("NBIO TCP Engine Started on %d listeners", len(tcpAddrs))
+
+		// Start TLS accept loops
+		for _, tlsL := range tlsListeners {
+			if err := e.startTLSListener(tlsL, handler); err != nil {
+				return fmt.Errorf("TLS listener %s start failed: %v", tlsL.Name, err)
+			}
+		}
 	}
 
 	// 4. Setup UDP Engine
@@ -94,6 +124,13 @@ func (e *Engine) Start(ctx context.Context) error {
 	<-ctx.Done()
 
 	logging.Info("Stopping NBIO Engines...")
+	// Close TLS listeners first to stop accepting new connections
+	for _, l := range e.tlsListeners {
+		l.Close()
+	}
+	if e.UDPPool != nil {
+		e.UDPPool.Stop()
+	}
 	if e.TCPEngine != nil {
 		e.TCPEngine.Stop()
 	}
@@ -127,10 +164,140 @@ func (e *Engine) initBackends() {
 func (e *Engine) getAddrs(proto string) []string {
 	addrs := make([]string, 0)
 	for _, l := range e.Listeners {
-		if l.Protocol == proto {
+		if l.Protocol == proto && l.TLS == nil {
 			addrs = append(addrs, l.Addr)
 			logging.Info("Registering listener %s on %s", l.Name, l.Addr)
 		}
 	}
 	return addrs
+}
+
+func (e *Engine) getTLSListeners() []*ListenerConfig {
+	var result []*ListenerConfig
+	for _, l := range e.Listeners {
+		if l.Protocol == "tcp" && l.TLS != nil {
+			result = append(result, l)
+		}
+	}
+	return result
+}
+
+func (e *Engine) startTLSListener(l *ListenerConfig, handler *ProxyEventHandler) error {
+	cert, err := tls.LoadX509KeyPair(l.TLS.Cert, l.TLS.Key)
+	if err != nil {
+		return fmt.Errorf("failed to load TLS cert/key: %v", err)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	ln, err := tls.Listen("tcp", l.Addr, tlsConfig)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s: %v", l.Addr, err)
+	}
+
+	e.tlsListeners = append(e.tlsListeners, ln)
+	logging.Info("TLS listener %s started on %s", l.Name, l.Addr)
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go e.handleTLSConn(conn, l, handler)
+		}
+	}()
+
+	return nil
+}
+
+func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *ProxyEventHandler) {
+	defer clientConn.Close()
+
+	// Check rate limit
+	if rl, ok := e.RateLimiters[l.Name]; ok {
+		if !rl.Allow() {
+			logging.Warn("[RATE] TLS connection from %s rejected (rate limit on %s)", clientConn.RemoteAddr(), l.Name)
+			return
+		}
+	}
+
+	logging.Info("[CONN] New tls client %s -> %s", clientConn.RemoteAddr(), clientConn.LocalAddr())
+	startTime := time.Now()
+
+	// Select backend
+	balancer, ok := e.Balancers[l.DefaultBackend]
+	if !ok {
+		logging.Error("Balancer '%s' not found for TLS listener '%s'", l.DefaultBackend, l.Name)
+		return
+	}
+
+	backend := e.Backends[l.DefaultBackend]
+
+	target, err := balancer.Next()
+	if err != nil {
+		logging.Error("Balancer '%s' error: %v", l.DefaultBackend, err)
+		return
+	}
+
+	originalTarget := target
+	dialTarget := target
+	if _, _, err := net.SplitHostPort(dialTarget); err != nil {
+		dialTarget = fmt.Sprintf("%s:%d", dialTarget, l.Port)
+	}
+
+	// Dial backend
+	backendConn, err := net.DialTimeout("tcp", dialTarget, 10*time.Second)
+	if err != nil {
+		logging.Error("TLS backend dial failed: %v", err)
+		return
+	}
+	defer backendConn.Close()
+
+	// Notify balancer
+	balancer.OnConnect(originalTarget)
+	defer balancer.OnDisconnect(originalTarget)
+
+	// Send PROXY v2 if configured
+	if backend != nil && backend.SendProxyV2 {
+		header := proxyproto.HeaderProxyFromAddrs(2, clientConn.RemoteAddr(), backendConn.LocalAddr())
+		if _, err := header.WriteTo(backendConn); err != nil {
+			logging.Error("Failed to write PROXY v2 header on TLS conn: %v", err)
+			return
+		}
+	}
+
+	// Bidirectional relay
+	done := make(chan struct{})
+
+	go func() {
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := backendConn.Read(buf)
+			if err != nil {
+				break
+			}
+			if _, err := clientConn.Write(buf[:n]); err != nil {
+				break
+			}
+		}
+		close(done)
+	}()
+
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := clientConn.Read(buf)
+		if err != nil {
+			break
+		}
+		if _, err := backendConn.Write(buf[:n]); err != nil {
+			break
+		}
+	}
+
+	<-done
+	logging.Info("[CONN] Closed TLS %s (Dur: %v)", clientConn.RemoteAddr(), time.Since(startTime))
 }

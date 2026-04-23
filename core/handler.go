@@ -8,6 +8,7 @@ import (
 
 	"nvelox/config"
 	"nvelox/core/logging"
+	"nvelox/lb"
 
 	"github.com/lesismal/nbio"
 	"github.com/pires/go-proxyproto"
@@ -16,6 +17,7 @@ import (
 type ProxyEventHandler struct {
 	engine      *Engine
 	listenerMap map[string]*ListenerConfig
+	sessions    sync.Map // *nbio.Conn -> *ConnContext (thread-safe session storage)
 }
 
 func NewProxyEventHandler(e *Engine) *ProxyEventHandler {
@@ -36,28 +38,54 @@ func NewProxyEventHandler(e *Engine) *ProxyEventHandler {
 }
 
 type ConnContext struct {
-	IsBackend bool
-	PeerConn  net.Conn
-	StartTime time.Time
-	Buffer    []byte // Buffer for data received before backend is connected
-	Mu        sync.Mutex
+	IsBackend     bool
+	PeerConn      net.Conn
+	StartTime     time.Time
+	Buffer        []byte      // Buffer for data received before backend is connected
+	BackendServer string      // Original value from balancer.Next() (matches conns map key)
+	BalancerRef   lb.Balancer // Reference for OnDisconnect in OnClose
+	Mu            sync.Mutex
+}
+
+func (h *ProxyEventHandler) setCtx(c *nbio.Conn, ctx *ConnContext) {
+	h.sessions.Store(c, ctx)
+	c.SetSession(ctx) // also set on nbio for the session != nil guard in OnOpen
+}
+
+func (h *ProxyEventHandler) getCtx(c *nbio.Conn) *ConnContext {
+	v, ok := h.sessions.Load(c)
+	if !ok {
+		return nil
+	}
+	return v.(*ConnContext)
+}
+
+func (h *ProxyEventHandler) deleteCtx(c *nbio.Conn) {
+	h.sessions.Delete(c)
 }
 
 func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
-	if c.Session() != nil {
+	// Backend connections from DialAsync already have session set in callback
+	if h.getCtx(c) != nil {
 		return
 	}
 
-	// LocalAddr might be nil for some UDP edge cases?
 	if c.LocalAddr() == nil {
 		return
 	}
 
 	l := h.findListener(c.LocalAddr().Network(), c.LocalAddr().String())
 	if l == nil {
-		// Backend connections from DialAsync already have session set in callback.
-		// If we get here with no session and no listener, just ignore.
 		return
+	}
+
+	// Check rate limit
+	if rl, ok := h.engine.RateLimiters[l.Name]; ok {
+		if !rl.Allow() {
+			logging.Warn("[RATE] Connection from %s rejected (rate limit on %s)", c.RemoteAddr(), l.Name)
+			c.Close()
+			return
+		}
 	}
 
 	logging.Info("[CONN] New %s client %s -> %s", l.Protocol, c.RemoteAddr(), c.LocalAddr())
@@ -66,36 +94,51 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 		IsBackend: false,
 		StartTime: time.Now(),
 	}
-	c.SetSession(clientCtx)
+	h.setCtx(c, clientCtx)
 
 	h.connectBackend(c, l)
 }
 
 func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
-	ctx, ok := c.Session().(*ConnContext)
-	if !ok || ctx == nil {
+	ctx := h.getCtx(c)
+	if ctx == nil {
 		return
 	}
+	h.deleteCtx(c)
 
-	if ctx.PeerConn != nil {
-		ctx.PeerConn.Close()
+	ctx.Mu.Lock()
+	peer := ctx.PeerConn
+	backendServer := ctx.BackendServer
+	balancerRef := ctx.BalancerRef
+	isBackend := ctx.IsBackend
+	ctx.PeerConn = nil // prevent double-close
+	ctx.Mu.Unlock()
+
+	if peer != nil {
+		peer.Close()
 	}
 
-	if !ctx.IsBackend {
+	// Notify balancer of disconnection (for LeastConn tracking)
+	if !isBackend && backendServer != "" && balancerRef != nil {
+		balancerRef.OnDisconnect(backendServer)
+	}
+
+	if !isBackend {
 		logging.Info("[CONN] Closed %s (Dur: %v, Err: %v)", c.RemoteAddr(), time.Since(ctx.StartTime), err)
 	}
 }
 
 func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
-	ctx, ok := c.Session().(*ConnContext)
-	if !ok || ctx == nil {
+	ctx := h.getCtx(c)
+	if ctx == nil {
 		return
 	}
 
 	ctx.Mu.Lock()
 	if ctx.PeerConn != nil {
+		peer := ctx.PeerConn
 		ctx.Mu.Unlock()
-		_, err := ctx.PeerConn.Write(data)
+		_, err := peer.Write(data)
 		if err != nil {
 			logging.Error("[DATA] Write failed: %v", err)
 		}
@@ -124,27 +167,43 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 		return
 	}
 
-	if _, _, err := net.SplitHostPort(target); err != nil {
+	// Store original balancer key before target normalization (must match conns map key)
+	clientCtx := h.getCtx(clientConn)
+	clientCtx.Mu.Lock()
+	clientCtx.BackendServer = target
+	clientCtx.BalancerRef = balancer
+	clientCtx.Mu.Unlock()
+
+	// Normalize target for dialing
+	dialTarget := target
+	if _, _, err := net.SplitHostPort(dialTarget); err != nil {
 		// Valid assumption: missing port, use listener port (1:1 mapping)
-		target = fmt.Sprintf("%s:%d", target, l.Port)
+		dialTarget = fmt.Sprintf("%s:%d", dialTarget, l.Port)
 	}
 
 	if l.Protocol == "udp" {
-		h.connectBackendUDP(clientConn, target)
+		h.connectBackendUDP(clientConn, dialTarget)
 	} else {
-		h.connectBackendTCP(clientConn, target, backend)
+		// Pass balancer info through closure to avoid reading from ConnContext across goroutines
+		h.connectBackendTCP(clientConn, dialTarget, backend, balancer, target)
 	}
 }
 
-func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target string, backend *config.Backend) {
-	go func() {
-		// Dial backend synchronously
-		backendConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target string, backend *config.Backend, balancer lb.Balancer, balancerKey string) {
+	onConnected := func(backendConn *nbio.Conn, err error) {
 		if err != nil {
-			logging.Error("Backend TCP dial failed: %v", err)
+			logging.Error("Backend TCP async dial failed: %v", err)
 			clientConn.Close()
 			return
 		}
+
+		// Set backend session so OnOpen returns early and OnData/OnClose route correctly
+		backendCtx := &ConnContext{
+			IsBackend: true,
+			PeerConn:  clientConn,
+			StartTime: time.Now(),
+		}
+		h.setCtx(backendConn, backendCtx)
 
 		// Send PROXY protocol v2 header if enabled on backend
 		if backend != nil && backend.SendProxyV2 {
@@ -158,10 +217,13 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 			logging.Info("Sent PROXY v2 header for client %s -> %s", clientConn.RemoteAddr(), target)
 		}
 
-		// Link client to backend
-		clientCtx := clientConn.Session().(*ConnContext)
+		// Link client to backend — use closure-captured balancer info instead of reading from ConnContext
+		clientCtx := h.getCtx(clientConn)
 		clientCtx.Mu.Lock()
 		clientCtx.PeerConn = backendConn
+
+		// Notify balancer of new connection (for LeastConn tracking)
+		balancer.OnConnect(balancerKey)
 
 		// Flush any buffered data
 		if len(clientCtx.Buffer) > 0 {
@@ -177,27 +239,36 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 		}
 		clientCtx.Mu.Unlock()
 
-		// Read from backend and write to client
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := backendConn.Read(buf)
-			if err != nil {
-				backendConn.Close()
-				clientConn.Close()
-				return
-			}
+		// No blocking read loop needed — nbio's OnData handler routes
+		// backend data to client via the backendCtx.PeerConn
+	}
 
-			_, err = clientConn.Write(buf[:n])
-			if err != nil {
-				backendConn.Close()
-				clientConn.Close()
-				return
-			}
-		}
-	}()
+	if err := h.engine.TCPEngine.DialAsyncTimeout("tcp", target, 10*time.Second, onConnected); err != nil {
+		logging.Error("Backend TCP DialAsync failed: %v", err)
+		clientConn.Close()
+	}
 }
 
 func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target string) {
+	clientCtx := h.getCtx(clientConn)
+
+	// Check UDP pool for existing session (session affinity)
+	poolKey := fmt.Sprintf("%s|%s", clientConn.RemoteAddr().String(), clientCtx.BackendServer)
+	if session := h.engine.UDPPool.Get(poolKey); session != nil {
+		// Reuse existing backend connection
+		clientCtx.Mu.Lock()
+		clientCtx.PeerConn = session.BackendConn
+		if clientCtx.BalancerRef != nil {
+			clientCtx.BalancerRef.OnConnect(clientCtx.BackendServer)
+		}
+		if len(clientCtx.Buffer) > 0 {
+			session.BackendConn.Write(clientCtx.Buffer)
+			clientCtx.Buffer = nil
+		}
+		clientCtx.Mu.Unlock()
+		return
+	}
+
 	go func() {
 		// Resolve and dial UDP
 		raddr, err := net.ResolveUDPAddr("udp", target)
@@ -214,10 +285,22 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 			return
 		}
 
+		// Store in pool for session affinity
+		session := &UDPSession{
+			BackendConn: backendConn,
+			Target:      target,
+			LastActive:  time.Now(),
+		}
+		h.engine.UDPPool.Put(poolKey, session)
+
 		// Link client to backend
-		clientCtx := clientConn.Session().(*ConnContext)
 		clientCtx.Mu.Lock()
 		clientCtx.PeerConn = backendConn
+
+		// Notify balancer of new connection (for LeastConn tracking)
+		if clientCtx.BalancerRef != nil {
+			clientCtx.BalancerRef.OnConnect(clientCtx.BackendServer)
+		}
 
 		// Flush any buffered data
 		if len(clientCtx.Buffer) > 0 {
@@ -239,17 +322,22 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 			backendConn.SetReadDeadline(time.Now().Add(60 * time.Second))
 			n, err := backendConn.Read(buf)
 			if err != nil {
-				backendConn.Close()
+				h.engine.UDPPool.Remove(poolKey)
 				clientConn.Close()
 				return
 			}
 
 			_, err = clientConn.Write(buf[:n])
 			if err != nil {
-				backendConn.Close()
+				h.engine.UDPPool.Remove(poolKey)
 				clientConn.Close()
 				return
 			}
+
+			// Update session activity
+			session.mu.Lock()
+			session.LastActive = time.Now()
+			session.mu.Unlock()
 		}
 	}()
 }

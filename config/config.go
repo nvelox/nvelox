@@ -2,8 +2,12 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -39,9 +43,18 @@ type Listener struct {
 	ZeroCopy       bool   `yaml:"zero_copy"`       // Use splice for TCP
 	DefaultBackend string `yaml:"default_backend"` // Name of the backend pool
 
+	// Rate limiting
+	RateLimit RateLimitConfig `yaml:"rate_limit,omitempty"`
+
 	// L7 fields (Placeholder for future)
 	TLS    TLSConfig     `yaml:"tls,omitempty"`
 	Routes []RouteConfig `yaml:"routes,omitempty"`
+}
+
+// RateLimitConfig defines per-listener connection rate limiting.
+type RateLimitConfig struct {
+	ConnectionsPerSecond float64 `yaml:"connections_per_second"`
+	Burst                int     `yaml:"burst"`
 }
 
 // TLSConfig placeholder
@@ -143,6 +156,8 @@ func validate(cfg *Config) error {
 	}
 
 	backendNames := make(map[string]bool)
+	validAlgorithms := map[string]bool{"": true, "roundrobin": true, "leastconn": true, "random": true}
+
 	for _, b := range cfg.Backends {
 		if b.Name == "" {
 			return fmt.Errorf("backend must have a name")
@@ -151,6 +166,31 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("duplicate backend name: %s", b.Name)
 		}
 		backendNames[b.Name] = true
+
+		if len(b.Servers) == 0 {
+			return fmt.Errorf("backend %s must have at least one server", b.Name)
+		}
+
+		if !validAlgorithms[b.Balance] {
+			return fmt.Errorf("backend %s has invalid balance algorithm: %q (must be roundrobin, leastconn, or random)", b.Name, b.Balance)
+		}
+
+		for _, s := range b.Servers {
+			if _, _, err := net.SplitHostPort(s); err != nil {
+				return fmt.Errorf("backend %s has invalid server address %q: %v", b.Name, s, err)
+			}
+		}
+
+		if b.HealthCheck.Active.Interval != "" {
+			if _, err := time.ParseDuration(b.HealthCheck.Active.Interval); err != nil {
+				return fmt.Errorf("backend %s has invalid health check interval %q: %v", b.Name, b.HealthCheck.Active.Interval, err)
+			}
+		}
+		if b.HealthCheck.Active.Timeout != "" {
+			if _, err := time.ParseDuration(b.HealthCheck.Active.Timeout); err != nil {
+				return fmt.Errorf("backend %s has invalid health check timeout %q: %v", b.Name, b.HealthCheck.Active.Timeout, err)
+			}
+		}
 	}
 
 	for _, l := range cfg.Listeners {
@@ -163,7 +203,67 @@ func validate(cfg *Config) error {
 		if l.DefaultBackend != "" && !backendNames[l.DefaultBackend] {
 			return fmt.Errorf("listener %s references unknown backend: %s", l.Name, l.DefaultBackend)
 		}
+
+		// Validate bind address format
+		if err := validateBindAddress(l.Bind); err != nil {
+			return fmt.Errorf("listener %s has invalid bind address %q: %v", l.Name, l.Bind, err)
+		}
+
+		// Validate TLS config
+		if l.TLS.Cert != "" || l.TLS.Key != "" {
+			if l.TLS.Cert == "" {
+				return fmt.Errorf("listener %s: TLS key is set but cert is missing", l.Name)
+			}
+			if l.TLS.Key == "" {
+				return fmt.Errorf("listener %s: TLS cert is set but key is missing", l.Name)
+			}
+			if _, err := os.Stat(l.TLS.Cert); err != nil {
+				return fmt.Errorf("listener %s: TLS cert file not found: %v", l.Name, err)
+			}
+			if _, err := os.Stat(l.TLS.Key); err != nil {
+				return fmt.Errorf("listener %s: TLS key file not found: %v", l.Name, err)
+			}
+		}
 	}
 
+	return nil
+}
+
+func validateBindAddress(addr string) error {
+	lastColon := strings.LastIndex(addr, ":")
+	if lastColon == -1 {
+		return fmt.Errorf("missing port")
+	}
+	portStr := addr[lastColon+1:]
+
+	if strings.Contains(portStr, "-") {
+		parts := strings.Split(portStr, "-")
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid port range format")
+		}
+		start, err := strconv.Atoi(parts[0])
+		if err != nil {
+			return fmt.Errorf("invalid range start port: %v", err)
+		}
+		end, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return fmt.Errorf("invalid range end port: %v", err)
+		}
+		if start < 1 || start > 65535 || end < 1 || end > 65535 {
+			return fmt.Errorf("port out of range (1-65535)")
+		}
+		if start > end {
+			return fmt.Errorf("port range start (%d) is greater than end (%d)", start, end)
+		}
+		return nil
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return fmt.Errorf("invalid port: %v", err)
+	}
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("port %d out of range (1-65535)", port)
+	}
 	return nil
 }

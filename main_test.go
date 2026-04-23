@@ -69,7 +69,7 @@ server:
   port: 8080
 listeners:
   - name: test-listener
-    bind: "127.0.0.1:0" # Random port
+    bind: "127.0.0.1:19876"
     protocol: tcp
     default_backend: backend1
 backends:
@@ -142,10 +142,10 @@ listeners:
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	// Should warn but not fail startup
+	// Should fail at config validation now
 	err := run([]string{"cmd", "-config", configPath}, ctx)
-	if err != nil {
-		t.Errorf("run failed: %v", err)
+	if err == nil {
+		t.Error("expected error for invalid bind address, got nil")
 	}
 }
 

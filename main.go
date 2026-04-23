@@ -68,6 +68,12 @@ func run(args []string, ctx context.Context) error {
 			continue
 		}
 
+		// Resolve TLS config pointer
+		var tlsCfg *config.TLSConfig
+		if l.TLS.Cert != "" {
+			tlsCfg = &l.TLS
+		}
+
 		if strings.Contains(portStr, "-") {
 			// Range
 			parts := strings.Split(portStr, "-")
@@ -81,6 +87,8 @@ func run(args []string, ctx context.Context) error {
 					Protocol:       l.Protocol,
 					ZeroCopy:       l.ZeroCopy,
 					DefaultBackend: l.DefaultBackend,
+					RateLimit:      l.RateLimit,
+					TLS:            tlsCfg,
 					Port:           p,
 				})
 			}
@@ -93,6 +101,8 @@ func run(args []string, ctx context.Context) error {
 				Protocol:       l.Protocol,
 				ZeroCopy:       l.ZeroCopy,
 				DefaultBackend: l.DefaultBackend,
+				RateLimit:      l.RateLimit,
+				TLS:            tlsCfg,
 				Port:           p,
 			})
 		}
