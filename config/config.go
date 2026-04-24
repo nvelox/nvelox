@@ -93,6 +93,13 @@ type Listener struct {
 	IPRateLimit IPRateLimitConfig `yaml:"ip_rate_limit,omitempty"`
 	ACL         []ACLRule         `yaml:"acl,omitempty"`
 
+	// TrustedProxies: CIDRs whose X-Forwarded-For / X-Real-IP / X-Forwarded-Proto
+	// headers are trusted and extended. Requests from any other source have
+	// these headers *replaced* (not appended) so a direct client can't spoof
+	// their source IP by presenting a forged XFF chain.
+	// If empty, no peer is trusted → XFF is always replaced with the peer IP.
+	TrustedProxies []string `yaml:"trusted_proxies,omitempty"`
+
 	// L7 fields
 	HTTP3       bool              `yaml:"http3,omitempty"`
 	Routes      []RouteConfig     `yaml:"routes,omitempty"`

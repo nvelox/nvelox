@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"nvelox/config"
+	"nvelox/core/acl"
 )
 
 func TestIsWebSocketUpgrade(t *testing.T) {
@@ -89,14 +90,19 @@ func TestApplyResponseHeaders(t *testing.T) {
 	}
 }
 
-func TestSetForwardedHeaders(t *testing.T) {
+func TestSetForwardedHeaders_NoTrustList(t *testing.T) {
+	// No trusted_proxies configured → always overwrite with peer IP,
+	// even if the client presents a forged XFF chain.
+	s := &HTTPServer{Listener: &ListenerConfig{}}
+
 	r := httptest.NewRequest("GET", "/", nil)
 	r.RemoteAddr = "192.168.1.100:54321"
+	r.Header.Set("X-Forwarded-For", "1.2.3.4, 5.6.7.8") // attacker-supplied
 
-	setForwardedHeaders(r)
+	s.setForwardedHeaders(r)
 
-	if r.Header.Get("X-Forwarded-For") != "192.168.1.100" {
-		t.Errorf("expected X-Forwarded-For=192.168.1.100, got %q", r.Header.Get("X-Forwarded-For"))
+	if got := r.Header.Get("X-Forwarded-For"); got != "192.168.1.100" {
+		t.Errorf("untrusted peer: XFF must be replaced, got %q", got)
 	}
 	if r.Header.Get("X-Real-IP") != "192.168.1.100" {
 		t.Errorf("expected X-Real-IP=192.168.1.100, got %q", r.Header.Get("X-Real-IP"))
@@ -106,16 +112,66 @@ func TestSetForwardedHeaders(t *testing.T) {
 	}
 }
 
-func TestSetForwardedHeaders_Chain(t *testing.T) {
+func TestSetForwardedHeaders_UntrustedPeerSpoof(t *testing.T) {
+	// Peer 192.168.1.100 is NOT in the trusted list. Their attempt to
+	// present a forged XFF chain must be overwritten.
+	s := &HTTPServer{Listener: &ListenerConfig{}}
+	s.TrustedProxies = acl.ParseCIDRList([]string{"10.0.0.0/8"})
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "192.168.1.100:54321"
+	r.Header.Set("X-Forwarded-For", "1.2.3.4")
+	r.Header.Set("X-Real-IP", "1.2.3.4")
+
+	s.setForwardedHeaders(r)
+
+	if r.Header.Get("X-Forwarded-For") != "192.168.1.100" {
+		t.Errorf("untrusted peer must not extend XFF, got %q", r.Header.Get("X-Forwarded-For"))
+	}
+	if r.Header.Get("X-Real-IP") != "192.168.1.100" {
+		t.Errorf("untrusted peer must not keep forged X-Real-IP, got %q", r.Header.Get("X-Real-IP"))
+	}
+}
+
+func TestSetForwardedHeaders_TrustedPeerChain(t *testing.T) {
+	// Peer 10.0.0.2 IS in the trusted list. Its XFF chain is extended.
+	s := &HTTPServer{Listener: &ListenerConfig{}}
+	s.TrustedProxies = acl.ParseCIDRList([]string{"10.0.0.0/8"})
+
 	r := httptest.NewRequest("GET", "/", nil)
 	r.RemoteAddr = "10.0.0.2:1234"
 	r.Header.Set("X-Forwarded-For", "10.0.0.1")
+	r.Header.Set("X-Real-IP", "10.0.0.1")
 
-	setForwardedHeaders(r)
+	s.setForwardedHeaders(r)
 
-	expected := "10.0.0.1, 10.0.0.2"
-	if r.Header.Get("X-Forwarded-For") != expected {
-		t.Errorf("expected X-Forwarded-For=%q, got %q", expected, r.Header.Get("X-Forwarded-For"))
+	if got := r.Header.Get("X-Forwarded-For"); got != "10.0.0.1, 10.0.0.2" {
+		t.Errorf("trusted peer: XFF must be extended, got %q", got)
+	}
+	if got := r.Header.Get("X-Real-IP"); got != "10.0.0.1" {
+		t.Errorf("trusted peer: X-Real-IP from proxy must be preserved, got %q", got)
+	}
+}
+
+func TestSetForwardedHeaders_TrustedPeerBackfill(t *testing.T) {
+	// Trusted peer that did NOT send X-Real-IP / X-Forwarded-Proto → we
+	// backfill them with authoritative values but still append XFF.
+	s := &HTTPServer{Listener: &ListenerConfig{}}
+	s.TrustedProxies = acl.ParseCIDRList([]string{"10.0.0.0/8"})
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.2:1234"
+
+	s.setForwardedHeaders(r)
+
+	if r.Header.Get("X-Forwarded-For") != "10.0.0.2" {
+		t.Errorf("XFF, got %q", r.Header.Get("X-Forwarded-For"))
+	}
+	if r.Header.Get("X-Real-IP") != "10.0.0.2" {
+		t.Errorf("backfill X-Real-IP, got %q", r.Header.Get("X-Real-IP"))
+	}
+	if r.Header.Get("X-Forwarded-Proto") != "http" {
+		t.Errorf("backfill X-Forwarded-Proto, got %q", r.Header.Get("X-Forwarded-Proto"))
 	}
 }
 

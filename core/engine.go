@@ -69,6 +69,7 @@ type ListenerConfig struct {
 	MaxBodySize    string
 	IPRateLimit    config.IPRateLimitConfig
 	ACL            []config.ACLRule
+	TrustedProxies []string
 	Compression    config.CompressionConfig
 	ErrorPages     map[int]string
 	Buffering      config.BufferingConfig
@@ -157,6 +158,7 @@ func (e *Engine) Start(ctx context.Context) error {
 			MaxBodySize:    l.MaxBodySize,
 			IPRateLimit:    l.IPRateLimit,
 			ACL:            l.ACL,
+			TrustedProxies: l.TrustedProxies,
 			Compression:    l.Compression,
 			ErrorPages:     l.ErrorPages,
 			Buffering:      l.Buffering,

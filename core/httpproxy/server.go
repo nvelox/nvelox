@@ -71,6 +71,7 @@ type HTTPServer struct {
 	ACLEngine     *acl.Engine
 	IPAllowlist   []*net.IPNet
 	IPDenylist    []*net.IPNet
+	TrustedProxies []*net.IPNet
 	IPRateLimiter *middleware.IPRateLimiter
 	CircuitBreakers map[string]CircuitBreakerI
 	MaxBodySize     int64 // 0 = unlimited
@@ -98,6 +99,7 @@ type ListenerConfig struct {
 	MaxBodySize    string
 	IPRateLimit    config.IPRateLimitConfig
 	ACL            []config.ACLRule
+	TrustedProxies []string
 	Compression    config.CompressionConfig
 	ErrorPages     map[int]string
 	Buffering      config.BufferingConfig
@@ -116,7 +118,8 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 		StickyStores:    stickyStores,
 		CircuitBreakers: circuitBreakers,
 		IPAllowlist:     acl.ParseCIDRList(l.IPAllowlist),
-		IPDenylist:    acl.ParseCIDRList(l.IPDenylist),
+		IPDenylist:     acl.ParseCIDRList(l.IPDenylist),
+		TrustedProxies: acl.ParseCIDRList(l.TrustedProxies),
 		MaxBodySize:   parseByteSize(l.MaxBodySize),
 		RateLimiter: rateLimiter,
 	}
@@ -474,7 +477,7 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Apply request headers
-	setForwardedHeaders(r)
+	s.setForwardedHeaders(r)
 	applyRequestHeaders(r, &s.Listener.Headers)
 	if routeHeaders != nil {
 		applyRequestHeaders(r, routeHeaders)
@@ -677,13 +680,51 @@ func isWebSocketUpgrade(r *http.Request) bool {
 }
 
 // setForwardedHeaders adds standard proxy headers.
-func setForwardedHeaders(r *http.Request) {
+//
+// XFF spoofing defense: if TrustedProxies is configured and the direct peer
+// is in it, the client-provided XFF/X-Real-IP/X-Forwarded-Proto are trusted
+// and the peer IP is appended. If the peer is NOT in the trust list (or the
+// list is empty), the headers are *replaced* with authoritative values —
+// preventing a direct client from spoofing its source IP via a forged XFF.
+func (s *HTTPServer) setForwardedHeaders(r *http.Request) {
 	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
-		r.Header.Set("X-Forwarded-For", prior+", "+clientIP)
-	} else {
-		r.Header.Set("X-Forwarded-For", clientIP)
+	trusted := false
+	if len(s.TrustedProxies) > 0 {
+		if peerIP := net.ParseIP(clientIP); peerIP != nil {
+			for _, cidr := range s.TrustedProxies {
+				if cidr.Contains(peerIP) {
+					trusted = true
+					break
+				}
+			}
+		}
 	}
+
+	if trusted {
+		// Peer is a trusted proxy: extend its XFF chain and trust its claim.
+		if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
+			r.Header.Set("X-Forwarded-For", prior+", "+clientIP)
+		} else {
+			r.Header.Set("X-Forwarded-For", clientIP)
+		}
+		// Keep existing X-Real-IP / X-Forwarded-Proto if already set by the
+		// trusted proxy; only backfill when absent.
+		if r.Header.Get("X-Real-IP") == "" {
+			r.Header.Set("X-Real-IP", clientIP)
+		}
+		if r.Header.Get("X-Forwarded-Proto") == "" {
+			if r.TLS != nil {
+				r.Header.Set("X-Forwarded-Proto", "https")
+			} else {
+				r.Header.Set("X-Forwarded-Proto", "http")
+			}
+		}
+		return
+	}
+
+	// Untrusted peer (or no trust list configured): overwrite any client-
+	// supplied forwarding headers with authoritative values.
+	r.Header.Set("X-Forwarded-For", clientIP)
 	r.Header.Set("X-Real-IP", clientIP)
 	if r.TLS != nil {
 		r.Header.Set("X-Forwarded-Proto", "https")
