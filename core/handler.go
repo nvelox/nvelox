@@ -197,20 +197,15 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 	if backend != nil && backend.Timeouts.Connect != "" {
 		connectTimeout = backend.Timeouts.ParseConnect()
 	}
-	onConnected := func(backendConn *nbio.Conn, err error) {
+
+	go func() {
+		// Blocking dial — guarantees sequential byte ordering for PROXY v2 + TLS
+		backendConn, err := net.DialTimeout("tcp", target, connectTimeout)
 		if err != nil {
-			logging.Error("Backend TCP async dial failed: %v", err)
+			logging.Error("Backend TCP dial failed: %v", err)
 			clientConn.Close()
 			return
 		}
-
-		// Set backend session so OnOpen returns early and OnData/OnClose route correctly
-		backendCtx := &ConnContext{
-			IsBackend: true,
-			PeerConn:  clientConn,
-			StartTime: time.Now(),
-		}
-		h.setCtx(backendConn, backendCtx)
 
 		// Send PROXY protocol v2 header if enabled on backend
 		if backend != nil && backend.SendProxyV2 {
@@ -221,15 +216,19 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 				clientConn.Close()
 				return
 			}
-			logging.Info("Sent PROXY v2 header for client %s -> %s", clientConn.RemoteAddr(), target)
 		}
 
-		// Link client to backend — use closure-captured balancer info instead of reading from ConnContext
+		// Link client to backend
 		clientCtx := h.getCtx(clientConn)
+		if clientCtx == nil {
+			// Client already closed during backend dial
+			backendConn.Close()
+			return
+		}
 		clientCtx.Mu.Lock()
 		clientCtx.PeerConn = backendConn
 
-		// Notify balancer of new connection (for LeastConn tracking)
+		// Notify balancer
 		balancer.OnConnect(balancerKey)
 
 		// Flush any buffered data
@@ -246,14 +245,23 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 		}
 		clientCtx.Mu.Unlock()
 
-		// No blocking read loop needed — nbio's OnData handler routes
-		// backend data to client via the backendCtx.PeerConn
-	}
-
-	if err := h.engine.TCPEngine.DialAsyncTimeout("tcp", target, connectTimeout, onConnected); err != nil {
-		logging.Error("Backend TCP DialAsync failed: %v", err)
-		clientConn.Close()
-	}
+		// Blocking read loop: backend → client
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := backendConn.Read(buf)
+			if err != nil {
+				backendConn.Close()
+				clientConn.Close()
+				return
+			}
+			_, err = clientConn.Write(buf[:n])
+			if err != nil {
+				backendConn.Close()
+				clientConn.Close()
+				return
+			}
+		}
+	}()
 }
 
 func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target string) {
