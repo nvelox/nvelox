@@ -12,8 +12,8 @@ func TestInit(t *testing.T) {
 	if err := Init("invalid", "", ""); err != nil {
 		t.Fatalf("Init failed: %v", err)
 	}
-	if level != WarnLevel {
-		t.Errorf("expected default level WarnLevel, got %v", level)
+	if got := current.Load().level; got != WarnLevel {
+		t.Errorf("expected default level WarnLevel, got %v", got)
 	}
 
 	// Test explicit levels
@@ -28,8 +28,8 @@ func TestInit(t *testing.T) {
 		if err := Init(name, "", ""); err != nil {
 			t.Errorf("Init(%s) failed: %v", name, err)
 		}
-		if level != want {
-			t.Errorf("Init(%s): expected level %v, got %v", name, want, level)
+		if got := current.Load().level; got != want {
+			t.Errorf("Init(%s): expected level %v, got %v", name, want, got)
 		}
 	}
 }

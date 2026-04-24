@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
+	"sync/atomic"
 )
 
 type Level int
@@ -19,30 +19,47 @@ const (
 	ErrorLevel
 )
 
-var (
+// loggerState bundles the three pieces of logger config so they can be
+// swapped atomically. Without this, a second Init() call races with
+// in-flight log calls reading level/accessLog/errorLog as separate
+// globals — which is how test A's still-draining engine goroutine
+// races with test B's Init.
+type loggerState struct {
 	accessLog *log.Logger
 	errorLog  *log.Logger
 	level     Level
-	mu        sync.Mutex
-)
+}
+
+// current holds the active logger state. Init swaps a fresh state in
+// atomically; all read helpers take a snapshot pointer with Load.
+var current atomic.Pointer[loggerState]
+
+func init() {
+	// Safe defaults so logging doesn't panic if a helper is called before
+	// Init (e.g. unit-test paths that forget to init).
+	current.Store(&loggerState{
+		accessLog: log.New(os.Stdout, "", 0),
+		errorLog:  log.New(os.Stderr, "", log.LstdFlags),
+		level:     WarnLevel,
+	})
+}
 
 // Init initializes the logger with config.
 func Init(logLevel string, accessPath, errorPath string) error {
-	mu.Lock()
-	defer mu.Unlock()
+	next := &loggerState{}
 
 	// Parse Level
 	switch strings.ToLower(logLevel) {
 	case "debug":
-		level = DebugLevel
+		next.level = DebugLevel
 	case "info":
-		level = InfoLevel
+		next.level = InfoLevel
 	case "warning":
-		level = WarnLevel
+		next.level = WarnLevel
 	case "error":
-		level = ErrorLevel
+		next.level = ErrorLevel
 	default:
-		level = WarnLevel
+		next.level = WarnLevel
 	}
 
 	// Setup Error Log
@@ -57,7 +74,7 @@ func Init(logLevel string, accessPath, errorPath string) error {
 		}
 		errWriter = f
 	}
-	errorLog = log.New(errWriter, "", log.LstdFlags) // Prefix handled in helpers
+	next.errorLog = log.New(errWriter, "", log.LstdFlags) // Prefix handled in helpers
 
 	// Setup Access Log
 	var accessWriter io.Writer = os.Stdout
@@ -71,37 +88,44 @@ func Init(logLevel string, accessPath, errorPath string) error {
 		}
 		accessWriter = f // Access log usually file only or stdout
 	}
-	accessLog = log.New(accessWriter, "", 0) // Raw format
+	next.accessLog = log.New(accessWriter, "", 0) // Raw format
 
+	// Atomic swap: concurrent readers see either the old or the new
+	// state in full — never a torn mix.
+	current.Store(next)
 	return nil
 }
 
 func Debug(format string, v ...interface{}) {
-	if level <= DebugLevel {
-		errorLog.Output(2, fmt.Sprintf("[DEBUG] "+format, v...))
+	s := current.Load()
+	if s.level <= DebugLevel {
+		s.errorLog.Output(2, fmt.Sprintf("[DEBUG] "+format, v...))
 	}
 }
 
 func Info(format string, v ...interface{}) {
-	if level <= InfoLevel {
-		errorLog.Output(2, fmt.Sprintf("[INFO] "+format, v...))
+	s := current.Load()
+	if s.level <= InfoLevel {
+		s.errorLog.Output(2, fmt.Sprintf("[INFO] "+format, v...))
 	}
 }
 
 func Warn(format string, v ...interface{}) {
-	if level <= WarnLevel {
-		errorLog.Output(2, fmt.Sprintf("[WARN] "+format, v...))
+	s := current.Load()
+	if s.level <= WarnLevel {
+		s.errorLog.Output(2, fmt.Sprintf("[WARN] "+format, v...))
 	}
 }
 
 func Error(format string, v ...interface{}) {
-	if level <= ErrorLevel {
-		errorLog.Output(2, fmt.Sprintf("[ERR] "+format, v...))
+	s := current.Load()
+	if s.level <= ErrorLevel {
+		s.errorLog.Output(2, fmt.Sprintf("[ERR] "+format, v...))
 	}
 }
 
 func Access(format string, v ...interface{}) {
-	accessLog.Printf(format, v...)
+	current.Load().accessLog.Printf(format, v...)
 }
 
 // SanitizeLogField strips CR/LF/tab and other control characters from strings
@@ -148,7 +172,7 @@ func SanitizeLogField(s string) string {
 // fields (method, path, proto, backend) are sanitized against CRLF log
 // injection; clientIP is produced by net.SplitHostPort and is trusted.
 func AccessHTTP(clientIP, method, path, proto string, status int, bytes int64, duration float64, backend string) {
-	accessLog.Printf("%s - \"%s %s %s\" %d %d %.3fms -> %s",
+	current.Load().accessLog.Printf("%s - \"%s %s %s\" %d %d %.3fms -> %s",
 		clientIP,
 		SanitizeLogField(method),
 		SanitizeLogField(path),
@@ -158,6 +182,6 @@ func AccessHTTP(clientIP, method, path, proto string, status int, bytes int64, d
 }
 
 func Fatal(format string, v ...interface{}) {
-	errorLog.Output(2, fmt.Sprintf("[FATAL] "+format, v...))
+	current.Load().errorLog.Output(2, fmt.Sprintf("[FATAL] "+format, v...))
 	os.Exit(1)
 }

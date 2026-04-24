@@ -70,11 +70,16 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 		return
 	}
 
-	if c.LocalAddr() == nil {
+	localAddr := c.LocalAddr()
+	if localAddr == nil {
 		return
 	}
 
-	l := h.findListener(c.LocalAddr().Network(), c.LocalAddr().String())
+	// Avoid calling net.UDPAddr.String() (or .IP's appendTo) here — nbio
+	// v1.6.8 can concurrently dupStdConn the same IP slice backing the
+	// address, tripping the race detector. Reading Port (an int field) on
+	// the concrete type sidesteps that slice walk entirely.
+	l := h.findListenerForAddr(localAddr)
 	if l == nil {
 		return
 	}
@@ -88,7 +93,7 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 		}
 	}
 
-	logging.Info("[CONN] New %s client %s -> %s", l.Protocol, c.RemoteAddr(), c.LocalAddr())
+	logging.Info("[CONN] New %s client %s -> :%d", l.Protocol, c.RemoteAddr(), portOf(localAddr))
 
 	h.engine.ActiveConns.Add(1)
 
@@ -379,4 +384,42 @@ func (h *ProxyEventHandler) findListener(network, localAddr string) *ListenerCon
 		return l
 	}
 	return nil
+}
+
+// findListenerForAddr is the race-safe variant of findListener: it reads the
+// port directly from the concrete *net.UDPAddr / *net.TCPAddr Port field
+// (an int, a scalar word) instead of calling .String() which walks the IP
+// byte slice that nbio@v1.6.8 races on during UDP conn setup.
+func (h *ProxyEventHandler) findListenerForAddr(addr net.Addr) *ListenerConfig {
+	var network string
+	var port int
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		network = "udp"
+		port = a.Port
+	case *net.TCPAddr:
+		network = "tcp"
+		port = a.Port
+	default:
+		// Fallback to the string-based lookup for unknown addr types.
+		return h.findListener(addr.Network(), addr.String())
+	}
+	key := fmt.Sprintf("%s:%d", network, port)
+	if l, ok := h.listenerMap[key]; ok {
+		return l
+	}
+	return nil
+}
+
+// portOf returns the Port field of a *net.UDPAddr / *net.TCPAddr, or 0 if
+// the address is of an unknown type. Used for logging so we don't call
+// Addr.String() (which walks the IP slice and races with nbio's conn setup).
+func portOf(addr net.Addr) int {
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		return a.Port
+	case *net.TCPAddr:
+		return a.Port
+	}
+	return 0
 }

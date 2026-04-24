@@ -328,8 +328,15 @@ func (s *HTTPServer) Start() error {
 		}
 		s.httpServer.TLSConfig = tlsCfg
 
-		// Start HTTP/3 (QUIC) if enabled
+		// Start HTTP/3 (QUIC) if enabled.
+		// NOTE: altSvcHeader must be written BEFORE spawning the HTTP/3
+		// goroutine. The `go` statement establishes happens-before to the
+		// goroutine's first instruction, so any request handled by either
+		// the HTTP/3 path or the TLS-HTTP/2 path below sees the final value.
+		// Writing after `go func()` caused a data race when a request
+		// arrived in the tiny window before the assignment retired.
 		if s.Listener.HTTP3 {
+			s.altSvcHeader = fmt.Sprintf(`h3=":%d"; ma=86400`, s.Listener.Port)
 			// HTTP/3 server uses the same ServeHTTP handler
 			s.http3Server = &http3.Server{
 				Addr:      s.Listener.Addr,
@@ -342,9 +349,6 @@ func (s *HTTPServer) Start() error {
 				}
 			}()
 			logging.Info("[HTTP3] QUIC listener started on %s", s.Listener.Addr)
-
-			// Enable Alt-Svc header injection in ServeHTTP
-			s.altSvcHeader = fmt.Sprintf(`h3=":%d"; ma=86400`, s.Listener.Port)
 		}
 
 		go func() {

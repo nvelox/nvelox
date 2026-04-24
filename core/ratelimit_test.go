@@ -68,9 +68,11 @@ func TestRateLimiter_HighRate(t *testing.T) {
 		}
 	}
 
-	// Should allow exactly 100 (the burst) since no time passes
-	if allowed != 100 {
-		t.Errorf("expected 100 allowed (burst), got %d", allowed)
+	// Should allow ~100 (the burst). Exact count drifts under -race because
+	// each Allow takes long enough to accrue a sub-token of replenishment
+	// at rate=1000/s. Allow a small tolerance instead of requiring exact 100.
+	if allowed < 100 || allowed > 105 {
+		t.Errorf("expected 100-105 allowed (burst + minor replenish drift), got %d", allowed)
 	}
 }
 
