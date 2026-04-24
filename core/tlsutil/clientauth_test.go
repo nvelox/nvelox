@@ -35,14 +35,11 @@ func TestConfigureClientAuth_Empty(t *testing.T) {
 	}
 }
 
-func TestConfigureClientAuth_Require(t *testing.T) {
+func TestConfigureClientAuth_RequireWithoutCA(t *testing.T) {
 	tlsCfg := &tls.Config{}
 	err := ConfigureClientAuth(tlsCfg, config.TLSConfig{ClientAuth: "require"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if tlsCfg.ClientAuth != tls.RequireAndVerifyClientCert {
-		t.Errorf("expected RequireAndVerifyClientCert, got %v", tlsCfg.ClientAuth)
+	if err == nil {
+		t.Error("expected error for require without client_ca")
 	}
 }
 

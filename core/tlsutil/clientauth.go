@@ -18,6 +18,9 @@ func ConfigureClientAuth(tlsCfg *tls.Config, cfg config.TLSConfig) error {
 
 	switch strings.ToLower(cfg.ClientAuth) {
 	case "require":
+		if cfg.ClientCA == "" {
+			return fmt.Errorf("client_auth 'require' needs client_ca to verify certificates")
+		}
 		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
 	case "request":
 		tlsCfg.ClientAuth = tls.RequestClientCert

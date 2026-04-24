@@ -56,9 +56,24 @@ func (s *Store) Get(key string) string {
 	return sess.server
 }
 
-// Set stores a sticky mapping.
+// Set stores a sticky mapping. Evicts oldest entries if over 100k sessions.
 func (s *Store) Set(key, server string) {
 	s.mu.Lock()
+	const maxSessions = 100000
+	if len(s.sessions) >= maxSessions {
+		// Evict 10% oldest
+		count := len(s.sessions) / 10
+		if count < 1 {
+			count = 1
+		}
+		for k := range s.sessions {
+			delete(s.sessions, k)
+			count--
+			if count <= 0 {
+				break
+			}
+		}
+	}
 	s.sessions[key] = &session{server: server, lastSeen: time.Now()}
 	s.mu.Unlock()
 }

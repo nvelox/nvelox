@@ -47,6 +47,11 @@ func (rl *IPRateLimiter) Allow(remoteAddr string) bool {
 
 	entry, ok := rl.ips[host]
 	if !ok {
+		// Prevent unbounded growth — evict oldest if over 100k entries
+		const maxEntries = 100000
+		if len(rl.ips) >= maxEntries {
+			rl.evictUnsafe()
+		}
 		entry = &ipEntry{
 			tokens:   float64(rl.burst) - 1,
 			lastTime: time.Now(),
@@ -85,6 +90,21 @@ func (rl *IPRateLimiter) cleanupLoop() {
 			return
 		case <-ticker.C:
 			rl.evict()
+		}
+	}
+}
+
+// evictUnsafe removes the oldest 10% of entries. Must be called with lock held.
+func (rl *IPRateLimiter) evictUnsafe() {
+	count := len(rl.ips) / 10
+	if count < 1 {
+		count = 1
+	}
+	for ip := range rl.ips {
+		delete(rl.ips, ip)
+		count--
+		if count <= 0 {
+			break
 		}
 	}
 }

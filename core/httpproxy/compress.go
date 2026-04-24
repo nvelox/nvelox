@@ -64,6 +64,17 @@ func (w *compressWriter) WriteHeader(code int) {
 		ct = strings.TrimSpace(ct[:idx])
 	}
 
+	// BREACH mitigation: don't compress responses with secrets/tokens
+	if w.ResponseWriter.Header().Get("Set-Cookie") != "" {
+		w.ResponseWriter.WriteHeader(code)
+		return
+	}
+	// Don't double-compress
+	if w.ResponseWriter.Header().Get("Content-Encoding") != "" {
+		w.ResponseWriter.WriteHeader(code)
+		return
+	}
+
 	if w.types[strings.ToLower(ct)] {
 		w.compressed = true
 		w.ResponseWriter.Header().Set("Content-Encoding", "gzip")

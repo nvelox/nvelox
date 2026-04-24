@@ -252,9 +252,16 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 		}
 		clientCtx.Mu.Unlock()
 
-		// Blocking read loop: backend → client
+		// Blocking read loop: backend → client (with idle timeout)
+		idleTimeout := 5 * time.Minute
+		if l.Timeouts.Idle != "" {
+			idleTimeout = l.Timeouts.ParseIdle()
+		}
 		buf := make([]byte, 32*1024)
 		for {
+			if idleTimeout > 0 {
+				backendConn.SetReadDeadline(time.Now().Add(idleTimeout))
+			}
 			n, err := backendConn.Read(buf)
 			if err != nil {
 				backendConn.Close()
