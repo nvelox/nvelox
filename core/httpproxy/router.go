@@ -2,6 +2,7 @@ package httpproxy
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 
 	"nvelox/config"
@@ -126,14 +127,25 @@ func (r *Router) MatchFull(host, path string) *RouteResult {
 }
 
 // ApplyRewrite applies regex capture substitution to a rewrite path.
+//
+// Uses strings.NewReplacer for a single left-to-right pass, so a capture
+// value containing literal "$N" can't feed back into a subsequent iteration
+// (which the old "for each i, ReplaceAll" approach did — with a URL like
+// /foo$2bar/baz against regex ^/(.*)/(.*)$ + rewrite /api/$1/$2, the old
+// code produced /api/foobazbar/baz instead of /api/foo$2bar/baz).
+//
+// Placeholders are registered longest-first ($10 before $1) so double-digit
+// captures match before the single-digit prefix swallows them.
 func ApplyRewrite(rewritePath string, matches []string) string {
-	result := rewritePath
-	for i, m := range matches {
-		if i == 0 {
-			continue // $0 is full match
-		}
-		placeholder := "$" + string(rune('0'+i))
-		result = strings.ReplaceAll(result, placeholder, m)
+	if len(matches) <= 1 {
+		return rewritePath
 	}
-	return result
+	// Build pairs: longest placeholder first so "$10" wins over "$1" at the
+	// same position. NewReplacer picks the FIRST registered match, not the
+	// longest, so registration order matters.
+	pairs := make([]string, 0, (len(matches)-1)*2)
+	for i := len(matches) - 1; i >= 1; i-- {
+		pairs = append(pairs, "$"+strconv.Itoa(i), matches[i])
+	}
+	return strings.NewReplacer(pairs...).Replace(rewritePath)
 }

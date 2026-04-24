@@ -1,6 +1,7 @@
 package httpproxy
 
 import (
+	"strconv"
 	"testing"
 
 	"nvelox/config"
@@ -216,5 +217,38 @@ func TestApplyRewrite_NoCaptures(t *testing.T) {
 	result := ApplyRewrite("/static/path", nil)
 	if result != "/static/path" {
 		t.Errorf("expected /static/path, got %s", result)
+	}
+}
+
+// TestApplyRewrite_CaptureContainsPlaceholder proves the single-pass
+// substitution: a capture whose literal content is "$2" must NOT be
+// re-interpreted by the next iteration of the replacer.
+func TestApplyRewrite_CaptureContainsPlaceholder(t *testing.T) {
+	// Simulated regex ^/(.*)/(.*)$ applied to "/foo$2bar/baz":
+	//   matches[0] = "/foo$2bar/baz"
+	//   matches[1] = "foo$2bar"
+	//   matches[2] = "baz"
+	matches := []string{"/foo$2bar/baz", "foo$2bar", "baz"}
+	got := ApplyRewrite("/api/$1/$2", matches)
+	want := "/api/foo$2bar/baz"
+	if got != want {
+		t.Errorf("single-pass rewrite: got %q, want %q", got, want)
+	}
+}
+
+// TestApplyRewrite_DoubleDigitCaptures: 10+ capture groups must resolve
+// correctly — $10 must match before $1 gobbles the "$1" prefix and leaves
+// a trailing "0".
+func TestApplyRewrite_DoubleDigitCaptures(t *testing.T) {
+	matches := make([]string, 12)
+	matches[0] = "full"
+	for i := 1; i < 12; i++ {
+		matches[i] = "cap" + strconv.Itoa(i)
+	}
+	// Rewrite contains both $1 and $10; they must resolve to distinct values.
+	got := ApplyRewrite("/$1/$10/$11", matches)
+	want := "/cap1/cap10/cap11"
+	if got != want {
+		t.Errorf("double-digit captures: got %q, want %q", got, want)
 	}
 }
