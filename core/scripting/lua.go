@@ -1,10 +1,12 @@
 package scripting
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
 	"sync"
+	"time"
 
 	"nvelox/core/logging"
 
@@ -18,13 +20,26 @@ type LuaPool struct {
 	mu      sync.RWMutex
 }
 
-// NewLuaPool creates a Lua VM pool.
+// NewLuaPool creates a sandboxed Lua VM pool.
+// Only safe libraries are loaded (string, table, math). The os, io, debug,
+// and package modules are NOT available — preventing arbitrary code execution.
 func NewLuaPool() *LuaPool {
 	return &LuaPool{
 		scripts: make(map[string]string),
 		pool: sync.Pool{
 			New: func() interface{} {
-				L := lua.NewState(lua.Options{SkipOpenLibs: false})
+				L := lua.NewState(lua.Options{SkipOpenLibs: true})
+				// Only load safe libraries
+				lua.OpenBase(L)
+				lua.OpenString(L)
+				lua.OpenTable(L)
+				lua.OpenMath(L)
+				// Disable dangerous base functions
+				L.SetGlobal("dofile", lua.LNil)
+				L.SetGlobal("loadfile", lua.LNil)
+				L.SetGlobal("load", lua.LNil)
+				L.SetGlobal("rawget", lua.LNil)
+				L.SetGlobal("rawset", lua.LNil)
 				return L
 			},
 		},
@@ -68,12 +83,21 @@ type RequestContext struct {
 }
 
 // RunRequestScript executes a Lua request script with the given context.
+// MaxScriptDuration is the maximum time a Lua script can run before being killed.
+const MaxScriptDuration = 5 * time.Second
+
 func RunRequestScript(pool *LuaPool, scriptPath string, ctx *RequestContext) error {
 	L := pool.Get()
 	defer pool.Put(L)
 
 	// Register the nvelox API module
 	registerAPI(L, ctx)
+
+	// Set execution timeout via context
+	lctx, cancel := context.WithTimeout(context.Background(), MaxScriptDuration)
+	defer cancel()
+	L.SetContext(lctx)
+	defer L.RemoveContext()
 
 	if err := L.DoFile(scriptPath); err != nil {
 		logging.Error("[LUA] Script error in %s: %v", scriptPath, err)
@@ -116,6 +140,12 @@ func RunResponseScript(pool *LuaPool, scriptPath string, resp *http.Response, r 
 	}))
 
 	L.SetGlobal("nvelox", mod)
+
+	// Set execution timeout
+	lctx, cancel := context.WithTimeout(context.Background(), MaxScriptDuration)
+	defer cancel()
+	L.SetContext(lctx)
+	defer L.RemoveContext()
 
 	if err := L.DoFile(scriptPath); err != nil {
 		logging.Error("[LUA] Response script error in %s: %v", scriptPath, err)
