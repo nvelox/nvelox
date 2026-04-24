@@ -39,6 +39,14 @@ func (h *StaticHandler) ServeFile(w http.ResponseWriter, r *http.Request) bool {
 		reqPath = "/"
 	}
 
+	// Dotfile protection: refuse any path whose last segment or any segment
+	// starts with '.'. Prevents serving /.env, /.git/config, /.htaccess, etc.
+	// RFC 3986 well-known paths (/.well-known/...) remain accessible via the
+	// explicit allowlist below.
+	if hasDotfileSegment(reqPath) {
+		return false
+	}
+
 	fullPath := filepath.Join(h.root, reqPath)
 
 	// Security: prevent directory traversal (pre-symlink check)
@@ -85,6 +93,26 @@ func (h *StaticHandler) ServeFile(w http.ResponseWriter, r *http.Request) bool {
 
 	http.ServeFile(w, r, realPath)
 	return true
+}
+
+// hasDotfileSegment reports whether any path segment starts with '.'
+// (other than "." and ".." which filepath.Clean already resolves).
+// /.well-known/ is allowed: operators who need ACME challenges / TLS
+// provisioning rely on it, and it's the RFC-sanctioned well-known prefix.
+func hasDotfileSegment(p string) bool {
+	// Normalize backslashes to forward slashes defensively; filepath.Clean
+	// on Linux leaves them literal, but a backslash in a path segment is
+	// a suspicious signal anyway — treating it as a separator is safer.
+	p = strings.ReplaceAll(p, "\\", "/")
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			continue
+		}
+		if seg[0] == '.' && seg != ".well-known" {
+			return true
+		}
+	}
+	return false
 }
 
 // TryFiles implements nginx-style try_files logic.

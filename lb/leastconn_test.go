@@ -57,11 +57,28 @@ func TestLeastConn_OnDisconnect_NoNegative(t *testing.T) {
 	servers := []string{"s1:80"}
 	b := NewLeastConn(servers)
 
-	// Disconnect without connect — goes to -1
+	// Disconnect without a matching connect must be clamped at 0.
+	// Previously it went to -1 and made this server look "most idle" →
+	// all new traffic concentrated on it.
 	b.OnDisconnect("s1:80")
+	if b.conns["s1:80"] != 0 {
+		t.Errorf("unpaired disconnect must stay at 0, got %d", b.conns["s1:80"])
+	}
 
-	if b.conns["s1:80"] != -1 {
-		t.Errorf("expected -1, got %d", b.conns["s1:80"])
+	// Normal connect/disconnect still works.
+	b.OnConnect("s1:80")
+	if b.conns["s1:80"] != 1 {
+		t.Errorf("after connect: want 1, got %d", b.conns["s1:80"])
+	}
+	b.OnDisconnect("s1:80")
+	if b.conns["s1:80"] != 0 {
+		t.Errorf("after connect+disconnect: want 0, got %d", b.conns["s1:80"])
+	}
+
+	// Double-disconnect must not go negative.
+	b.OnDisconnect("s1:80")
+	if b.conns["s1:80"] != 0 {
+		t.Errorf("double-disconnect must stay at 0, got %d", b.conns["s1:80"])
 	}
 }
 

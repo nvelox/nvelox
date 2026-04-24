@@ -134,6 +134,12 @@ var sensitiveCacheHeaders = []string{
 	"Proxy-Authenticate", "Proxy-Authorization",
 }
 
+// ExposeXCacheHeader controls whether X-Cache: HIT/MISS is emitted to
+// clients. Default false: the header leaks cache state and lets an
+// attacker enumerate what other users fetched via timing-free observation.
+// Operators who need it for debugging can set it true.
+var ExposeXCacheHeader = false
+
 // ServeCached writes a cached response to the ResponseWriter.
 func ServeCached(w http.ResponseWriter, entry *CacheEntry) {
 	for k, vv := range entry.Headers {
@@ -141,7 +147,9 @@ func ServeCached(w http.ResponseWriter, entry *CacheEntry) {
 			w.Header().Add(k, v)
 		}
 	}
-	w.Header().Set("X-Cache", "HIT")
+	if ExposeXCacheHeader {
+		w.Header().Set("X-Cache", "HIT")
+	}
 	w.WriteHeader(entry.StatusCode)
 	w.Write(entry.Body)
 }

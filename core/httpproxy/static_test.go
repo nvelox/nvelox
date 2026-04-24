@@ -216,3 +216,50 @@ func TestParseExpiresDuration_Overflow(t *testing.T) {
 		}
 	}
 }
+
+func TestHasDotfileSegment(t *testing.T) {
+	cases := []struct {
+		p    string
+		want bool
+	}{
+		{"/index.html", false},
+		{"/api/v1/users", false},
+		{"/.env", true},
+		{"/.git/config", true},
+		{"/docs/.hidden/file.txt", true},
+		{"/.htaccess", true},
+		{"/.well-known/acme-challenge/abc", false}, // explicit allow
+		{"/foo/bar", false},
+		{"/", false},
+		{"", false},
+		{"/..", false},                  // "." and ".." resolved by filepath.Clean
+		{"/path\\.env/file", true},      // backslash treated as separator
+	}
+	for _, c := range cases {
+		if got := hasDotfileSegment(c.p); got != c.want {
+			t.Errorf("hasDotfileSegment(%q) = %v, want %v", c.p, got, c.want)
+		}
+	}
+}
+
+func TestStaticHandler_RejectsDotfiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	os.WriteFile(filepath.Join(tmpDir, ".env"), []byte("SECRET=xxx"), 0644)
+	os.WriteFile(filepath.Join(tmpDir, "index.html"), []byte("ok"), 0644)
+
+	h := NewStaticHandler(config.StaticConfig{Root: tmpDir})
+
+	// .env must NOT be served
+	r := httptest.NewRequest("GET", "/.env", nil)
+	w := httptest.NewRecorder()
+	if h.ServeFile(w, r) {
+		t.Error(".env must not be served")
+	}
+
+	// index.html must still be served
+	r = httptest.NewRequest("GET", "/index.html", nil)
+	w = httptest.NewRecorder()
+	if !h.ServeFile(w, r) {
+		t.Error("index.html must be served")
+	}
+}

@@ -149,7 +149,18 @@ func ServeFastCGI(w http.ResponseWriter, r *http.Request, cfg config.FastCGIConf
 		}
 	}
 
+	// Post-join prefix check: a crafted splitPathInfo regex can make
+	// scriptName contain ".." which filepath.Join resolves outside docRoot.
+	// PHP-FPM may still reject via security.limit_extensions, but we should
+	// never hand it a path we didn't intend.
 	scriptFilename := filepath.Join(docRoot, scriptName)
+	cleanRoot := filepath.Clean(docRoot)
+	if cleanRoot != "" && !strings.HasPrefix(filepath.Clean(scriptFilename), cleanRoot) {
+		logging.Warn("[FCGI] Refusing path-traversal SCRIPT_FILENAME %q (script=%q root=%q)",
+			scriptFilename, scriptName, cleanRoot)
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
 
 	// Use gofast to handle the request
 	connFactory := gofast.SimpleConnFactory(network, address)

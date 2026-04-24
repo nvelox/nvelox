@@ -253,6 +253,23 @@ func parseByteSize(s string) int64 {
 	return n * multiplier
 }
 
+// warnIfKeyWorldReadable logs a WARN if a private-key file on disk has
+// group or world permission bits set. Operators in containerized setups
+// sometimes can't change perms, so we log rather than refuse the load.
+func warnIfKeyWorldReadable(keyPath string) {
+	if keyPath == "" {
+		return
+	}
+	fi, err := os.Stat(keyPath)
+	if err != nil {
+		return
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		logging.Warn("[TLS] Private key %q has overly permissive mode %o — recommend 0600",
+			keyPath, fi.Mode().Perm())
+	}
+}
+
 // buildBackendTLSConfig turns a BackendTLSConfig into a *tls.Config suitable
 // for use as Transport.TLSClientConfig.
 //
@@ -299,6 +316,7 @@ func buildBackendTLSConfig(cfg config.BackendTLSConfig) (*tls.Config, error) {
 // Start begins listening for HTTP/HTTPS connections.
 func (s *HTTPServer) Start() error {
 	if s.Listener.TLS != nil {
+		warnIfKeyWorldReadable(s.Listener.TLS.Key)
 		cert, err := tls.LoadX509KeyPair(s.Listener.TLS.Cert, s.Listener.TLS.Key)
 		if err != nil {
 			return fmt.Errorf("failed to load TLS cert/key: %v", err)

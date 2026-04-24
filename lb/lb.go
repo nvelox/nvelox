@@ -320,10 +320,16 @@ func (b *LeastConn) OnConnect(server string) {
 	b.conns[server]++
 }
 
+// OnDisconnect decrements the active connection count for server, clamped
+// at 0. An unpaired disconnect (or double-disconnect on an error path)
+// used to drive the counter negative — making that server look like
+// "most idle" forever and concentrating all new traffic on it.
 func (b *LeastConn) OnDisconnect(server string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.conns[server]--
+	if b.conns[server] > 0 {
+		b.conns[server]--
+	}
 }
 
 func (b *LeastConn) MarkDraining(server string) {

@@ -77,3 +77,33 @@ func TestConnLimiter_Concurrent(t *testing.T) {
 		t.Errorf("expected 0 active after release all, got %d", cl.Active())
 	}
 }
+
+// TestConnLimiter_OverReleaseDetected verifies that Release without a
+// matching Acquire no longer silently succeeds — it's tracked in
+// OverReleaseCount so error-path bugs that inflate capacity get caught.
+func TestConnLimiter_OverReleaseDetected(t *testing.T) {
+	cl := NewConnLimiter(3)
+
+	// No Acquires; over-release straight away.
+	cl.Release()
+	cl.Release()
+
+	if n := cl.OverReleaseCount(); n != 2 {
+		t.Errorf("expected 2 over-releases, got %d", n)
+	}
+
+	// Matched pair should NOT count as over-release.
+	if !cl.Acquire() {
+		t.Fatal("Acquire failed")
+	}
+	cl.Release()
+	if n := cl.OverReleaseCount(); n != 2 {
+		t.Errorf("matched Acquire/Release must not count; got %d", n)
+	}
+
+	// Extra Release again → incremented.
+	cl.Release()
+	if n := cl.OverReleaseCount(); n != 3 {
+		t.Errorf("expected 3 over-releases, got %d", n)
+	}
+}

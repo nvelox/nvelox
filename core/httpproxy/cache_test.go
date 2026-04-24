@@ -116,6 +116,9 @@ func TestServeCached(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
+	prev := ExposeXCacheHeader
+	ExposeXCacheHeader = true
+	defer func() { ExposeXCacheHeader = prev }()
 	ServeCached(w, entry)
 
 	if w.Code != 200 {
@@ -126,6 +129,20 @@ func TestServeCached(t *testing.T) {
 	}
 	if w.Body.String() != "cached-body" {
 		t.Errorf("expected cached-body, got %s", w.Body.String())
+	}
+}
+
+func TestServeCached_XCacheHidden(t *testing.T) {
+	// Default (ExposeXCacheHeader=false) must NOT leak cache state.
+	entry := &CacheEntry{
+		StatusCode: 200,
+		Headers:    http.Header{"Content-Type": []string{"text/plain"}},
+		Body:       []byte("hi"),
+	}
+	w := httptest.NewRecorder()
+	ServeCached(w, entry)
+	if got := w.Header().Get("X-Cache"); got != "" {
+		t.Errorf("X-Cache leaked with default setting: %q", got)
 	}
 }
 

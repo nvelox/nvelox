@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -415,7 +416,27 @@ func (e *Engine) getTLSListeners() []*ListenerConfig {
 	return result
 }
 
+// warnIfKeyWorldReadable logs a WARN if a private-key file on disk has
+// group or world permission bits set. Doesn't refuse the load (operators
+// sometimes can't change perms in containerized / mounted-secret setups),
+// but surfaces the issue at startup so it isn't silent.
+func warnIfKeyWorldReadable(keyPath string) {
+	if keyPath == "" {
+		return
+	}
+	fi, err := os.Stat(keyPath)
+	if err != nil {
+		return
+	}
+	// Refuse if any of group/other bits are set.
+	if fi.Mode().Perm()&0o077 != 0 {
+		logging.Warn("[TLS] Private key %q has overly permissive mode %o — recommend 0600",
+			keyPath, fi.Mode().Perm())
+	}
+}
+
 func (e *Engine) startTLSListener(l *ListenerConfig, handler *ProxyEventHandler) error {
+	warnIfKeyWorldReadable(l.TLS.Key)
 	cert, err := tls.LoadX509KeyPair(l.TLS.Cert, l.TLS.Key)
 	if err != nil {
 		return fmt.Errorf("failed to load TLS cert/key: %v", err)
