@@ -1,6 +1,7 @@
 package tlsutil
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"io"
@@ -87,17 +88,14 @@ func (s *OCSPStapler) refresh() {
 	}
 
 	ocspURL := leaf.OCSPServer[0]
-	httpResp, err := http.Post(ocspURL, "application/ocsp-request", io.NopCloser(io.Reader(nil)))
+
+	// POST the OCSP request with proper body and timeout
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	httpResp, err := httpClient.Post(ocspURL, "application/ocsp-request", bytes.NewReader(ocspReq))
 	if err != nil {
-		// Try with body
-		resp, err2 := http.Post(ocspURL, "application/ocsp-request", nil)
-		if err2 != nil {
-			logging.Error("[OCSP] Failed to fetch OCSP response from %s: %v", ocspURL, err)
-			return
-		}
-		httpResp = resp
+		logging.Error("[OCSP] Failed to fetch OCSP response from %s: %v", ocspURL, err)
+		return
 	}
-	_ = ocspReq // used in real implementation with proper POST body
 	defer httpResp.Body.Close()
 
 	body, err := io.ReadAll(httpResp.Body)
