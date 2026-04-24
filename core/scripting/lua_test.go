@@ -192,3 +192,68 @@ func TestLoadScript_Invalid(t *testing.T) {
 		t.Error("expected error for invalid script")
 	}
 }
+
+// TestStringRepCap verifies that string.rep is bounded and a script
+// attempting to allocate a gigabyte via a single call fails fast rather
+// than OOMing the process.
+func TestStringRepCap(t *testing.T) {
+	tmpDir := t.TempDir()
+	script := filepath.Join(tmpDir, "rep_bomb.lua")
+	// 1 million bytes × 10000 = 10 GB — must be rejected.
+	os.WriteFile(script, []byte(`
+		local s = string.rep("A", 1000000)
+		local big = string.rep(s, 10000)
+	`), 0644)
+
+	pool := NewLuaPool()
+	r := httptest.NewRequest("GET", "/", nil)
+	ctx := &RequestContext{Request: r}
+
+	err := RunRequestScript(pool, script, ctx)
+	if err == nil {
+		t.Fatal("expected error for string.rep memory bomb, got nil")
+	}
+}
+
+// TestStringRepSmall verifies the cap doesn't break legitimate use.
+func TestStringRepSmall(t *testing.T) {
+	tmpDir := t.TempDir()
+	script := filepath.Join(tmpDir, "rep_ok.lua")
+	os.WriteFile(script, []byte(`
+		local s = string.rep("x", 100)
+		nvelox.set_header("X-Len", tostring(#s))
+	`), 0644)
+
+	pool := NewLuaPool()
+	r := httptest.NewRequest("GET", "/", nil)
+	ctx := &RequestContext{Request: r}
+
+	if err := RunRequestScript(pool, script, ctx); err != nil {
+		t.Fatalf("legitimate string.rep failed: %v", err)
+	}
+	if r.Header.Get("X-Len") != "100" {
+		t.Errorf("expected X-Len=100, got %q", r.Header.Get("X-Len"))
+	}
+}
+
+// TestStringRepCap_WithSeparator exercises the sep variant of string.rep
+// and the additional length contribution from the separator.
+func TestStringRepCap_WithSeparator(t *testing.T) {
+	tmpDir := t.TempDir()
+	script := filepath.Join(tmpDir, "rep_sep.lua")
+	os.WriteFile(script, []byte(`
+		local s = string.rep("abc", 10, "---")
+		nvelox.set_header("X-Out", s)
+	`), 0644)
+
+	pool := NewLuaPool()
+	r := httptest.NewRequest("GET", "/", nil)
+	ctx := &RequestContext{Request: r}
+	if err := RunRequestScript(pool, script, ctx); err != nil {
+		t.Fatalf("sep variant failed: %v", err)
+	}
+	expected := "abc---abc---abc---abc---abc---abc---abc---abc---abc---abc"
+	if r.Header.Get("X-Out") != expected {
+		t.Errorf("unexpected output: %q", r.Header.Get("X-Out"))
+	}
+}

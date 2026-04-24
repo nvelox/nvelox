@@ -5,12 +5,26 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"runtime"
 	"sync"
 	"time"
 
 	"nvelox/core/logging"
 
 	lua "github.com/yuin/gopher-lua"
+)
+
+// Script resource limits. gopher-lua doesn't expose a memory-cap hook, so we
+// enforce bounds at two layers:
+//  1. Replace allocation-amplifying stdlib functions (string.rep) with
+//     capped variants — single call bounded.
+//  2. Sample the process heap while the script runs; if HeapAlloc grows by
+//     more than MaxScriptMemoryGrowth during execution, cancel the context.
+const (
+	MaxScriptDuration     = 5 * time.Second
+	MaxStringRepOutput    = 1 << 20 // 1 MiB cap on string.rep output
+	MaxScriptMemoryGrowth = 64 << 20 // 64 MiB heap growth budget per script
+	MemoryPollInterval    = 50 * time.Millisecond
 )
 
 // LuaPool manages a pool of pre-loaded Lua VMs for script execution.
@@ -40,9 +54,94 @@ func NewLuaPool() *LuaPool {
 				L.SetGlobal("load", lua.LNil)
 				L.SetGlobal("rawget", lua.LNil)
 				L.SetGlobal("rawset", lua.LNil)
+				installResourceGuards(L)
 				return L
 			},
 		},
+	}
+}
+
+// installResourceGuards replaces stdlib functions that can amplify small
+// inputs into large heap allocations. The 5s timeout alone doesn't help
+// against a single O(1)-to-gigabyte call like string.rep(" ", 2^30).
+func installResourceGuards(L *lua.LState) {
+	strTable := L.GetGlobal("string")
+	if strTable == lua.LNil {
+		return
+	}
+	// string.rep(s, n [, sep]) — bound total output to MaxStringRepOutput.
+	L.SetField(strTable, "rep", L.NewFunction(func(L *lua.LState) int {
+		s := L.CheckString(1)
+		n := L.CheckInt(2)
+		sep := L.OptString(3, "")
+		if n <= 0 {
+			L.Push(lua.LString(""))
+			return 1
+		}
+		// Output size = n*len(s) + (n-1)*len(sep). Guard before allocating.
+		total := int64(n) * int64(len(s))
+		if n > 1 {
+			total += int64(n-1) * int64(len(sep))
+		}
+		if total < 0 || total > int64(MaxStringRepOutput) {
+			L.RaiseError("string.rep: output size %d exceeds %d-byte cap", total, MaxStringRepOutput)
+			return 0
+		}
+		// Build the output manually (avoid re-calling the original rep which
+		// we've already replaced; just do the repetition in Go).
+		buf := make([]byte, 0, int(total))
+		for i := 0; i < n; i++ {
+			if i > 0 && sep != "" {
+				buf = append(buf, sep...)
+			}
+			buf = append(buf, s...)
+		}
+		L.Push(lua.LString(string(buf)))
+		return 1
+	}))
+}
+
+// runWithMemoryGuard runs fn on the given state inside a goroutine while a
+// second goroutine samples heap growth. If the script runs past the time
+// budget OR grows the process heap by more than MaxScriptMemoryGrowth, the
+// context is cancelled (gopher-lua checks context on each VM step and
+// aborts with an error).
+func runWithMemoryGuard(L *lua.LState, fn func() error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), MaxScriptDuration)
+	defer cancel()
+	L.SetContext(ctx)
+	defer L.RemoveContext()
+
+	var startMem runtime.MemStats
+	runtime.ReadMemStats(&startMem)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- fn()
+	}()
+
+	ticker := time.NewTicker(MemoryPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case err := <-done:
+			return err
+		case <-ticker.C:
+			var now runtime.MemStats
+			runtime.ReadMemStats(&now)
+			// HeapAlloc is monotonic between GC cycles; compare to start.
+			// Process-wide measurement means a concurrent goroutine could
+			// trigger this — but the budget (64 MiB) is generous enough
+			// that false positives on an idle server are unlikely, and
+			// a legitimate script doesn't allocate anywhere near that.
+			if now.HeapAlloc > startMem.HeapAlloc &&
+				now.HeapAlloc-startMem.HeapAlloc > MaxScriptMemoryGrowth {
+				cancel()
+				<-done // wait for the goroutine to observe cancellation
+				return fmt.Errorf("script cancelled: heap growth exceeded %d bytes", MaxScriptMemoryGrowth)
+			}
+		}
 	}
 }
 
@@ -82,10 +181,8 @@ type RequestContext struct {
 	BackendOverride string
 }
 
-// RunRequestScript executes a Lua request script with the given context.
-// MaxScriptDuration is the maximum time a Lua script can run before being killed.
-const MaxScriptDuration = 5 * time.Second
-
+// RunRequestScript executes a Lua request script with the given context,
+// enforcing both a duration limit (via context) and a heap-growth budget.
 func RunRequestScript(pool *LuaPool, scriptPath string, ctx *RequestContext) error {
 	L := pool.Get()
 	defer pool.Put(L)
@@ -93,17 +190,13 @@ func RunRequestScript(pool *LuaPool, scriptPath string, ctx *RequestContext) err
 	// Register the nvelox API module
 	registerAPI(L, ctx)
 
-	// Set execution timeout via context
-	lctx, cancel := context.WithTimeout(context.Background(), MaxScriptDuration)
-	defer cancel()
-	L.SetContext(lctx)
-	defer L.RemoveContext()
-
-	if err := L.DoFile(scriptPath); err != nil {
+	err := runWithMemoryGuard(L, func() error {
+		return L.DoFile(scriptPath)
+	})
+	if err != nil {
 		logging.Error("[LUA] Script error in %s: %v", scriptPath, err)
 		return err
 	}
-
 	return nil
 }
 
@@ -141,17 +234,13 @@ func RunResponseScript(pool *LuaPool, scriptPath string, resp *http.Response, r 
 
 	L.SetGlobal("nvelox", mod)
 
-	// Set execution timeout
-	lctx, cancel := context.WithTimeout(context.Background(), MaxScriptDuration)
-	defer cancel()
-	L.SetContext(lctx)
-	defer L.RemoveContext()
-
-	if err := L.DoFile(scriptPath); err != nil {
+	err := runWithMemoryGuard(L, func() error {
+		return L.DoFile(scriptPath)
+	})
+	if err != nil {
 		logging.Error("[LUA] Response script error in %s: %v", scriptPath, err)
 		return err
 	}
-
 	return nil
 }
 
