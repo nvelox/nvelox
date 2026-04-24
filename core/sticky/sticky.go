@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"net"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 )
@@ -56,26 +57,47 @@ func (s *Store) Get(key string) string {
 	return sess.server
 }
 
-// Set stores a sticky mapping. Evicts oldest entries if over 100k sessions.
+// MaxSessions is the cap on concurrent sticky sessions. When reached, the
+// oldest 10% (by lastSeen) are evicted. Map-iteration-order eviction would
+// let an attacker with many spoofed cookies DoS legitimate users' sessions
+// by random removal — we sort by lastSeen instead.
+const MaxSessions = 100000
+
+// Set stores a sticky mapping. Evicts oldest (by lastSeen) entries if over MaxSessions.
 func (s *Store) Set(key, server string) {
 	s.mu.Lock()
-	const maxSessions = 100000
-	if len(s.sessions) >= maxSessions {
-		// Evict 10% oldest
-		count := len(s.sessions) / 10
-		if count < 1 {
-			count = 1
-		}
-		for k := range s.sessions {
-			delete(s.sessions, k)
-			count--
-			if count <= 0 {
-				break
-			}
-		}
+	if len(s.sessions) >= MaxSessions {
+		s.evictOldestLocked(MaxSessions / 10)
 	}
 	s.sessions[key] = &session{server: server, lastSeen: time.Now()}
 	s.mu.Unlock()
+}
+
+// evictOldestLocked removes the n entries with the smallest lastSeen.
+// Must be called with s.mu held for write.
+// O(n) scan + O(k log k) sort where k is the victim count; cheap enough at
+// 10k victims on a 100k map that it runs once per ~90k inserts.
+func (s *Store) evictOldestLocked(n int) {
+	if n <= 0 || len(s.sessions) == 0 {
+		return
+	}
+	type entry struct {
+		key string
+		ts  time.Time
+	}
+	entries := make([]entry, 0, len(s.sessions))
+	for k, sess := range s.sessions {
+		entries = append(entries, entry{k, sess.lastSeen})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].ts.Before(entries[j].ts)
+	})
+	if n > len(entries) {
+		n = len(entries)
+	}
+	for i := 0; i < n; i++ {
+		delete(s.sessions, entries[i].key)
+	}
 }
 
 // Stop shuts down the cleanup goroutine.

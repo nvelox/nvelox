@@ -90,6 +90,65 @@ func TestKeyFromIPHash(t *testing.T) {
 	}
 }
 
+// TestEvictOldestLocked_PrefersOldest ensures eviction removes the entries
+// with the smallest lastSeen rather than random map-iteration order.
+// Without this, an attacker filling the table with fresh sessions could
+// DoS legitimate users by evicting their still-active sessions at random.
+func TestEvictOldestLocked_PrefersOldest(t *testing.T) {
+	s := NewStore(1 * time.Hour)
+	defer s.Stop()
+
+	// Insert 5 sessions with monotonically advancing lastSeen.
+	// We manipulate lastSeen directly to avoid sleeping.
+	s.mu.Lock()
+	base := time.Now()
+	for i, k := range []string{"a", "b", "c", "d", "e"} {
+		s.sessions[k] = &session{
+			server:   "srv-" + k,
+			lastSeen: base.Add(time.Duration(i) * time.Second),
+		}
+	}
+	s.evictOldestLocked(2)
+	s.mu.Unlock()
+
+	// a and b should be gone (oldest); c, d, e should remain.
+	if s.Get("a") != "" || s.Get("b") != "" {
+		t.Error("expected oldest entries (a,b) to be evicted")
+	}
+	if s.Get("c") == "" || s.Get("d") == "" || s.Get("e") == "" {
+		t.Error("expected newer entries (c,d,e) to survive eviction")
+	}
+}
+
+// TestEvictOldestLocked_EmptyAndBounds checks the edge cases.
+func TestEvictOldestLocked_EmptyAndBounds(t *testing.T) {
+	s := NewStore(1 * time.Hour)
+	defer s.Stop()
+
+	// Empty store: no panic.
+	s.mu.Lock()
+	s.evictOldestLocked(5)
+	s.mu.Unlock()
+
+	s.Set("k1", "v1")
+	// n > map size: must clear the whole map, not panic.
+	s.mu.Lock()
+	s.evictOldestLocked(100)
+	s.mu.Unlock()
+	if s.Len() != 0 {
+		t.Errorf("expected 0 sessions after oversized evict, got %d", s.Len())
+	}
+
+	// n <= 0: no-op.
+	s.Set("k2", "v2")
+	s.mu.Lock()
+	s.evictOldestLocked(0)
+	s.mu.Unlock()
+	if s.Len() != 1 {
+		t.Errorf("n=0 must be a no-op, got %d sessions", s.Len())
+	}
+}
+
 func TestServerToToken(t *testing.T) {
 	t1 := ServerToToken("10.0.0.1:80")
 	t2 := ServerToToken("10.0.0.2:80")
