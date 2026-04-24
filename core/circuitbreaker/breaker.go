@@ -13,15 +13,26 @@ const (
 )
 
 // Breaker implements the circuit breaker pattern per backend.
+//
+// Concurrency model: `state` and `failures` are accessed with sync/atomic for
+// the fast-path (e.g. `State()`, `Failures()` observers). All state
+// transitions (threshold crossing, timeout→half-open, half-open→closed/open)
+// happen under `mu`. This makes transitions linearizable — two concurrent
+// RecordFailure calls at the threshold can't produce torn state between
+// `state` and `lastFail`; two concurrent Allow() calls in HalfOpen can't
+// both see a stale halfOpenCnt.
 type Breaker struct {
-	state       int32
-	failures    int64
+	// Fast-path atomics.
+	state    atomic.Int32
+	failures atomic.Int64
+
+	// Transition-path fields, all guarded by mu.
+	mu          sync.Mutex
 	threshold   int
 	timeout     time.Duration
 	halfOpenMax int
 	halfOpenCnt int64
 	lastFail    time.Time
-	mu          sync.Mutex
 }
 
 // New creates a circuit breaker.
@@ -37,66 +48,91 @@ func New(threshold int, timeout time.Duration, halfOpenMax int) *Breaker {
 }
 
 // Allow returns true if the request should proceed.
+//
+// Fast path: Closed state reads atomic.state and returns true without
+// acquiring the mutex. Slow path: Open and HalfOpen acquire mu so the
+// state/counter check is atomic with respect to transitions.
 func (b *Breaker) Allow() bool {
-	state := atomic.LoadInt32(&b.state)
+	// Fast path: closed → no coordination needed.
+	if b.state.Load() == StateClosed {
+		return true
+	}
 
-	switch state {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Re-load state under lock: it may have changed since the Load above.
+	switch b.state.Load() {
 	case StateClosed:
 		return true
 	case StateOpen:
-		b.mu.Lock()
-		defer b.mu.Unlock()
 		if time.Since(b.lastFail) > b.timeout {
-			// Transition to half-open, this request counts as the first probe
-			atomic.StoreInt32(&b.state, StateHalfOpen)
-			atomic.StoreInt64(&b.halfOpenCnt, 1)
+			// Transition to half-open. This request is the first probe, so
+			// seed halfOpenCnt=1 BEFORE flipping state — under the mutex no
+			// concurrent Allow() can observe the new state with the old count.
+			b.halfOpenCnt = 1
+			b.state.Store(StateHalfOpen)
 			return true
 		}
 		return false
 	case StateHalfOpen:
-		cnt := atomic.AddInt64(&b.halfOpenCnt, 1)
-		return cnt <= int64(b.halfOpenMax)
+		if b.halfOpenCnt < int64(b.halfOpenMax) {
+			b.halfOpenCnt++
+			return true
+		}
+		return false
 	}
 	return true
 }
 
 // RecordSuccess records a successful request.
 func (b *Breaker) RecordSuccess() {
-	state := atomic.LoadInt32(&b.state)
-	if state == StateHalfOpen {
-		// Success in half-open → close the circuit
-		atomic.StoreInt32(&b.state, StateClosed)
-		atomic.StoreInt64(&b.failures, 0)
-	} else if state == StateClosed {
-		atomic.StoreInt64(&b.failures, 0)
+	// Fast path: closed + failures==0 is the overwhelmingly common case;
+	// avoid acquiring the mutex on every success.
+	if b.state.Load() == StateClosed && b.failures.Load() == 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch b.state.Load() {
+	case StateHalfOpen:
+		// Success probe → close the circuit.
+		b.failures.Store(0)
+		b.halfOpenCnt = 0
+		b.state.Store(StateClosed)
+	case StateClosed:
+		b.failures.Store(0)
 	}
 }
 
 // RecordFailure records a failed request.
 func (b *Breaker) RecordFailure() {
-	state := atomic.LoadInt32(&b.state)
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
-	if state == StateHalfOpen {
-		// Failure in half-open → open the circuit
-		b.mu.Lock()
+	switch b.state.Load() {
+	case StateHalfOpen:
+		// Failure during recovery probe → re-open.
 		b.lastFail = time.Now()
-		b.mu.Unlock()
-		atomic.StoreInt32(&b.state, StateOpen)
-		return
-	}
-
-	fails := atomic.AddInt64(&b.failures, 1)
-	if int(fails) >= b.threshold {
-		b.mu.Lock()
+		b.halfOpenCnt = 0
+		b.state.Store(StateOpen)
+	case StateClosed:
+		fails := b.failures.Add(1)
+		if int(fails) >= b.threshold {
+			b.lastFail = time.Now()
+			b.state.Store(StateOpen)
+		}
+	case StateOpen:
+		// Already open — refresh lastFail so the timeout window slides forward
+		// when failures continue. This matches the "hold open while failures
+		// continue" behaviour most CB implementations use.
 		b.lastFail = time.Now()
-		b.mu.Unlock()
-		atomic.StoreInt32(&b.state, StateOpen)
 	}
 }
 
 // State returns the current state as a string.
 func (b *Breaker) State() string {
-	switch atomic.LoadInt32(&b.state) {
+	switch b.state.Load() {
 	case StateClosed:
 		return "closed"
 	case StateOpen:
@@ -110,5 +146,5 @@ func (b *Breaker) State() string {
 
 // Failures returns the current failure count.
 func (b *Breaker) Failures() int {
-	return int(atomic.LoadInt64(&b.failures))
+	return int(b.failures.Load())
 }

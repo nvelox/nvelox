@@ -1,6 +1,8 @@
 package circuitbreaker
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -118,5 +120,62 @@ func TestBreaker_SuccessResetsFailures(t *testing.T) {
 
 	if b.State() != "closed" {
 		t.Error("should still be closed (reset after success)")
+	}
+}
+
+// TestBreaker_HalfOpen_ConcurrentCapRespected exercises the previously-racy
+// Open→HalfOpen transition with many concurrent Allow() callers. Exactly
+// halfOpenMax probes must be admitted, never more.
+func TestBreaker_HalfOpen_ConcurrentCapRespected(t *testing.T) {
+	const halfMax = 5
+	b := New(1, 10*time.Millisecond, halfMax)
+
+	// Trip the breaker open.
+	b.RecordFailure()
+	if b.State() != "open" {
+		t.Fatalf("precondition: expected open, got %s", b.State())
+	}
+	time.Sleep(15 * time.Millisecond) // past timeout
+
+	// Fire many concurrent Allow() calls; count how many succeed.
+	var wg sync.WaitGroup
+	var admitted atomic.Int64
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if b.Allow() {
+				admitted.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Exactly halfMax probes should have been admitted (the transition probe
+	// + halfMax-1 concurrent HalfOpen admissions).
+	got := admitted.Load()
+	if got != halfMax {
+		t.Errorf("concurrent Allow() in HalfOpen: admitted %d, want %d", got, halfMax)
+	}
+}
+
+// TestBreaker_RecordFailure_ConcurrentThreshold verifies that concurrent
+// RecordFailure calls cleanly cross the threshold without torn state.
+// Run with -race to catch lastFail write-without-lock races.
+func TestBreaker_RecordFailure_ConcurrentThreshold(t *testing.T) {
+	b := New(5, 1*time.Minute, 1)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			b.RecordFailure()
+		}()
+	}
+	wg.Wait()
+
+	if b.State() != "open" {
+		t.Errorf("after 100 concurrent failures (threshold=5): expected open, got %s", b.State())
 	}
 }
