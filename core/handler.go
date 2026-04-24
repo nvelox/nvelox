@@ -146,7 +146,14 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 			logging.Error("[DATA] Write failed: %v", err)
 		}
 	} else {
-		// Buffer data until backend connects
+		// Buffer data until backend connects (max 1MB to prevent DoS)
+		const maxBufferSize = 1 << 20 // 1MB
+		if len(ctx.Buffer)+len(data) > maxBufferSize {
+			ctx.Mu.Unlock()
+			logging.Warn("[DATA] Buffer overflow from %s, closing connection", c.RemoteAddr())
+			c.Close()
+			return
+		}
 		ctx.Buffer = append(ctx.Buffer, data...)
 		ctx.Mu.Unlock()
 	}
