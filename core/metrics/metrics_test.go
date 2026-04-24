@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -107,5 +108,56 @@ func TestGetCounter_DifferentLabels(t *testing.T) {
 	c1.Inc()
 	if c2.Get() != 0 {
 		t.Error("different labels should be different counters")
+	}
+}
+
+// TestCardinalityCap_Counter verifies that once MaxSeriesPerMetricType
+// distinct counter series are registered, additional label combinations
+// are served by the shared overflow counter and the drop counter grows.
+// Protects against an attacker inflating cardinality via user-controlled
+// labels (paths, user-agents, etc.) to exhaust memory.
+func TestCardinalityCap_Counter(t *testing.T) {
+	r := &Registry{}
+	// Fill up to the cap with distinct labels.
+	for i := 0; i < MaxSeriesPerMetricType; i++ {
+		r.GetCounter("cap_test", map[string]string{"id": fmt.Sprintf("%d", i)}).Inc()
+	}
+	if r.DroppedSeries() != 0 {
+		t.Fatalf("expected 0 drops while filling, got %d", r.DroppedSeries())
+	}
+
+	// Beyond the cap: the next 100 unique labels must all share the overflow sink.
+	var first *Counter
+	for i := 0; i < 100; i++ {
+		c := r.GetCounter("cap_test", map[string]string{"id": fmt.Sprintf("overflow-%d", i)})
+		if first == nil {
+			first = c
+		} else if c != first {
+			t.Fatal("overflow labels must share the same overflow counter instance")
+		}
+		c.Inc()
+	}
+	if r.DroppedSeries() != 100 {
+		t.Errorf("expected 100 dropped series, got %d", r.DroppedSeries())
+	}
+	// Existing series still work (re-lookup of a known label).
+	r.GetCounter("cap_test", map[string]string{"id": "0"}).Inc()
+	if r.DroppedSeries() != 100 {
+		t.Errorf("existing-series lookup must not count as a drop; got %d", r.DroppedSeries())
+	}
+}
+
+func TestCardinalityCap_Gauge(t *testing.T) {
+	r := &Registry{}
+	for i := 0; i < MaxSeriesPerMetricType; i++ {
+		r.GetGauge("cap_gauge", map[string]string{"id": fmt.Sprintf("%d", i)}).Inc()
+	}
+	g := r.GetGauge("cap_gauge", map[string]string{"id": "overflow"})
+	g2 := r.GetGauge("cap_gauge", map[string]string{"id": "overflow-b"})
+	if g != g2 {
+		t.Error("overflow gauges must share the same instance")
+	}
+	if r.DroppedSeries() < 2 {
+		t.Errorf("expected >=2 dropped gauges, got %d", r.DroppedSeries())
 	}
 }

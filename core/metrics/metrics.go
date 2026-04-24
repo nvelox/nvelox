@@ -9,15 +9,31 @@ import (
 	"sync/atomic"
 )
 
+// MaxSeriesPerMetricType caps the number of distinct label combinations
+// per metric type (counters, gauges) to prevent an attacker from inflating
+// cardinality with user-controlled labels (e.g. paths, user-agents) and
+// exhausting memory. Series beyond the cap are dropped and counted via
+// the "metrics_dropped_series_total" counter.
+const MaxSeriesPerMetricType = 10000
+
 // Registry holds all metrics for Prometheus exposition.
 type Registry struct {
-	counters   sync.Map // name+labels -> *Counter
-	gauges     sync.Map // name+labels -> *Gauge
-	histograms sync.Map // name -> *Histogram
+	counters      sync.Map // name+labels -> *Counter
+	gauges        sync.Map // name+labels -> *Gauge
+	histograms    sync.Map // name -> *Histogram
+	counterCount  int64
+	gaugeCount    int64
+	droppedSeries uint64 // counter of attempts rejected due to cardinality cap
 }
 
 // Global registry
 var Default = &Registry{}
+
+// DroppedSeries returns the number of times a series was rejected due to
+// cardinality overflow. Useful for monitoring if the cap is hit in prod.
+func (r *Registry) DroppedSeries() uint64 {
+	return atomic.LoadUint64(&r.droppedSeries)
+}
 
 // Counter is a monotonically increasing counter.
 type Counter struct {
@@ -67,25 +83,51 @@ func (h *Histogram) Observe(v float64) {
 	}
 }
 
+// overflow sinks shared by all label combinations rejected due to the
+// cardinality cap. Increments still happen so traffic isn't lost, but no
+// new series is created in the registry.
+var (
+	overflowCounter = &Counter{}
+	overflowGauge   = &Gauge{}
+)
+
 // GetCounter returns or creates a counter with the given name and labels.
+// If creating a new series would exceed MaxSeriesPerMetricType, a shared
+// overflow counter is returned and droppedSeries is incremented.
 func (r *Registry) GetCounter(name string, labels map[string]string) *Counter {
 	key := metricKey(name, labels)
 	if v, ok := r.counters.Load(key); ok {
 		return v.(*Counter)
 	}
+	if atomic.LoadInt64(&r.counterCount) >= MaxSeriesPerMetricType {
+		atomic.AddUint64(&r.droppedSeries, 1)
+		return overflowCounter
+	}
 	c := &Counter{}
-	actual, _ := r.counters.LoadOrStore(key, c)
+	actual, loaded := r.counters.LoadOrStore(key, c)
+	if !loaded {
+		atomic.AddInt64(&r.counterCount, 1)
+	}
 	return actual.(*Counter)
 }
 
 // GetGauge returns or creates a gauge with the given name and labels.
+// If creating a new series would exceed MaxSeriesPerMetricType, a shared
+// overflow gauge is returned and droppedSeries is incremented.
 func (r *Registry) GetGauge(name string, labels map[string]string) *Gauge {
 	key := metricKey(name, labels)
 	if v, ok := r.gauges.Load(key); ok {
 		return v.(*Gauge)
 	}
+	if atomic.LoadInt64(&r.gaugeCount) >= MaxSeriesPerMetricType {
+		atomic.AddUint64(&r.droppedSeries, 1)
+		return overflowGauge
+	}
 	g := &Gauge{}
-	actual, _ := r.gauges.LoadOrStore(key, g)
+	actual, loaded := r.gauges.LoadOrStore(key, g)
+	if !loaded {
+		atomic.AddInt64(&r.gaugeCount, 1)
+	}
 	return actual.(*Gauge)
 }
 
