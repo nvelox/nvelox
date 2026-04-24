@@ -1,13 +1,21 @@
 package httpproxy
 
 import (
+	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"nvelox/config"
 	"nvelox/core/acl"
+	"nvelox/core/logging"
 )
+
+func init() {
+	// buildBackendTLSConfig logs a warning when Insecure is set; the logger
+	// must be initialized or Warn() panics.
+	_ = logging.Init("debug", "", "")
+}
 
 func TestIsWebSocketUpgrade(t *testing.T) {
 	tests := []struct {
@@ -212,5 +220,85 @@ func TestApplyRequestHeaders_EmptyConfig(t *testing.T) {
 
 	if r.Header.Get("Keep") != "me" {
 		t.Error("empty config should not modify existing headers")
+	}
+}
+
+func TestBuildBackendTLSConfig_Default(t *testing.T) {
+	tlsCfg, err := buildBackendTLSConfig(config.BackendTLSConfig{Enabled: true})
+	if err != nil {
+		t.Fatalf("default config should succeed: %v", err)
+	}
+	if tlsCfg.InsecureSkipVerify {
+		t.Error("default must NOT set InsecureSkipVerify")
+	}
+	if tlsCfg.RootCAs != nil {
+		t.Error("default must use system roots (RootCAs nil)")
+	}
+	if tlsCfg.MinVersion != tls.VersionTLS12 {
+		t.Errorf("MinVersion must be TLS 1.2, got %x", tlsCfg.MinVersion)
+	}
+}
+
+func TestBuildBackendTLSConfig_Insecure(t *testing.T) {
+	// Must only be set when operator explicitly opts in. Used for testing
+	// or when talking to backends with self-signed certs where CA pinning
+	// is not practical.
+	tlsCfg, err := buildBackendTLSConfig(config.BackendTLSConfig{Enabled: true, Insecure: true})
+	if err != nil {
+		t.Fatalf("insecure config should succeed: %v", err)
+	}
+	if !tlsCfg.InsecureSkipVerify {
+		t.Error("insecure: true must set InsecureSkipVerify")
+	}
+}
+
+func TestBuildBackendTLSConfig_MTLSBothOrNeither(t *testing.T) {
+	// Client cert without client key (or vice versa) must be rejected —
+	// silently dropping either half would produce a broken mTLS setup.
+	_, err := buildBackendTLSConfig(config.BackendTLSConfig{
+		Enabled: true, ClientCert: "/tmp/cert.pem",
+	})
+	if err == nil {
+		t.Error("client_cert without client_key must be rejected")
+	}
+	_, err = buildBackendTLSConfig(config.BackendTLSConfig{
+		Enabled: true, ClientKey: "/tmp/key.pem",
+	})
+	if err == nil {
+		t.Error("client_key without client_cert must be rejected")
+	}
+}
+
+func TestBuildBackendTLSConfig_BadCACert(t *testing.T) {
+	_, err := buildBackendTLSConfig(config.BackendTLSConfig{
+		Enabled: true, CACert: "/nonexistent/ca.pem",
+	})
+	if err == nil {
+		t.Error("missing ca_cert file must return error")
+	}
+}
+
+// TestNewHTTPServer_BackendTLSWiring proves that a backend with
+// backend_tls.enabled=true gets its own Transport and https scheme,
+// while a plaintext backend uses the default transport.
+func TestNewHTTPServer_BackendTLSWiring(t *testing.T) {
+	backends := map[string]*config.Backend{
+		"plain": {Servers: []string{"10.0.0.1:80"}},
+		"tls": {
+			Servers:    []string{"10.0.0.2:443"},
+			BackendTLS: config.BackendTLSConfig{Enabled: true, Insecure: true},
+		},
+	}
+	l := &ListenerConfig{Name: "test", Addr: ":0", Protocol: "http"}
+	s := NewHTTPServer(l, nil, backends, nil, nil, nil, nil, nil)
+
+	if _, ok := s.backendTransports["plain"]; ok {
+		t.Error("plain backend must NOT have a per-backend transport")
+	}
+	if _, ok := s.backendTransports["tls"]; !ok {
+		t.Error("tls backend must have a per-backend transport")
+	}
+	if s.backendSchemes["tls"] != "https" {
+		t.Errorf("tls backend scheme must be https, got %q", s.backendSchemes["tls"])
 	}
 }

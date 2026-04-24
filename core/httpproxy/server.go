@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
@@ -79,7 +80,11 @@ type HTTPServer struct {
 	ErrorPages      map[int][]byte // status code -> pre-loaded HTML content
 	ResponseCache   *Cache
 	BufferPool      *BufferPool
-	backendTransport *http.Transport // shared transport with connection pooling
+	backendTransport *http.Transport // default transport (plaintext HTTP backends)
+	// backendTransports holds per-backend TLS-enabled transports. If a backend's
+	// name is absent here, the default backendTransport is used.
+	backendTransports map[string]*http.Transport
+	backendSchemes    map[string]string // "https" when backend_tls is enabled
 	altSvcHeader    string
 }
 
@@ -177,6 +182,31 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 		ForceAttemptHTTP2:   true,
 	}
 
+	// Per-backend TLS transports: a backend with backend_tls.enabled=true gets
+	// its own Transport with a TLSClientConfig built from the backend config.
+	s.backendTransports = make(map[string]*http.Transport)
+	s.backendSchemes = make(map[string]string)
+	for name, be := range backends {
+		if be == nil || !be.BackendTLS.Enabled {
+			continue
+		}
+		tlsCfg, err := buildBackendTLSConfig(be.BackendTLS)
+		if err != nil {
+			logging.Error("[HTTP] backend %q: backend_tls invalid: %v — falling back to plaintext transport", name, err)
+			continue
+		}
+		s.backendTransports[name] = &http.Transport{
+			MaxIdleConns:        1024,
+			MaxIdleConnsPerHost: 256,
+			IdleConnTimeout:     90 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
+			TLSClientConfig:     tlsCfg,
+			DisableCompression:  true,
+			ForceAttemptHTTP2:   true,
+		}
+		s.backendSchemes[name] = "https"
+	}
+
 	s.httpServer = &http.Server{
 		Addr:         l.Addr,
 		Handler:      s,
@@ -209,6 +239,49 @@ func parseByteSize(s string) int64 {
 	n := int64(0)
 	fmt.Sscanf(s, "%d", &n)
 	return n * multiplier
+}
+
+// buildBackendTLSConfig turns a BackendTLSConfig into a *tls.Config suitable
+// for use as Transport.TLSClientConfig.
+//
+// Security defaults: InsecureSkipVerify is OFF unless the operator explicitly
+// sets backend_tls.insecure: true. System CA pool is used when no ca_cert is
+// provided. Client cert/key are both required if either is set (mTLS).
+func buildBackendTLSConfig(cfg config.BackendTLSConfig) (*tls.Config, error) {
+	t := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+
+	if cfg.Insecure {
+		// Operator opted out of verification explicitly. Document loudly.
+		logging.Warn("[HTTP] backend_tls.insecure=true — certificate verification DISABLED for backend")
+		t.InsecureSkipVerify = true
+	} else if cfg.CACert != "" {
+		pem, err := os.ReadFile(cfg.CACert)
+		if err != nil {
+			return nil, fmt.Errorf("read ca_cert: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("ca_cert %q: no certificates parsed", cfg.CACert)
+		}
+		t.RootCAs = pool
+	}
+	// If neither Insecure nor CACert are set, Go's default (system roots) is used.
+
+	// mTLS client cert: both files must be present together.
+	if (cfg.ClientCert != "") != (cfg.ClientKey != "") {
+		return nil, fmt.Errorf("backend_tls: client_cert and client_key must both be set for mTLS")
+	}
+	if cfg.ClientCert != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.ClientCert, cfg.ClientKey)
+		if err != nil {
+			return nil, fmt.Errorf("load client cert: %w", err)
+		}
+		t.Certificates = []tls.Certificate{cert}
+	}
+
+	return t, nil
 }
 
 // Start begins listening for HTTP/HTTPS connections.
@@ -518,10 +591,17 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		balancer.OnConnect(target)
 
 		proxyErr := make(chan error, 1)
+		// Pick per-backend TLS transport if configured, else shared default.
+		transport := s.backendTransport
+		scheme := "http"
+		if t, ok := s.backendTransports[backendName]; ok {
+			transport = t
+			scheme = s.backendSchemes[backendName]
+		}
 		proxy := &httputil.ReverseProxy{
-			Transport: s.backendTransport,
+			Transport: transport,
 			Director: func(req *http.Request) {
-				req.URL.Scheme = "http"
+				req.URL.Scheme = scheme
 				req.URL.Host = target
 				req.Host = r.Host
 			},
