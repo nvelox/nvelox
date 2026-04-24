@@ -91,9 +91,9 @@ func (e *Engine) matches(r *http.Request, clientIP net.IP, rule *CompiledRule) b
 		}
 	}
 
-	// Check method
+	// Check method (normalize to uppercase — rule methods compiled uppercase)
 	if len(rule.Methods) > 0 {
-		if !rule.Methods[r.Method] {
+		if !rule.Methods[strings.ToUpper(r.Method)] {
 			return false
 		}
 	}

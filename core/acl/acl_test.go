@@ -44,6 +44,22 @@ func TestACL_Method_Deny(t *testing.T) {
 	}
 }
 
+func TestACL_Method_CaseInsensitive(t *testing.T) {
+	// Rule methods are compiled uppercase; request methods must be normalized
+	// before lookup or attackers can bypass rules by sending lowercase verbs.
+	engine := NewEngine([]config.ACLRule{
+		{Match: config.ACLMatch{Method: []string{"DELETE"}}, Action: "deny"},
+	})
+
+	for _, m := range []string{"DELETE", "delete", "Delete", "dElEtE"} {
+		r := httptest.NewRequest(m, "/resource", nil)
+		r.RemoteAddr = "10.0.0.1:1234"
+		if action := engine.Check(r); action != "deny" {
+			t.Errorf("expected deny for method %q, got %q", m, action)
+		}
+	}
+}
+
 func TestACL_Combined(t *testing.T) {
 	engine := NewEngine([]config.ACLRule{
 		{
