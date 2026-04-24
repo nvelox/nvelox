@@ -98,6 +98,7 @@ type Listener struct {
 	Headers     HeadersConfig     `yaml:"headers,omitempty"`
 	Compression CompressionConfig `yaml:"compression,omitempty"`
 	ErrorPages  map[int]string    `yaml:"error_pages,omitempty"` // status code -> file path
+	Root        string            `yaml:"root,omitempty"`        // Document root for static files
 	Buffering   BufferingConfig   `yaml:"buffering,omitempty"`
 	Cache       CacheConfig       `yaml:"cache,omitempty"`
 	GRPC        bool              `yaml:"grpc,omitempty"`        // Enable gRPC-aware proxying
@@ -162,12 +163,28 @@ type TLSConfig struct {
 
 // RouteConfig defines an L7 route matching rule.
 type RouteConfig struct {
-	Match    RouteMatch    `yaml:"match"`
-	Backend  string        `yaml:"backend,omitempty"`
-	Headers  HeadersConfig `yaml:"headers,omitempty"`
+	Match    RouteMatch     `yaml:"match"`
+	Backend  string         `yaml:"backend,omitempty"`
+	Headers  HeadersConfig  `yaml:"headers,omitempty"`
 	Rewrite  RewriteConfig  `yaml:"rewrite,omitempty"`
 	Redirect RedirectConfig `yaml:"redirect,omitempty"`
 	Scripts  ScriptsConfig  `yaml:"scripts,omitempty"`
+	Static   StaticConfig   `yaml:"static,omitempty"`   // Serve static files
+	TryFiles TryFilesConfig `yaml:"try_files,omitempty"` // try_files logic
+	Expires  string         `yaml:"expires,omitempty"`   // Cache-Control: "1y", "30d", "1h", "-1" (no cache)
+}
+
+// StaticConfig defines static file serving.
+type StaticConfig struct {
+	Root      string   `yaml:"root"`                  // Document root directory
+	Index     []string `yaml:"index,omitempty"`        // Index files (default: ["index.html"])
+	Autoindex bool     `yaml:"autoindex,omitempty"`    // Directory listing
+}
+
+// TryFilesConfig defines try_files behavior.
+type TryFilesConfig struct {
+	Files    []string `yaml:"files"`     // e.g., ["$uri", "$uri/", "/index.php$is_args$args"]
+	Fallback string   `yaml:"fallback"`  // Fallback path or =status (e.g., "=404", "/fallback.html")
 }
 
 // ScriptsConfig defines Lua script hooks for a route.

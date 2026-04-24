@@ -350,6 +350,47 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Handle static file serving
+		if routeResult.Static.Root != "" {
+			// Set expires header
+			if routeResult.Expires != "" {
+				SetExpires(w, routeResult.Expires)
+			}
+
+			root := routeResult.Static.Root
+
+			// try_files logic
+			if len(routeResult.TryFiles.Files) > 0 {
+				resolved := TryFiles(root, r, routeResult.TryFiles.Files, routeResult.TryFiles.Fallback)
+				if resolved != "" {
+					// Check if fallback is a status code (e.g., "=404")
+					if strings.HasPrefix(resolved, "=") {
+						code := 404
+						fmt.Sscanf(resolved[1:], "%d", &code)
+						s.serveError(w, code)
+						return
+					}
+					// Update request path and serve
+					r.URL.Path = resolved
+				}
+			}
+
+			handler := NewStaticHandler(routeResult.Static)
+			if handler.ServeFile(w, r) {
+				return
+			}
+			// File not found — fall through to backend or 404
+			if backendName == "" {
+				s.serveError(w, http.StatusNotFound)
+				return
+			}
+		}
+
+		// Set expires header for non-static routes
+		if routeResult.Static.Root == "" && routeResult.Expires != "" {
+			SetExpires(w, routeResult.Expires)
+		}
+
 		// Handle rewrite
 		if routeResult.Rewrite.Path != "" {
 			newPath := routeResult.Rewrite.Path

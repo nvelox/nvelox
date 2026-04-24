@@ -15,6 +15,9 @@ type compiledRoute struct {
 	headers    config.HeadersConfig
 	rewrite    config.RewriteConfig
 	redirect   config.RedirectConfig
+	static     config.StaticConfig
+	tryFiles   config.TryFilesConfig
+	expires    string
 }
 
 // RouteResult contains the result of a route match.
@@ -23,6 +26,9 @@ type RouteResult struct {
 	Headers      *config.HeadersConfig
 	Rewrite      config.RewriteConfig
 	Redirect     config.RedirectConfig
+	Static       config.StaticConfig
+	TryFiles     config.TryFilesConfig
+	Expires      string
 	RegexMatches []string // capture groups from regex match
 }
 
@@ -43,6 +49,9 @@ func NewRouter(routes []config.RouteConfig, defaultBackend string) *Router {
 			headers:    r.Headers,
 			rewrite:    r.Rewrite,
 			redirect:   r.Redirect,
+			static:     r.Static,
+			tryFiles:   r.TryFiles,
+			expires:    r.Expires,
 		}
 		if r.Match.PathRegex != "" {
 			cr.pathRegex, _ = regexp.Compile(r.Match.PathRegex)
@@ -99,6 +108,9 @@ func (r *Router) MatchFull(host, path string) *RouteResult {
 			Headers:      &route.headers,
 			Rewrite:      route.rewrite,
 			Redirect:     route.redirect,
+			Static:       route.static,
+			TryFiles:     route.tryFiles,
+			Expires:      route.expires,
 			RegexMatches: regexMatches,
 		}
 	}
