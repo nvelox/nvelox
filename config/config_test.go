@@ -545,3 +545,60 @@ func TestValidation_HTTP3(t *testing.T) {
 		}
 	})
 }
+
+func TestResolveIncludeGlob_Rejections(t *testing.T) {
+	tmpDir := t.TempDir()
+	mainConfig := filepath.Join(tmpDir, "nvelox.yaml")
+	os.WriteFile(mainConfig, []byte("version: '2'"), 0644)
+
+	cases := []struct {
+		name    string
+		pattern string
+	}{
+		{"dotdot relative", "../*.yaml"},
+		{"dotdot nested", "sub/../../*.yaml"},
+		{"absolute outside", "/etc/*/passwd"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := resolveIncludeGlob(c.pattern, mainConfig)
+			if err == nil {
+				t.Errorf("pattern %q must be rejected", c.pattern)
+			}
+		})
+	}
+}
+
+func TestResolveIncludeGlob_Accepts(t *testing.T) {
+	tmpDir := t.TempDir()
+	mainConfig := filepath.Join(tmpDir, "nvelox.yaml")
+	os.WriteFile(mainConfig, []byte("version: '2'"), 0644)
+	// Create two includable files in the same dir.
+	os.WriteFile(filepath.Join(tmpDir, "a.yaml"), []byte("backends: []"), 0644)
+	os.WriteFile(filepath.Join(tmpDir, "b.yaml"), []byte("backends: []"), 0644)
+
+	// Relative pattern.
+	matches, err := resolveIncludeGlob("*.yaml", mainConfig)
+	if err != nil {
+		t.Fatalf("relative: %v", err)
+	}
+	// Should match nvelox.yaml + a.yaml + b.yaml.
+	if len(matches) != 3 {
+		t.Errorf("relative *.yaml: want 3 matches, got %d: %v", len(matches), matches)
+	}
+
+	// Absolute path inside baseDir — allowed.
+	matches, err = resolveIncludeGlob(filepath.Join(tmpDir, "a.yaml"), mainConfig)
+	if err != nil {
+		t.Fatalf("absolute inside baseDir: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Errorf("absolute inside: want 1 match, got %d", len(matches))
+	}
+
+	// Empty pattern is a no-op.
+	matches, err = resolveIncludeGlob("", mainConfig)
+	if err != nil || matches != nil {
+		t.Errorf("empty: want (nil, nil), got (%v, %v)", matches, err)
+	}
+}
