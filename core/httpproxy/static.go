@@ -41,8 +41,9 @@ func (h *StaticHandler) ServeFile(w http.ResponseWriter, r *http.Request) bool {
 
 	fullPath := filepath.Join(h.root, reqPath)
 
-	// Security: prevent directory traversal
-	if !strings.HasPrefix(filepath.Clean(fullPath), filepath.Clean(h.root)) {
+	// Security: prevent directory traversal (pre-symlink check)
+	cleanRoot := filepath.Clean(h.root)
+	if !strings.HasPrefix(filepath.Clean(fullPath), cleanRoot) {
 		return false
 	}
 
@@ -51,19 +52,38 @@ func (h *StaticHandler) ServeFile(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 
+	// Security: resolve symlinks and re-check path is still within root
+	realPath, err := filepath.EvalSymlinks(fullPath)
+	if err != nil {
+		return false
+	}
+	realRoot, err := filepath.EvalSymlinks(cleanRoot)
+	if err != nil {
+		realRoot = cleanRoot
+	}
+	if !strings.HasPrefix(realPath, realRoot) {
+		return false // symlink points outside document root
+	}
+
 	// If directory, try index files
 	if info.IsDir() {
 		for _, idx := range h.index {
 			indexPath := filepath.Join(fullPath, idx)
-			if fi, err := os.Stat(indexPath); err == nil && !fi.IsDir() {
-				http.ServeFile(w, r, indexPath)
-				return true
+			// Check index file also resolves within root
+			if realIdx, err := filepath.EvalSymlinks(indexPath); err == nil {
+				if !strings.HasPrefix(realIdx, realRoot) {
+					continue
+				}
+				if fi, err := os.Stat(realIdx); err == nil && !fi.IsDir() {
+					http.ServeFile(w, r, realIdx)
+					return true
+				}
 			}
 		}
 		return false
 	}
 
-	http.ServeFile(w, r, fullPath)
+	http.ServeFile(w, r, realPath)
 	return true
 }
 
