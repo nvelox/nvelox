@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"net"
+	"sort"
 	"sync"
 	"time"
 )
@@ -94,18 +95,34 @@ func (rl *IPRateLimiter) cleanupLoop() {
 	}
 }
 
-// evictUnsafe removes the oldest 10% of entries. Must be called with lock held.
+// evictUnsafe removes the oldest 10% of entries (by lastTime). Must be called
+// with lock held. Random-order eviction would let a bot farm with many IPs
+// evict legitimate users' token buckets, which then re-initialize with full
+// burst allowance — effectively resetting the rate limit on demand.
 func (rl *IPRateLimiter) evictUnsafe() {
-	count := len(rl.ips) / 10
-	if count < 1 {
-		count = 1
+	n := len(rl.ips) / 10
+	if n < 1 {
+		n = 1
 	}
-	for ip := range rl.ips {
-		delete(rl.ips, ip)
-		count--
-		if count <= 0 {
-			break
-		}
+	if len(rl.ips) == 0 {
+		return
+	}
+	type entry struct {
+		ip string
+		ts time.Time
+	}
+	entries := make([]entry, 0, len(rl.ips))
+	for ip, e := range rl.ips {
+		entries = append(entries, entry{ip, e.lastTime})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].ts.Before(entries[j].ts)
+	})
+	if n > len(entries) {
+		n = len(entries)
+	}
+	for i := 0; i < n; i++ {
+		delete(rl.ips, entries[i].ip)
 	}
 }
 
