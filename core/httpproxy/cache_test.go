@@ -90,8 +90,9 @@ func TestCache_DefaultMethods(t *testing.T) {
 
 func TestCacheKey(t *testing.T) {
 	r := httptest.NewRequest("GET", "http://example.com/path?q=1", nil)
+	// No Accept-Encoding → identity class.
 	key := CacheKey(r)
-	if key != "GET|example.com|/path|q=1" {
+	if key != "GET|example.com|/path|q=1|identity" {
 		t.Errorf("unexpected key: %s", key)
 	}
 }
@@ -158,5 +159,53 @@ func TestBufferPool(t *testing.T) {
 	buf2 := bp.Get()
 	if len(buf2) != 4096 {
 		t.Errorf("expected 4096 bytes from pool, got %d", len(buf2))
+	}
+}
+
+func TestCacheKey_VariesByAcceptEncoding(t *testing.T) {
+	// Same request, different Accept-Encoding → different keys.
+	rGzip := httptest.NewRequest("GET", "http://ex.com/x", nil)
+	rGzip.Host = "ex.com"
+	rGzip.Header.Set("Accept-Encoding", "gzip, deflate")
+
+	rIdent := httptest.NewRequest("GET", "http://ex.com/x", nil)
+	rIdent.Host = "ex.com"
+	// no Accept-Encoding → identity
+
+	kg := CacheKey(rGzip)
+	ki := CacheKey(rIdent)
+	if kg == ki {
+		t.Errorf("gzip and identity requests must have distinct cache keys, both = %q", kg)
+	}
+	// Identical gzip-capable clients share a key (presence-based).
+	rGzip2 := httptest.NewRequest("GET", "http://ex.com/x", nil)
+	rGzip2.Host = "ex.com"
+	rGzip2.Header.Set("Accept-Encoding", "gzip;q=0.9, br")
+	if CacheKey(rGzip2) != kg {
+		t.Error("two gzip-capable clients should hit the same cache entry")
+	}
+}
+
+func TestShouldSkipCacheResponse_VaryBeyondAcceptEncoding(t *testing.T) {
+	cases := []struct {
+		vary string
+		skip bool
+	}{
+		{"", false},
+		{"Accept-Encoding", false},
+		{"accept-encoding", false},
+		{"Accept-Encoding, Accept-Encoding", false},
+		{"User-Agent", true},
+		{"Accept-Encoding, Cookie", true},
+		{"*", true},
+	}
+	for _, c := range cases {
+		h := http.Header{}
+		if c.vary != "" {
+			h.Set("Vary", c.vary)
+		}
+		if got := ShouldSkipCacheResponse(h); got != c.skip {
+			t.Errorf("Vary=%q: got skip=%v, want %v", c.vary, got, c.skip)
+		}
 	}
 }

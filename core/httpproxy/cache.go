@@ -97,8 +97,18 @@ func (c *Cache) Put(key string, entry *CacheEntry) {
 }
 
 // CacheKey generates a cache key from the request.
+//
+// Accept-Encoding is part of the key: without it, a gzipped response cached
+// from a gzip-capable client would be served to an identity-only client,
+// who'd see garbage. Normalized to "gzip" / "identity" (presence-based) so
+// trivially-different Accept-Encoding strings from the same class of client
+// still hit the same cache entry.
 func CacheKey(r *http.Request) string {
-	return r.Method + "|" + r.Host + "|" + r.URL.Path + "|" + r.URL.RawQuery
+	enc := "identity"
+	if ae := r.Header.Get("Accept-Encoding"); strings.Contains(ae, "gzip") {
+		enc = "gzip"
+	}
+	return r.Method + "|" + r.Host + "|" + r.URL.Path + "|" + r.URL.RawQuery + "|" + enc
 }
 
 // ShouldSkipCache checks if the request should bypass the cache.
@@ -124,6 +134,18 @@ func ShouldSkipCacheResponse(h http.Header) bool {
 	// Don't cache responses with Set-Cookie
 	if h.Get("Set-Cookie") != "" {
 		return true
+	}
+	// Vary only supports Accept-Encoding in our key. If the upstream
+	// says the response varies on anything else (User-Agent, Cookie,
+	// custom header, or "*"), we can't safely key it — skip caching.
+	if v := h.Get("Vary"); v != "" {
+		for _, tok := range strings.Split(v, ",") {
+			tok = strings.TrimSpace(strings.ToLower(tok))
+			if tok == "" || tok == "accept-encoding" {
+				continue
+			}
+			return true
+		}
 	}
 	return false
 }
