@@ -109,7 +109,7 @@ func (e *Engine) Start(ctx context.Context) error {
 
 	// 1e. Start admin API
 	if e.Config.Admin.Enabled {
-		e.AdminServer = admin.NewServer(e.Config.Admin.Bind, e.Balancers)
+		e.AdminServer = admin.NewServer(e.Config.Admin.Bind, e.Config.Admin.APIKey, e.Balancers)
 		e.AdminServer.Start()
 	}
 

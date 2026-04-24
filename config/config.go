@@ -35,8 +35,9 @@ type MetricsConfig struct {
 
 // AdminConfig defines the admin REST API endpoint.
 type AdminConfig struct {
-	Enabled bool   `yaml:"enabled"`
-	Bind    string `yaml:"bind"` // e.g., "127.0.0.1:9091"
+	Enabled  bool   `yaml:"enabled"`
+	Bind     string `yaml:"bind"`      // e.g., "127.0.0.1:9091"
+	APIKey   string `yaml:"api_key"`   // Required for all requests (via X-API-Key header)
 }
 
 // TracingConfig defines OpenTelemetry tracing settings.

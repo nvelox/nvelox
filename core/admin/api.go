@@ -2,8 +2,11 @@ package admin
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"nvelox/core/logging"
@@ -15,6 +18,7 @@ type Server struct {
 	httpServer *http.Server
 	balancers  map[string]lb.Balancer
 	startTime  time.Time
+	apiKey     string
 }
 
 // BackendStatus represents a backend's status in the API response.
@@ -30,27 +34,73 @@ type StatsResponse struct {
 }
 
 // NewServer creates an admin API server.
-func NewServer(bind string, balancers map[string]lb.Balancer) *Server {
+func NewServer(bind string, apiKey string, balancers map[string]lb.Balancer) *Server {
 	s := &Server{
 		balancers: balancers,
 		startTime: time.Now(),
+		apiKey:    apiKey,
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/stats", s.handleStats)
-	mux.HandleFunc("/api/v1/backends", s.handleBackends)
-	mux.HandleFunc("/api/v1/backends/", s.handleBackendAction)
+	mux.HandleFunc("/api/v1/stats", s.authenticate(s.handleStats))
+	mux.HandleFunc("/api/v1/backends", s.authenticate(s.handleBackends))
+	mux.HandleFunc("/api/v1/backends/", s.authenticate(s.handleBackendAction))
 
 	s.httpServer = &http.Server{
-		Addr:    bind,
-		Handler: mux,
+		Addr:         bind,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  30 * time.Second,
 	}
 
 	return s
 }
 
+// authenticate wraps a handler with API key authentication and localhost enforcement.
+func (s *Server) authenticate(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Enforce localhost-only if bound to loopback
+		if s.isLoopbackBind() {
+			clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+			ip := net.ParseIP(clientIP)
+			if ip != nil && !ip.IsLoopback() {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+		}
+
+		// API key authentication (constant-time comparison)
+		if s.apiKey != "" {
+			key := r.Header.Get("X-API-Key")
+			if subtle.ConstantTimeCompare([]byte(key), []byte(s.apiKey)) != 1 {
+				logging.Warn("[ADMIN] Unauthorized request from %s", r.RemoteAddr)
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+
+		next(w, r)
+	}
+}
+
+func (s *Server) isLoopbackBind() bool {
+	host, _, err := net.SplitHostPort(s.httpServer.Addr)
+	if err != nil {
+		return false
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // Start begins listening.
 func (s *Server) Start() error {
+	if s.apiKey == "" {
+		logging.Warn("[ADMIN] API started WITHOUT authentication — set admin.api_key in config")
+	}
 	go func() {
 		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logging.Error("[ADMIN] Server error: %v", err)
@@ -89,11 +139,7 @@ func (s *Server) handleBackendAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse: /api/v1/backends/{name}/drain
-	// Simple path parsing
-	path := r.URL.Path
-	// Expected: /api/v1/backends/{name}/{action}
-	parts := splitPath(path)
+	parts := splitPath(r.URL.Path)
 	if len(parts) < 5 {
 		http.Error(w, "Invalid path", http.StatusBadRequest)
 		return
@@ -108,62 +154,37 @@ func (s *Server) handleBackendAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	server := r.URL.Query().Get("server")
+	if server == "" {
+		http.Error(w, "server query param required", http.StatusBadRequest)
+		return
+	}
+
 	switch action {
 	case "drain":
-		// Drain a specific server
-		server := r.URL.Query().Get("server")
-		if server == "" {
-			http.Error(w, "server query param required", http.StatusBadRequest)
-			return
-		}
 		balancer.MarkDraining(server)
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "draining", "server": server})
-
+		logging.Info("[ADMIN] Server %s in %s marked as draining", server, backendName)
 	case "enable":
-		server := r.URL.Query().Get("server")
-		if server == "" {
-			http.Error(w, "server query param required", http.StatusBadRequest)
-			return
-		}
 		balancer.UpdateStatus(server, true)
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "enabled", "server": server})
-
+		logging.Info("[ADMIN] Server %s in %s enabled", server, backendName)
 	case "disable":
-		server := r.URL.Query().Get("server")
-		if server == "" {
-			http.Error(w, "server query param required", http.StatusBadRequest)
-			return
-		}
 		balancer.UpdateStatus(server, false)
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "disabled", "server": server})
-
+		logging.Info("[ADMIN] Server %s in %s disabled", server, backendName)
 	default:
 		http.Error(w, "Unknown action", http.StatusBadRequest)
+		return
 	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": action, "server": server})
 }
 
 func splitPath(path string) []string {
 	var parts []string
-	for _, p := range split(path, '/') {
+	for _, p := range strings.Split(path, "/") {
 		if p != "" {
 			parts = append(parts, p)
 		}
 	}
 	return parts
-}
-
-func split(s string, sep byte) []string {
-	var result []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == sep {
-			result = append(result, s[start:i])
-			start = i + 1
-		}
-	}
-	result = append(result, s[start:])
-	return result
 }
