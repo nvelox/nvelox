@@ -101,8 +101,16 @@ func CacheKey(r *http.Request) string {
 	return r.Method + "|" + r.Host + "|" + r.URL.Path + "|" + r.URL.RawQuery
 }
 
-// ShouldSkipCache checks if the request has cache-busting headers.
+// ShouldSkipCache checks if the request should bypass the cache.
+// Skips caching for authenticated requests and cache-busting headers.
 func ShouldSkipCache(r *http.Request) bool {
+	// Never cache authenticated requests
+	if r.Header.Get("Authorization") != "" {
+		return true
+	}
+	if r.Header.Get("Cookie") != "" {
+		return true
+	}
 	cc := r.Header.Get("Cache-Control")
 	return strings.Contains(cc, "no-cache") || strings.Contains(cc, "no-store")
 }
@@ -110,7 +118,20 @@ func ShouldSkipCache(r *http.Request) bool {
 // ShouldSkipCacheResponse checks if the response should not be cached.
 func ShouldSkipCacheResponse(h http.Header) bool {
 	cc := h.Get("Cache-Control")
-	return strings.Contains(cc, "no-cache") || strings.Contains(cc, "no-store") || strings.Contains(cc, "private")
+	if strings.Contains(cc, "no-cache") || strings.Contains(cc, "no-store") || strings.Contains(cc, "private") {
+		return true
+	}
+	// Don't cache responses with Set-Cookie
+	if h.Get("Set-Cookie") != "" {
+		return true
+	}
+	return false
+}
+
+// sensitiveCacheHeaders are headers that should never be stored in cache.
+var sensitiveCacheHeaders = []string{
+	"Set-Cookie", "Authorization", "WWW-Authenticate",
+	"Proxy-Authenticate", "Proxy-Authorization",
 }
 
 // ServeCached writes a cached response to the ResponseWriter.
@@ -209,6 +230,10 @@ func (w *cacheWriter) ToCacheEntry() *CacheEntry {
 	headers := make(http.Header)
 	for k, vv := range w.ResponseWriter.Header() {
 		headers[k] = vv
+	}
+	// Strip sensitive headers from cache
+	for _, h := range sensitiveCacheHeaders {
+		headers.Del(h)
 	}
 	return &CacheEntry{
 		StatusCode: w.statusCode,
