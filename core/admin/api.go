@@ -7,11 +7,27 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"nvelox/core/logging"
 	"nvelox/lb"
 )
+
+// Brute-force defense parameters. constant-time key comparison prevents
+// timing attacks but does NOT stop an attacker making millions of guesses
+// per second; we rate-limit failed attempts per source IP.
+const (
+	authFailWindow      = 10 * time.Minute // window for counting failed attempts
+	authFailThreshold   = 10               // fail this many in the window → lockout
+	authLockoutDuration = 15 * time.Minute
+)
+
+type authAttempt struct {
+	failures    int
+	firstFailAt time.Time
+	lockedUntil time.Time
+}
 
 // Server provides a REST API for runtime management.
 type Server struct {
@@ -19,6 +35,10 @@ type Server struct {
 	balancers  map[string]lb.Balancer
 	startTime  time.Time
 	apiKey     string
+
+	// Per-source-IP failed auth tracking.
+	authMu       sync.Mutex
+	authFailures map[string]*authAttempt
 }
 
 // BackendStatus represents a backend's status in the API response.
@@ -36,9 +56,10 @@ type StatsResponse struct {
 // NewServer creates an admin API server.
 func NewServer(bind string, apiKey string, balancers map[string]lb.Balancer) *Server {
 	s := &Server{
-		balancers: balancers,
-		startTime: time.Now(),
-		apiKey:    apiKey,
+		balancers:    balancers,
+		startTime:    time.Now(),
+		apiKey:       apiKey,
+		authFailures: make(map[string]*authAttempt),
 	}
 
 	mux := http.NewServeMux()
@@ -58,11 +79,16 @@ func NewServer(bind string, apiKey string, balancers map[string]lb.Balancer) *Se
 }
 
 // authenticate wraps a handler with API key authentication and localhost enforcement.
+//
+// Defense-in-depth layers: (1) loopback-only binding check, (2) per-IP
+// lockout after N failed API-key attempts in a window, (3) constant-time
+// API-key comparison.
 func (s *Server) authenticate(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+
 		// Enforce localhost-only if bound to loopback
 		if s.isLoopbackBind() {
-			clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
 			ip := net.ParseIP(clientIP)
 			if ip != nil && !ip.IsLoopback() {
 				http.Error(w, "Forbidden", http.StatusForbidden)
@@ -70,18 +96,68 @@ func (s *Server) authenticate(next http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
+		// Deny while locked out for this source IP.
+		if s.isLockedOut(clientIP) {
+			logging.Warn("[ADMIN] Locked-out request from %s", r.RemoteAddr)
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return
+		}
+
 		// API key authentication (constant-time comparison)
 		if s.apiKey != "" {
 			key := r.Header.Get("X-API-Key")
 			if subtle.ConstantTimeCompare([]byte(key), []byte(s.apiKey)) != 1 {
+				s.recordAuthFailure(clientIP)
 				logging.Warn("[ADMIN] Unauthorized request from %s", r.RemoteAddr)
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
+			// Success → clear any accumulated failures for this IP.
+			s.clearAuthFailures(clientIP)
 		}
 
 		next(w, r)
 	}
+}
+
+// isLockedOut reports whether the given source IP is currently locked out
+// due to previous authentication failures.
+func (s *Server) isLockedOut(ip string) bool {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	a, ok := s.authFailures[ip]
+	if !ok {
+		return false
+	}
+	return time.Now().Before(a.lockedUntil)
+}
+
+// recordAuthFailure increments the failure counter for the given IP and
+// triggers a lockout once authFailThreshold failures accumulate within
+// authFailWindow.
+func (s *Server) recordAuthFailure(ip string) {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	now := time.Now()
+	a := s.authFailures[ip]
+	if a == nil || now.Sub(a.firstFailAt) > authFailWindow {
+		// First failure, or window expired → start a fresh window.
+		s.authFailures[ip] = &authAttempt{failures: 1, firstFailAt: now}
+		return
+	}
+	a.failures++
+	if a.failures >= authFailThreshold {
+		a.lockedUntil = now.Add(authLockoutDuration)
+		logging.Warn("[ADMIN] IP %s locked out after %d failed auth attempts until %v",
+			ip, a.failures, a.lockedUntil.Format(time.RFC3339))
+	}
+}
+
+// clearAuthFailures removes the failure record for an IP after a successful auth.
+func (s *Server) clearAuthFailures(ip string) {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	delete(s.authFailures, ip)
 }
 
 func (s *Server) isLoopbackBind() bool {

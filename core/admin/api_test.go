@@ -159,3 +159,76 @@ func TestAdminAPI_NotFound(t *testing.T) {
 		t.Errorf("expected 404, got %d", w.Code)
 	}
 }
+
+// TestAdminAPI_LockoutAfterFailures fires authFailThreshold failed auth
+// attempts from one source IP and verifies subsequent requests from that
+// IP get 429 (Too Many Requests) regardless of whether they use a valid key.
+// Prevents online brute-force of the API key.
+func TestAdminAPI_LockoutAfterFailures(t *testing.T) {
+	srv := newTestServer(map[string]lb.Balancer{
+		"be": lb.NewRoundRobin([]string{"s1:80"}),
+	})
+
+	// Fire threshold-1 failures: still accept further attempts.
+	for i := 0; i < authFailThreshold-1; i++ {
+		req := localRequest("GET", "/api/v1/stats")
+		req.Header.Set("X-API-Key", "wrong")
+		w := httptest.NewRecorder()
+		srv.authenticate(srv.handleStats)(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: expected 401, got %d", i+1, w.Code)
+		}
+	}
+
+	// The Nth failure triggers lockout.
+	req := localRequest("GET", "/api/v1/stats")
+	req.Header.Set("X-API-Key", "wrong")
+	w := httptest.NewRecorder()
+	srv.authenticate(srv.handleStats)(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("final failure: expected 401, got %d", w.Code)
+	}
+
+	// Now even a VALID key from the same IP must be rejected with 429.
+	w = httptest.NewRecorder()
+	srv.authenticate(srv.handleStats)(w, authedRequest("GET", "/api/v1/stats"))
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("locked-out IP with valid key: expected 429, got %d", w.Code)
+	}
+}
+
+// TestAdminAPI_SuccessClearsFailures verifies that a successful auth
+// resets the failure counter, so one success absolves prior misfires.
+func TestAdminAPI_SuccessClearsFailures(t *testing.T) {
+	srv := newTestServer(map[string]lb.Balancer{
+		"be": lb.NewRoundRobin([]string{"s1:80"}),
+	})
+
+	// A few failures, but below threshold.
+	for i := 0; i < 3; i++ {
+		req := localRequest("GET", "/api/v1/stats")
+		req.Header.Set("X-API-Key", "wrong")
+		srv.authenticate(srv.handleStats)(httptest.NewRecorder(), req)
+	}
+
+	// One success clears counters.
+	srv.authenticate(srv.handleStats)(httptest.NewRecorder(), authedRequest("GET", "/api/v1/stats"))
+
+	// Now we should be able to accumulate full threshold-1 NEW failures.
+	for i := 0; i < authFailThreshold-1; i++ {
+		req := localRequest("GET", "/api/v1/stats")
+		req.Header.Set("X-API-Key", "wrong")
+		w := httptest.NewRecorder()
+		srv.authenticate(srv.handleStats)(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d after success-clear: expected 401, got %d", i+1, w.Code)
+		}
+	}
+
+	// Valid key must still work — we haven't hit threshold yet post-clear.
+	w := httptest.NewRecorder()
+	srv.authenticate(srv.handleStats)(w, authedRequest("GET", "/api/v1/stats"))
+	if w.Code != http.StatusOK {
+		t.Errorf("post-clear valid key must succeed, got %d", w.Code)
+	}
+}
