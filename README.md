@@ -4,265 +4,355 @@
 
 # Nvelox
 
-**High-Performance L4 Load Balancer & Proxy (Go + nbio)**
+**High-Performance L4/L7 Load Balancer, Reverse Proxy & Web Server (Go + nbio)**
 
-Nvelox is a lightweight, high-performance TCP/UDP load balancer and proxy server written in Go, powered by [nbio](https://github.com/lesismal/nbio). It is designed to handle high concurrency with minimal resource usage, offering features similar to HAProxy but with a simplified configuration and modern Go architecture.
+Nvelox is a lightweight, high-performance load balancer and reverse proxy written in Go. It handles TCP/UDP (L4) and HTTP/HTTPS (L7) traffic with features comparable to nginx and HAProxy — in a single static binary with simple YAML configuration.
 
 ## Why Nvelox?
 
-* **Massive Scale:** Bind to 10,000+ ports without the overhead of 10,000+ OS threads.
-* **UDP Session Awareness:** Unlike raw UDP proxies, Nvelox maintains state to ensure consistent routing for datagram streams.
-* **Modern Core:** Built on `nbio` for Linux/epoll and macOS/kqueue performance.
-* **Port Range Mastery:** Efficiency bind thousands of ports with a single config line.
+* **L4 + L7 in one binary** — TCP/UDP proxy, HTTP reverse proxy, static file server, FastCGI (PHP-FPM)
+* **Massive Scale** — Bind 10,000+ ports with a single config line, event-driven via nbio
+* **HTTP/1.1 + HTTP/2 + HTTP/3** — Full protocol support including QUIC
+* **nginx-compatible features** — try_files, expires, FastCGI, regex routes, URL rewrite
+* **Simple YAML config** — No complex directive syntax
 
 ## Features
 
-- **High Performance**: Built on an event-driven networking engine (Reactor pattern) via `nbio`, minimizing goroutine overhead.
-- **Async Backend Dial**: TCP backend connections use `nbio.DialAsync` — no goroutine-per-connection overhead.
-- **Port Ranges**: Efficiently bind to thousands of ports (e.g., `10000-20000`) with a single configuration line.
-  > **Note:** When using port ranges, the **destination port is preserved** if a specific backend port is not mapped. This is ideal for gaming and VoIP applications requiring direct 1:1 port mapping.
-- **Load Balancing**: Supports `roundrobin`, `leastconn`, and `random` with accurate connection tracking.
-- **TLS Termination**: Native TLS support on any listener with cert/key configuration.
-- **Rate Limiting**: Per-listener token bucket rate limiter to protect against connection floods.
-- **PROXY Protocol v2**: Transparently passes client IP information to backends (TCP & UDP supported).
-- **UDP Session Affinity**: Connection pool ensures packets from the same client route to the same backend with TTL-based cleanup.
-- **HTTP/1.1 + HTTP/2 Reverse Proxy**: L7 reverse proxy with Host and path-prefix routing, header manipulation, and automatic HTTP/2 via ALPN.
-- **HTTP/3 (QUIC)**: Native HTTP/3 support via quic-go with Alt-Svc header advertisement for client discovery.
-- **WebSocket Proxying**: Transparent WebSocket upgrade detection and bidirectional relay.
-- **Header Manipulation**: Add/set/remove headers on requests and responses, with automatic X-Forwarded-For, X-Real-IP, and X-Forwarded-Proto injection.
-- **Config Validation**: Comprehensive validation at load time — server addresses, ports, health check durations, TLS files, and balance algorithms.
-- **Advanced Logging**: Structured file-based logging with configurable levels (`debug`, `info`, `warn`, `error`).
-- **Modular Configuration**: Support for split configuration files via `include`.
-- **Zero-Dependency**: Static binary, easy to deploy.
+### Core Proxy
+- **L4 TCP/UDP Proxy** — async I/O via nbio with zero-copy splice support
+- **L7 HTTP Reverse Proxy** — `httputil.ReverseProxy` with shared connection pool
+- **HTTP/1.1 + HTTP/2** — automatic HTTP/2 via ALPN on HTTPS listeners
+- **HTTP/3 (QUIC)** — via quic-go with Alt-Svc header advertisement
+- **WebSocket Proxying** — transparent upgrade detection and bidirectional relay
+- **Port Ranges** — bind `:10000-20000` with 1:1 port mapping for gaming/VoIP
+
+### Load Balancing
+- **Round Robin** — cycle through backends
+- **Least Connections** — accurate per-connection tracking via OnConnect/OnDisconnect
+- **Random** — random server selection
+- **Sticky Sessions** — cookie, header, or IP-hash based session persistence
+- **Connection Draining** — mark servers as draining (no new connections, existing continue)
+- **Max Connections** — per-backend connection limit with 503 when full
+
+### Routing (L7)
+- **Host-based routing** — route by `Host` header (first-match-wins)
+- **Path prefix routing** — route by URL path prefix
+- **Regex routing** — regex path matching with capture groups
+- **URL Rewriting** — `$1`-style substitution from regex captures
+- **Redirect Rules** — 301/302 with variable substitution (`${host}`, `${path}`, `${uri}`, `${scheme}`, `${query}`, `${port}`)
+
+### Static Files & PHP
+- **Static File Serving** — serve from document root with directory index support
+- **try_files** — nginx-style `$uri`, `$uri/`, `/fallback$is_args$args`
+- **expires** — `1y`, `30d`, `1h`, `-1` (no-cache), sets Cache-Control/Expires headers
+- **FastCGI (PHP-FPM)** — forward to PHP-FPM via TCP or Unix socket with `split_path_info`, custom params
+
+### Security
+- **TLS Termination** — on any TCP or HTTPS listener
+- **OCSP Stapling** — automatic OCSP response fetching and refresh
+- **Client Certificate Auth (mTLS)** — require/request client certs with CA verification
+- **ACLs** — match by source IP/CIDR, HTTP method, headers; allow/deny actions
+- **IP Allowlist/Denylist** — CIDR-based per-listener filtering
+- **Per-IP Rate Limiting** — token bucket per client IP with LRU cleanup
+- **Per-Listener Rate Limiting** — global connection rate limit
+- **Request Body Size Limit** — reject oversized request bodies
+- **SSL to Backend** — TLS when connecting to upstream servers (mTLS supported)
+
+### Resilience
+- **Active Health Checks** — TCP connect or HTTP GET with configurable interval/timeout
+- **Passive Health Checks** — mark down after N consecutive failures
+- **Retries / Failover** — retry on connect failure, 502, 503; skip failed servers
+- **Circuit Breaker** — closed/open/half-open state machine per backend
+- **Configurable Timeouts** — connect/read/write/idle per listener and backend
+- **Graceful Drain** — finish in-flight connections on shutdown with configurable deadline
+
+### Response Processing
+- **Header Manipulation** — add/set/remove on request and response (per-listener and per-route)
+- **X-Forwarded-For/X-Real-IP** — automatic proxy header injection
+- **Gzip Compression** — configurable content types and minimum size
+- **Response Caching** — in-memory cache with TTL, LRU eviction, Cache-Control support
+- **Request/Response Buffering** — sync.Pool-based buffer pool for reverse proxy
+- **Custom Error Pages** — styled HTML error pages (403, 404, 429, 502, 503, etc.)
+
+### Observability & Management
+- **Per-Request Access Logging** — method, path, status, bytes, latency, backend in CLF format
+- **Prometheus Metrics** — `/metrics` endpoint with counters, gauges, histograms
+- **Admin REST API** — runtime stats, drain/enable/disable servers
+- **Hot Reload** — SIGHUP reloads config (backends and health checks)
+- **Bandwidth Throttling** — per-connection read/write rate limiting
+
+### Extensibility
+- **Lua Scripting** — embedded Lua 5.1 VM with `nvelox.*` API for request/response hooks
+- **PROXY Protocol v2** — pass client IP to backends in HAProxy format
+- **DNS Service Discovery** — periodic hostname resolution with auto-update
+- **SNI Routing** — TLS passthrough based on server name (wildcard support)
+- **Modular Config** — split configs via `include` glob patterns
+- **Config Validation** — comprehensive validation at load time
 
 ## Architecture
 
-Nvelox uses `nbio` to run an event loop on each listener, handling thousands of concurrent connections efficiently.
-
 ```mermaid
 graph TD
-    Client(Clients) -->|TCP/UDP| Listeners
-    subgraph Nvelox Node
-        Listeners -->|Accepted| RateLimit{Rate Limiter}
-        RateLimit -->|Allowed| EventLoop{nbio Event Loop}
-        RateLimit -->|Rejected| Drop[Connection Dropped]
-        EventLoop -->|Session Ctx| LB[Load Balancer]
-        LB -->|Select| BackendConn[Backend Connection]
-        TLS[TLS Listener] -->|Handshake| EventLoop
+    Client -->|TCP/UDP/HTTP| Listeners
+    subgraph Nvelox
+        Listeners -->|IP Filter| ACL{ACL + Rate Limit}
+        ACL -->|L4| NBIOEngine[nbio Event Loop]
+        ACL -->|L7| HTTPServer[net/http Server]
+        ACL -->|FastCGI| FCGIClient[FastCGI Client]
+        HTTPServer -->|Route Match| Router
+        Router -->|Static| FileServer[Static Files]
+        Router -->|Proxy| ReverseProxy[httputil.ReverseProxy]
+        Router -->|Redirect| RedirectHandler
+        NBIOEngine -->|DialAsync| BackendPool
+        ReverseProxy -->|Shared Transport| BackendPool[Backend Pool]
+        FCGIClient --> PHPFPM[PHP-FPM]
     end
-    BackendConn -->|PROXY v2 + Data| AppServers(Application Servers)
+    BackendPool -->|Connection Pool| Backends(Backend Servers)
 ```
 
-- **TCP**: Connections are accepted asynchronously. Backend connections use `nbio.DialAsync` for non-blocking dial — no goroutine-per-connection. Data is forwarded bidirectionally via the event loop.
-- **UDP**: Packets are processed with session affinity. A connection pool maps each client to its backend, ensuring consistent routing with TTL-based cleanup.
-- **TLS**: TLS listeners perform the handshake in a dedicated accept loop, then hand the decrypted connection to the main proxy path.
-
-## Nvelox vs. The Giants
+## Nvelox vs. nginx vs. HAProxy
 
 | Feature | Nvelox | HAProxy | Nginx |
 | :--- | :--- | :--- | :--- |
-| **Architecture** | **Event-Driven (Go/nbio/epoll)** | Event-Driven (C/epoll) | Event-Driven (C/epoll) |
-| **Concurrency Model** | Reactors (Internal Event Loops) | Process-based (Single/Multi-process) | Process-based (Worker Processes) |
-| **Port Binding** | **Range-Optimized (10k ports in <1s)** | Individual Binds (Slow for 10k+) | Individual Binds (Config hell) |
-| **UDP Mode** | **Session-Aware (Pool + Affinity)** | Datagram/Stream | Datagram |
-| **TLS Termination** | **Yes (crypto/tls)** | Yes (OpenSSL) | Yes (OpenSSL) |
-| **Rate Limiting** | **Yes (Token Bucket)** | Yes (stick-tables) | Yes (limit_conn) |
-| **Zero-Copy** | **Native (Splice/Sendfile)** | Yes (Splice) | Yes (Sendfile) |
-| **Configuration** | **Simple YAML + Validation** | Complex HCL-like | Directive-based |
-| **Binary Size** | ~10MB (Static) | ~2-5MB (Dynamic) | ~1-3MB (Dynamic) |
-| **Hot Reload** | Planned | Yes (Hitless) | Yes |
-| **Memory (10k Conns)** | **Low (~40MB)** | Low (~150MB) | Medium |
+| **L4 + L7** | Both | Both | Both |
+| **HTTP/3** | Yes (quic-go) | Yes (quictls) | Yes (quic) |
+| **FastCGI (PHP)** | Yes | No | Yes |
+| **Static Files** | Yes | No | Yes |
+| **try_files** | Yes | No | Yes |
+| **Lua Scripting** | Yes | Yes (SPOE) | Yes |
+| **Port Ranges** | `:10000-20000` | Individual | Individual |
+| **Config Format** | YAML | Custom | Directives |
+| **Binary** | Static (Go) | Dynamic (C) | Dynamic (C) |
+| **Hot Reload** | SIGHUP | Hitless | SIGHUP |
+| **Memory (10k)** | ~40MB | ~150MB | ~100MB |
 
-## Performance
+## Quick Start
 
-*Preliminary benchmarks on 4 vCPU / 8GB RAM node:*
-
-| Tool | Concurrency | Memory Usage | Throughput |
-| --- | --- | --- | --- |
-| HAProxy | 10k | ~150MB | X Gbps |
-| **Nvelox** | **10k** | **~40MB** | **Y Gbps** |
-
-## Installation
-
-### Build from Source
 ```bash
-git clone git@github.com:nvelox/nvelox.git
-cd nvelox
+# Build
 go build -o nvelox main.go
+
+# Run with example config
+./nvelox -config examples/01-basic-tcp-proxy.yaml
+
+# See all 30 examples
+cat examples/README.md
 ```
 
 ## Configuration
 
-Nvelox uses a YAML configuration file.
-
-### Example `nvelox.yaml`
-
+### Basic HTTP Proxy
 ```yaml
 version: "2"
-# Server Settings
-server:
-  user: "nvelox"
-  group: "nvelox"
-
-# Logging
-logging:
-  level: "info"
-  access_log: "/var/log/nvelox/access.log"
-  error_log: "/var/log/nvelox/error.log"
-
-# Modular Config
-include: "/etc/nvelox/config.d/*.yaml"
-
 listeners:
-  # Single Port
-  - name: "api-gateway"
-    bind: ":8080"
-    protocol: "tcp"
-    zero_copy: true # Enable zero-copy splice (linux only)
-    default_backend: "api-servers"
-    rate_limit:
-      connections_per_second: 100  # Max 100 new connections/sec
-      burst: 50                    # Allow burst of 50
-
-  # TLS-Terminated Listener
-  - name: "api-secure"
-    bind: ":8443"
-    protocol: "tcp"
-    default_backend: "api-servers"
-    tls:
-      cert: "/etc/ssl/certs/server.pem"
-      key: "/etc/ssl/private/server.key"
-
-  # Port Range (Mass Binding)
-  - name: "dynamic-ports"
-    bind: ":10000-11000" 
-    protocol: "tcp"
-    default_backend: "tunnel-nodes"
-
-  # UDP with Session Affinity
-  - name: "dns-proxy"
-    bind: ":5353"
-    protocol: "udp"
-    default_backend: "dns-servers"
-
+  - name: "web"
+    bind: ":80"
+    protocol: "http"
+    default_backend: "servers"
 backends:
-  - name: "api-servers"
-    balance: "leastconn"  # Accurate connection tracking
-    send_proxy_v2: true   # Enable PROXY Protocol v2 to pass client IP
-    
-    # Active Health Check
-    health_check:
-      active:
-        type: "tcp"     # "tcp" or "http"
-        interval: "5s"  # Check every 5 seconds
-        timeout: "1s"   # Timeout after 1 second
-        # path: "/health" # Required if type is "http"
-
+  - name: "servers"
+    balance: "roundrobin"
     servers:
       - "10.0.0.1:8080"
       - "10.0.0.2:8080"
-
-  - name: "tunnel-nodes"
-    balance: "leastconn"
-    servers:
-      - "10.0.1.5" # 1:1 Port Mapping (e.g. 10001 -> 10.0.1.5:10001)
-      - "10.0.1.6"
-
-  - name: "dns-servers"
-    balance: "random"
-    servers:
-      - "10.0.2.1:53"
-      - "10.0.2.2:53"
 ```
 
-### HTTP/HTTPS Listener with L7 Routing
-
+### HTTPS + HTTP/2 + Routing + Compression
 ```yaml
 listeners:
-  - name: "web-gateway"
+  - name: "secure"
     bind: ":443"
     protocol: "https"
-    http3: true  # Enable QUIC/HTTP3
     tls:
       cert: "/etc/ssl/cert.pem"
       key: "/etc/ssl/key.pem"
-    default_backend: "web-servers"
+    default_backend: "web"
+    compression:
+      enabled: true
     headers:
       response_add:
         Strict-Transport-Security: "max-age=31536000"
     routes:
       - match:
           host: "api.example.com"
-        backend: "api-servers"
+        backend: "api"
       - match:
           path_prefix: "/static"
-        backend: "cdn-servers"
-      - match:
-          host: "ws.example.com"
-        backend: "websocket-servers"
+        static:
+          root: "/var/www/html"
+        expires: "1y"
 ```
 
-## Load Balancing Algorithms
+### PHP-FPM with Static Files (nginx-equivalent)
+```yaml
+listeners:
+  - name: "php-app"
+    bind: ":80"
+    protocol: "http"
+    routes:
+      - match:
+          path_regex: "\\.(css|js|png|jpg|gif|ico)$"
+        static:
+          root: "/var/www/html"
+        try_files:
+          files: ["$uri"]
+          fallback: "=404"
+        expires: "1y"
 
-- **roundrobin**: Cycles through backends in order.
-- **random**: Selects a backend at random.
-- **leastconn**: Selects the backend with the fewest active connections.
+      - match:
+          path_regex: "\\.php(/|$)"
+        fastcgi:
+          pass: "127.0.0.1:9000"
+          document_root: "/var/www/html"
+          split_path_info: "^(.+\\.php)(/.*)$"
 
-## Roadmap
+      - match:
+          path_prefix: "/"
+        static:
+          root: "/var/www/html"
+        try_files:
+          files: ["$uri", "$uri/"]
+          fallback: "/index.php$is_args$args"
+        fastcgi:
+          pass: "127.0.0.1:9000"
+          document_root: "/var/www/html"
+```
 
-- [x] **Health Checks**: Active (TCP/HTTP) health checks for backends.
-- [x] **TLS Termination**: Native SSL/TLS support for listeners.
-- [x] **Rate Limiting**: Per-listener token bucket rate limiter.
-- [x] **LeastConn Tracking**: Accurate connection counting for load balancing.
-- [x] **Async Backend Dial**: Non-blocking TCP backend connections via nbio.
-- [x] **UDP Connection Pooling**: Session affinity with TTL-based cleanup.
-- [x] **Config Validation**: Comprehensive validation at load time.
-- [x] **HTTP/1.1 + HTTP/2 Reverse Proxy**: L7 routing with Host/Path matching.
-- [x] **HTTP/3 (QUIC)**: Native HTTP/3 via quic-go.
-- [x] **WebSocket Proxying**: Transparent upgrade and relay.
-- [x] **Header Manipulation**: Request/response header add/set/remove.
-- [ ] **Passive Health Checks**: Failure-based backend marking.
-- [ ] **Web Dashboard**: Real-time metrics and configuration monitoring.
-- [ ] **Hot Reloading**: Update configuration without dropping connections.
-- [ ] **Auto TLS**: Automatic certificate management (Let's Encrypt / ACME).
+### Full Production (all features)
+```yaml
+version: "2"
+metrics:
+  enabled: true
+  bind: ":9090"
+admin:
+  enabled: true
+  bind: "127.0.0.1:9091"
+logging:
+  level: "info"
+  access_log: "/var/log/nvelox/access.log"
+  error_log: "/var/log/nvelox/error.log"
 
-## Contributing
+listeners:
+  - name: "https"
+    bind: ":443"
+    protocol: "https"
+    http3: true
+    tls:
+      cert: "/etc/ssl/cert.pem"
+      key: "/etc/ssl/key.pem"
+    default_backend: "web"
+    compression: { enabled: true }
+    ip_rate_limit: { requests_per_second: 100, burst: 50 }
+    routes:
+      - match: { host: "api.example.com" }
+        backend: "api"
 
-We welcome contributions from the community! Whether it's reporting a bug, improving documentation, or proposing new features, your help is appreciated.
+  - name: "http-redirect"
+    bind: ":80"
+    protocol: "http"
+    routes:
+      - match: { path_prefix: "/" }
+        redirect: { url: "https://${host}${uri}", code: 301 }
 
-### How to Contribute
+backends:
+  - name: "web"
+    balance: "roundrobin"
+    max_connections: 200
+    retry: { attempts: 2, on: "connect_failure,502" }
+    sticky_session: { type: "cookie", cookie_name: "SRV", ttl: "1h" }
+    health_check:
+      active: { type: "http", path: "/health", interval: "5s", timeout: "2s" }
+      passive: { max_fails: 3 }
+    circuit_breaker: { enabled: true, threshold: 5, timeout: "30s" }
+    servers:
+      - "10.0.0.1:8080"
+      - "10.0.0.2:8080"
 
-1. **Fork the Repository**: Click the "Fork" button on the top right.
-2. **Clone your Fork**:
-   ```bash
-   git clone git@github.com:YOUR_USERNAME/nvelox.git
-   cd nvelox
-   ```
-3. **Create a Branch**:
-   ```bash
-   git checkout -b feature/my-new-feature
-   ```
-4. **Make Changes**: Implement your feature or fix.
-   * Ensure code is formatted: `go fmt ./...`
-   * Run tests: `go test ./...`
-5. **Commit & Push**:
-   ```bash
-   git commit -m "feat: add amazing new feature"
-   git push origin feature/my-new-feature
-   ```
-6. **Open a Pull Request**: Go to the original repository and click "New Pull Request".
+  - name: "api"
+    balance: "leastconn"
+    timeouts: { connect: "2s", read: "10s" }
+    servers:
+      - "10.0.1.1:8080"
+```
 
-### Development Plan
+## Examples
 
-Nvelox uses **Go 1.25+**. Key areas to explore:
-* `core/engine.go`: Engine orchestration, TLS listener setup, rate limiter init.
-* `core/handler.go`: L4 connection handling, async dial, data forwarding.
-* `core/httpproxy/`: L7 HTTP reverse proxy (router, server, WebSocket).
-* `core/ratelimit.go`: Token bucket rate limiter.
-* `core/udppool.go`: UDP session affinity pool.
-* `config/`: YAML parsing and validation.
-* `proxy/`: Protocol parsing (PROXY v2).
-* `lb/`: Load balancing algorithms (roundrobin, leastconn, random).
+See [`examples/`](examples/) for 30 ready-to-run configs with test commands:
+
+| # | Feature | Config |
+|---|---------|--------|
+| 01 | Basic TCP proxy | `01-basic-tcp-proxy.yaml` |
+| 02 | Load balancing | `02-load-balancing.yaml` |
+| 03 | Health checks | `03-health-checks.yaml` |
+| 04 | Rate limiting | `04-rate-limiting.yaml` |
+| 05 | TLS termination | `05-tls-termination.yaml` |
+| 06 | HTTPS + HTTP/2 | `06-https-http2.yaml` |
+| 07 | HTTP/3 QUIC | `07-http3-quic.yaml` |
+| 08 | Host routing | `08-host-routing.yaml` |
+| 09 | Path routing | `09-path-routing.yaml` |
+| 10 | Regex + rewrite | `10-regex-rewrite.yaml` |
+| 11 | Redirects | `11-redirects.yaml` |
+| 12 | Header manipulation | `12-header-manipulation.yaml` |
+| 13 | Compression | `13-compression.yaml` |
+| 14 | Retries / failover | `14-retries-failover.yaml` |
+| 15 | Sticky sessions | `15-sticky-sessions.yaml` |
+| 16 | Max connections | `16-max-connections.yaml` |
+| 17 | ACL access control | `17-acl-access-control.yaml` |
+| 18 | IP allowlist/denylist | `18-ip-allowlist-denylist.yaml` |
+| 19 | Body size limit | `19-body-size-limit.yaml` |
+| 20 | Circuit breaker | `20-circuit-breaker.yaml` |
+| 21 | Prometheus metrics | `21-metrics-prometheus.yaml` |
+| 22 | Admin API | `22-admin-api.yaml` |
+| 23 | Timeouts | `23-timeouts.yaml` |
+| 24 | Caching | `24-caching.yaml` |
+| 25 | Port range | `25-port-range.yaml` |
+| 26 | PROXY protocol | `26-proxy-protocol.yaml` |
+| 27 | UDP proxy | `27-udp-proxy.yaml` |
+| 28 | Full production | `28-full-production.yaml` |
+| 29 | Static files + try_files | `29-static-files.yaml` |
+| 30 | PHP-FPM FastCGI | `30-php-fpm-fastcgi.yaml` |
+
+## Testing
+
+```bash
+go test ./...                    # All tests (22 packages)
+go test -race ./...              # Race detector
+go test -v ./integration/...     # Integration tests
+go test -coverprofile=c.out ./... && go tool cover -html=c.out  # Coverage
+```
+
+See [`examples/README.md`](examples/README.md) for manual real-world testing with curl.
+
+## Project Structure
+
+```
+core/
+  engine.go          — Engine orchestration, lifecycle
+  handler.go         — L4 proxy (TCP/UDP via nbio)
+  httpproxy/
+    server.go        — L7 HTTP reverse proxy
+    router.go        — Route matching (host/path/regex)
+    static.go        — Static files, try_files, expires
+    fastcgi.go       — FastCGI client (PHP-FPM)
+    compress.go      — Gzip compression
+    cache.go         — Response caching
+    errorhtml/       — Styled error pages
+  acl/               — Access control lists
+  admin/             — Admin REST API
+  circuitbreaker/    — Circuit breaker state machine
+  discovery/         — DNS service discovery
+  health/            — Active health checks
+  metrics/           — Prometheus metrics
+  middleware/        — Per-IP rate limiting
+  scripting/         — Lua VM pool
+  sni/               — SNI-based TLS routing
+  sticky/            — Sticky session store
+  throttle/          — Bandwidth throttling
+  tlsutil/           — OCSP, client cert auth
+config/              — YAML config parsing + validation
+lb/                  — Load balancing algorithms
+proxy/               — PROXY Protocol v2
+```
 
 ## License
 

@@ -1,121 +1,281 @@
-# /etc/nvelox/nvelox.conf
-# Main Configuration File
+# /etc/nvelox/nvelox.yaml — Complete Reference Configuration
+# Every feature is shown below. Remove what you don't need.
 
-# Server Settings
 version: "2"
+
+# ─── Server Settings ───────────────────────────────────────
 server:
   user: "nvelox"
   group: "nvelox"
   pid_file: "/var/run/nvelox.pid"
+  workers: 0  # SO_REUSEPORT workers (0 = single process)
 
-# Logging Configuration
+# ─── Logging ───────────────────────────────────────────────
 logging:
-  level: "info" # debug, info, warning, error
-  access_log: "/var/log/nvelox/access.log"
+  level: "info"  # debug, info, warning, error
+  access_log: "/var/log/nvelox/access.log"  # Per-request CLF format
   error_log: "/var/log/nvelox/error.log"
 
-# Modular Includes
-# Include additional configuration files (e.g., listeners, backends)
+# ─── Prometheus Metrics ───────────────────────────────────
+metrics:
+  enabled: true
+  bind: ":9090"
+  path: "/metrics"
+
+# ─── Admin API ─────────────────────────────────────────────
+admin:
+  enabled: true
+  bind: "127.0.0.1:9091"
+  # Endpoints:
+  #   GET  /api/v1/stats
+  #   GET  /api/v1/backends
+  #   POST /api/v1/backends/{name}/drain?server=addr
+  #   POST /api/v1/backends/{name}/enable?server=addr
+  #   POST /api/v1/backends/{name}/disable?server=addr
+
+# ─── OpenTelemetry Tracing ─────────────────────────────────
+# tracing:
+#   enabled: true
+#   endpoint: "http://jaeger:4318"
+#   service: "nvelox"
+
+# ─── Modular Config Includes ──────────────────────────────
 include: "/etc/nvelox/config.d/*.yaml"
 
-# Listeners and Backends can also be defined here directly
+# ═══════════════════════════════════════════════════════════
+# LISTENERS
+# ═══════════════════════════════════════════════════════════
+
 listeners:
-  # Basic TCP listener
-  - name: "web-traffic"
-    bind: ":80"
-    protocol: "tcp"
-    default_backend: "web-cluster"
 
-  # TLS-terminated listener
-  - name: "web-traffic-tls"
-    bind: ":443"
-    protocol: "tcp"
-    default_backend: "web-cluster"
-    tls:
-      cert: "/etc/ssl/certs/server.pem"
-      key: "/etc/ssl/private/server.key"
-
-  # Rate-limited listener
-  - name: "api-gateway"
-    bind: ":8080"
-    protocol: "tcp"
-    default_backend: "api-servers"
-    rate_limit:
-      connections_per_second: 100
-      burst: 50
-
-  # Port range with zero-copy (gaming / VoIP)
-  - name: "dynamic-ports"
-    bind: ":10000-11000"
-    protocol: "tcp"
-    zero_copy: true
-    default_backend: "tunnel-nodes"
-
-  # HTTP/HTTPS L7 reverse proxy with routing
-  - name: "web-gateway"
-    bind: ":443"
-    protocol: "https"
-    http3: true  # Enable QUIC/HTTP3 on same port
-    tls:
-      cert: "/etc/ssl/certs/server.pem"
-      key: "/etc/ssl/private/server.key"
-    default_backend: "web-cluster"
-    headers:
-      response_add:
-        Strict-Transport-Security: "max-age=31536000"
-    routes:
-      - match:
-          host: "api.example.com"
-        backend: "api-servers"
-      - match:
-          path_prefix: "/static"
-        backend: "web-cluster"
-
-  # Plain HTTP listener
+  # ─── HTTP → HTTPS redirect ─────────────────────────────
   - name: "http-redirect"
     bind: ":80"
     protocol: "http"
-    default_backend: "web-cluster"
+    routes:
+      - match:
+          path_prefix: "/"
+        redirect:
+          url: "https://${host}${uri}"  # Variable substitution
+          code: 301
+    # Redirect routes don't need a backend
 
-  # UDP listener (session affinity via connection pool)
+  # ─── HTTPS with HTTP/2 + HTTP/3 ────────────────────────
+  - name: "https-main"
+    bind: ":443"
+    protocol: "https"
+    http3: true  # QUIC on same port, advertises Alt-Svc
+    default_backend: "web-cluster"
+    tls:
+      cert: "/etc/ssl/certs/server.pem"
+      key: "/etc/ssl/private/server.key"
+      # ocsp_stapling: true
+      # client_auth: "require"         # mTLS: "require", "request", "none"
+      # client_ca: "/etc/ssl/ca.pem"
+
+    # Timeouts
+    timeouts:
+      connect: "5s"
+      read: "30s"
+      write: "30s"
+      idle: "120s"
+
+    # Rate limiting
+    rate_limit:
+      connections_per_second: 500
+      burst: 100
+    ip_rate_limit:
+      requests_per_second: 50
+      burst: 20
+
+    # Security
+    ip_denylist: ["192.168.100.0/24"]
+    # ip_allowlist: ["10.0.0.0/8"]  # If set, only listed CIDRs allowed
+    max_body_size: "10MB"
+    acl:
+      - match:
+          method: ["DELETE"]
+          source_ip: ["0.0.0.0/0"]
+        action: "deny"
+
+    # Response processing
+    compression:
+      enabled: true
+      types: ["text/html", "application/json", "text/css", "application/javascript"]
+      min_length: 1024
+
+    cache:
+      enabled: true
+      max_size: "256MB"
+      default_ttl: "5m"
+      methods: ["GET"]
+
+    # Error pages (custom HTML files, falls back to built-in styled pages)
+    # error_pages:
+    #   404: "/var/www/errors/404.html"
+    #   502: "/var/www/errors/502.html"
+
+    # Header manipulation (applied to all routes on this listener)
+    headers:
+      request_add:
+        X-Proxy: "nvelox"
+      response_add:
+        Strict-Transport-Security: "max-age=31536000"
+        X-Content-Type-Options: "nosniff"
+      response_remove:
+        - "Server"
+
+    # L7 Routes (first match wins)
+    routes:
+      # API routing by host
+      - match:
+          host: "api.example.com"
+        backend: "api-servers"
+        headers:
+          request_add:
+            X-Route: "api"
+
+      # Regex route with URL rewrite
+      - match:
+          path_regex: "^/api/v(\\d+)/(.*)"
+        rewrite:
+          path: "/v$1/$2"
+        backend: "api-servers"
+
+      # Static assets with long cache
+      - match:
+          path_regex: "\\.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$"
+        static:
+          root: "/var/www/html"
+        try_files:
+          files: ["$uri"]
+          fallback: "=404"
+        expires: "1y"
+
+      # PHP files via FastCGI
+      - match:
+          path_regex: "\\.php(/|$)"
+        fastcgi:
+          pass: "127.0.0.1:9000"           # or "unix:/var/run/php-fpm.sock"
+          document_root: "/var/www/html"
+          split_path_info: "^(.+\\.php)(/.*)$"
+          params:
+            HTTPS: "on"
+
+      # Catch-all: try static, fall back to PHP
+      - match:
+          path_prefix: "/"
+        static:
+          root: "/var/www/html"
+          index: ["index.html", "index.php"]
+        try_files:
+          files: ["$uri", "$uri/"]
+          fallback: "/index.php$is_args$args"
+        fastcgi:
+          pass: "127.0.0.1:9000"
+          document_root: "/var/www/html"
+
+      # Lua scripting hook
+      # - match:
+      #     path_prefix: "/custom"
+      #   backend: "web-cluster"
+      #   scripts:
+      #     request_script: "/etc/nvelox/scripts/auth.lua"
+      #     response_script: "/etc/nvelox/scripts/transform.lua"
+
+  # ─── TCP L4 proxy (gaming/tunneling) ───────────────────
+  - name: "game-ports"
+    bind: ":10000-10100"
+    protocol: "tcp"
+    zero_copy: true
+    default_backend: "game-servers"
+
+  # ─── TLS passthrough with SNI routing ──────────────────
+  # - name: "tls-passthrough"
+  #   bind: ":8443"
+  #   protocol: "tcp"
+  #   sni_routes:
+  #     - server_name: "api.example.com"
+  #       backend: "api-servers"
+  #     - server_name: "*.example.com"
+  #       backend: "web-cluster"
+
+  # ─── UDP proxy ─────────────────────────────────────────
   - name: "dns-proxy"
     bind: ":5353"
     protocol: "udp"
     default_backend: "dns-servers"
 
+# ═══════════════════════════════════════════════════════════
+# BACKENDS
+# ═══════════════════════════════════════════════════════════
+
 backends:
   - name: "web-cluster"
-    balance: "roundrobin"
+    balance: "roundrobin"  # roundrobin, leastconn, random
+    max_connections: 200
+    send_proxy_v2: false
+
+    # Timeouts (override listener defaults)
+    timeouts:
+      connect: "3s"
+      read: "15s"
+
+    # Retry on failure
+    retry:
+      attempts: 3
+      on: "connect_failure,502,503"
+
+    # Sticky sessions
+    sticky_session:
+      type: "cookie"           # cookie, header, ip_hash
+      cookie_name: "NVELOX_SRV"
+      ttl: "1h"
+
+    # Health checks
+    health_check:
+      active:
+        type: "http"           # tcp or http
+        path: "/health"
+        interval: "5s"
+        timeout: "2s"
+      passive:
+        max_fails: 3           # Mark down after 3 consecutive failures
+
+    # Circuit breaker
+    circuit_breaker:
+      enabled: true
+      threshold: 5             # Failures to open circuit
+      timeout: "30s"           # Time before half-open probe
+      half_open_max: 2         # Probe requests in half-open state
+
+    # Backend TLS (connect to upstream via TLS)
+    # backend_tls:
+    #   enabled: true
+    #   ca_cert: "/etc/ssl/ca.pem"
+    #   insecure: false
+
+    # DNS service discovery (re-resolve hostnames)
+    # resolve_interval: "30s"
+
     servers:
       - "10.0.0.1:8080"
       - "10.0.0.2:8080"
-    health_check:
-      active:
-        type: "http"
-        interval: "5s"
-        timeout: "1s"
-        path: "/health"
 
   - name: "api-servers"
     balance: "leastconn"
-    send_proxy_v2: true
     servers:
-      - "10.0.0.1:8080"
-      - "10.0.0.2:8080"
-    health_check:
-      active:
-        type: "tcp"
-        interval: "5s"
-        timeout: "1s"
+      - "10.0.1.1:8080"
+      - "10.0.1.2:8080"
 
-  - name: "tunnel-nodes"
-    balance: "leastconn"
+  - name: "game-servers"
+    balance: "roundrobin"
     servers:
-      - "10.0.1.5" # 1:1 Port Mapping (e.g. 10001 -> 10.0.1.5:10001)
-      - "10.0.1.6"
+      - "10.0.2.1"  # 1:1 port mapping (e.g., :10050 → 10.0.2.1:10050)
+      - "10.0.2.2"
 
   - name: "dns-servers"
     balance: "random"
     servers:
-      - "10.0.2.1:53"
-      - "10.0.2.2:53"
+      - "10.0.3.1:53"
+      - "10.0.3.2:53"
