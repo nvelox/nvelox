@@ -20,6 +20,7 @@ import (
 	"nvelox/core/logging"
 	"nvelox/core/middleware"
 	"nvelox/core/sticky"
+	"nvelox/core/tlsutil"
 	"nvelox/lb"
 
 	"github.com/quic-go/quic-go/http3"
@@ -323,8 +324,10 @@ func (s *HTTPServer) Start() error {
 		}
 		tlsCfg := &tls.Config{
 			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
 			NextProtos:   []string{"h2", "http/1.1"},
+		}
+		if err := tlsutil.ApplyTLSVersionAndCiphers(tlsCfg, *s.Listener.TLS); err != nil {
+			return fmt.Errorf("TLS listener %s: %v", s.Listener.Name, err)
 		}
 		s.httpServer.TLSConfig = tlsCfg
 

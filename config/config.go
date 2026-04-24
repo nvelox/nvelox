@@ -167,6 +167,18 @@ type TLSConfig struct {
 	OCSPStapling  bool   `yaml:"ocsp_stapling,omitempty"`  // Enable OCSP stapling
 	ClientAuth    string `yaml:"client_auth,omitempty"`     // "require", "request", "none"
 	ClientCA      string `yaml:"client_ca,omitempty"`       // CA cert for client verification
+
+	// MinVersion is the lowest TLS protocol version this listener accepts.
+	// Values: "1.2", "1.3". Empty defaults to "1.2".
+	MinVersion string `yaml:"min_version,omitempty"`
+	// MaxVersion is the highest TLS protocol version this listener accepts.
+	// Values: "1.2", "1.3". Empty defaults to "1.3".
+	MaxVersion string `yaml:"max_version,omitempty"`
+	// CipherSuites is an allowlist of cipher-suite names (TLS 1.2 only;
+	// TLS 1.3 suites are mandatory and not configurable per RFC 8446).
+	// Names must match Go's tls.CipherSuites(). Empty keeps Go's safe
+	// default list. Example: ["TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"].
+	CipherSuites []string `yaml:"cipher_suites,omitempty"`
 }
 
 // RouteConfig defines an L7 route matching rule.

@@ -20,6 +20,7 @@ import (
 	"nvelox/core/logging"
 	"nvelox/core/metrics"
 	"nvelox/core/sticky"
+	"nvelox/core/tlsutil"
 	"nvelox/lb"
 
 	"github.com/lesismal/nbio"
@@ -444,7 +445,9 @@ func (e *Engine) startTLSListener(l *ListenerConfig, handler *ProxyEventHandler)
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+	}
+	if err := tlsutil.ApplyTLSVersionAndCiphers(tlsConfig, *l.TLS); err != nil {
+		return fmt.Errorf("TLS listener %s: %v", l.Name, err)
 	}
 
 	ln, err := tls.Listen("tcp", l.Addr, tlsConfig)

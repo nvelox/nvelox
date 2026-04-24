@@ -180,3 +180,80 @@ func TestOCSPStapler_NextRefreshDelay(t *testing.T) {
 		t.Errorf("far-future NextUpdate: expected 24h ceiling, got %v", d)
 	}
 }
+
+func TestParseTLSVersion(t *testing.T) {
+	cases := []struct {
+		in   string
+		want uint16
+	}{
+		{"1.2", tls.VersionTLS12},
+		{"1.3", tls.VersionTLS13},
+		{" 1.3 ", tls.VersionTLS13},
+		{"", 0},
+		{"1.4", 0},
+		{"bogus", 0},
+	}
+	for _, c := range cases {
+		if got := ParseTLSVersion(c.in); got != c.want {
+			t.Errorf("ParseTLSVersion(%q) = %x, want %x", c.in, got, c.want)
+		}
+	}
+}
+
+func TestResolveCipherSuites(t *testing.T) {
+	// Empty list returns nil (let Go pick defaults).
+	out, err := ResolveCipherSuites(nil)
+	if err != nil || out != nil {
+		t.Errorf("empty: want (nil, nil), got (%v, %v)", out, err)
+	}
+
+	// Valid cipher resolves.
+	out, err = ResolveCipherSuites([]string{"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"})
+	if err != nil || len(out) != 1 {
+		t.Errorf("valid cipher failed: %v (%d entries)", err, len(out))
+	}
+
+	// Unknown cipher is rejected — operators shouldn't silently get a
+	// weaker defaults if they mistype a suite name.
+	_, err = ResolveCipherSuites([]string{"TLS_BOGUS_SUITE"})
+	if err == nil {
+		t.Error("unknown cipher must be rejected")
+	}
+}
+
+func TestApplyTLSVersionAndCiphers_Defaults(t *testing.T) {
+	cfg := &tls.Config{}
+	if err := ApplyTLSVersionAndCiphers(cfg, config.TLSConfig{}); err != nil {
+		t.Fatalf("default config must succeed: %v", err)
+	}
+	if cfg.MinVersion != tls.VersionTLS12 {
+		t.Errorf("MinVersion default: want TLS1.2, got %x", cfg.MinVersion)
+	}
+	if cfg.MaxVersion != tls.VersionTLS13 {
+		t.Errorf("MaxVersion default: want TLS1.3, got %x", cfg.MaxVersion)
+	}
+}
+
+func TestApplyTLSVersionAndCiphers_MinGreaterThanMax(t *testing.T) {
+	cfg := &tls.Config{}
+	err := ApplyTLSVersionAndCiphers(cfg, config.TLSConfig{
+		MinVersion: "1.3",
+		MaxVersion: "1.2",
+	})
+	if err == nil {
+		t.Error("min > max must be rejected")
+	}
+}
+
+func TestApplyTLSVersionAndCiphers_Pinned13(t *testing.T) {
+	cfg := &tls.Config{}
+	if err := ApplyTLSVersionAndCiphers(cfg, config.TLSConfig{
+		MinVersion: "1.3",
+		MaxVersion: "1.3",
+	}); err != nil {
+		t.Fatalf("TLS 1.3 only should succeed: %v", err)
+	}
+	if cfg.MinVersion != tls.VersionTLS13 || cfg.MaxVersion != tls.VersionTLS13 {
+		t.Errorf("want pinned 1.3, got min=%x max=%x", cfg.MinVersion, cfg.MaxVersion)
+	}
+}
