@@ -209,9 +209,10 @@ func TestValidation_ServerAddress(t *testing.T) {
 	}{
 		{"valid host:port", []string{"10.0.0.1:80"}, false},
 		{"valid localhost:port", []string{"127.0.0.1:8080"}, false},
-		{"missing port", []string{"10.0.0.1"}, true},
-		{"no colon", []string{"foobar"}, true},
+		{"bare IP (1:1 port mapping)", []string{"10.0.0.1"}, false},
+		{"hostname without port", []string{"backend.local"}, false},
 		{"empty string", []string{""}, true},
+		{"invalid with slash", []string{"10.0.0.1/path"}, true},
 	}
 
 	for _, tt := range tests {

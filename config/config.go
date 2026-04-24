@@ -429,8 +429,18 @@ func validate(cfg *Config) error {
 		}
 
 		for _, s := range b.Servers {
+			if s == "" {
+				return fmt.Errorf("backend %s has empty server address", b.Name)
+			}
 			if _, _, err := net.SplitHostPort(s); err != nil {
-				return fmt.Errorf("backend %s has invalid server address %q: %v", b.Name, s, err)
+				// Allow bare IP/hostname without port (1:1 port mapping for port ranges)
+				if net.ParseIP(s) != nil {
+					continue // valid bare IP
+				}
+				// Not a bare IP — reject if it has invalid chars, allow hostnames
+				if strings.ContainsAny(s, ":/ ") {
+					return fmt.Errorf("backend %s has invalid server address %q: %v", b.Name, s, err)
+				}
 			}
 		}
 
