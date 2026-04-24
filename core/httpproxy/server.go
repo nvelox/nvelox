@@ -386,6 +386,15 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// Handle FastCGI (PHP-FPM) forwarding
+		if routeResult.FastCGI.Pass != "" {
+			if routeResult.Expires != "" {
+				SetExpires(w, routeResult.Expires)
+			}
+			ServeFastCGI(w, r, routeResult.FastCGI)
+			return
+		}
+
 		// Set expires header for non-static routes
 		if routeResult.Static.Root == "" && routeResult.Expires != "" {
 			SetExpires(w, routeResult.Expires)

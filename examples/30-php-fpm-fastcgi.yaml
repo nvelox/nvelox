@@ -1,0 +1,75 @@
+## 30 — PHP-FPM via FastCGI
+## Full PHP application setup equivalent to nginx + PHP-FPM.
+## Serves static files directly, forwards PHP to FastCGI.
+##
+## Equivalent nginx config:
+##   root /var/www/html;
+##   location ~ \.(css|js|png|jpg|gif|ico)$ {
+##       expires 1y;
+##       try_files $uri =404;
+##   }
+##   location ~ \.php(/|$) {
+##       fastcgi_pass 127.0.0.1:9000;
+##       fastcgi_split_path_info ^(.+\.php)(/.*)$;
+##       fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+##       fastcgi_param DOCUMENT_ROOT $document_root;
+##   }
+##   location / {
+##       try_files $uri $uri/ /index.php$is_args$args;
+##   }
+
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "php-app"
+    bind: ":9080"
+    protocol: "http"
+    root: "/var/www/html"
+    routes:
+      # Static assets — serve directly with long cache
+      - match:
+          path_regex: "\\.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|map)$"
+        static:
+          root: "/var/www/html"
+        try_files:
+          files: ["$uri"]
+          fallback: "=404"
+        expires: "1y"
+
+      # PDF/XML — serve with no cache
+      - match:
+          path_regex: "\\.(xml|pdf|xlsx)$"
+        static:
+          root: "/var/www/html"
+        try_files:
+          files: ["$uri"]
+          fallback: "/index.php$is_args$args"
+        expires: "-1"
+
+      # PHP files — forward to PHP-FPM
+      - match:
+          path_regex: "^/(index)\\.php(/|$)"
+        fastcgi:
+          pass: "127.0.0.1:9000"
+          document_root: "/var/www/html"
+          split_path_info: "^(.+\\.php)(/.*)$"
+          params:
+            HTTPS: "$http_x_forwarded_proto"
+            REMOTE_ADDR: "$http_x_real_ip"
+
+      # Everything else — try static, fall back to PHP
+      - match:
+          path_prefix: "/"
+        static:
+          root: "/var/www/html"
+          index: ["index.html", "index.php"]
+        try_files:
+          files: ["$uri", "$uri/"]
+          fallback: "/index.php$is_args$args"
+        fastcgi:
+          pass: "127.0.0.1:9000"
+          document_root: "/var/www/html"
+
+# No backends needed — FastCGI routes handle everything
+backends: []

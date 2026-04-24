@@ -18,6 +18,7 @@ type compiledRoute struct {
 	static     config.StaticConfig
 	tryFiles   config.TryFilesConfig
 	expires    string
+	fastcgi    config.FastCGIConfig
 }
 
 // RouteResult contains the result of a route match.
@@ -29,6 +30,7 @@ type RouteResult struct {
 	Static       config.StaticConfig
 	TryFiles     config.TryFilesConfig
 	Expires      string
+	FastCGI      config.FastCGIConfig
 	RegexMatches []string // capture groups from regex match
 }
 
@@ -52,6 +54,7 @@ func NewRouter(routes []config.RouteConfig, defaultBackend string) *Router {
 			static:     r.Static,
 			tryFiles:   r.TryFiles,
 			expires:    r.Expires,
+			fastcgi:    r.FastCGI,
 		}
 		if r.Match.PathRegex != "" {
 			cr.pathRegex, _ = regexp.Compile(r.Match.PathRegex)
@@ -111,6 +114,7 @@ func (r *Router) MatchFull(host, path string) *RouteResult {
 			Static:       route.static,
 			TryFiles:     route.tryFiles,
 			Expires:      route.expires,
+			FastCGI:      route.fastcgi,
 			RegexMatches: regexMatches,
 		}
 	}

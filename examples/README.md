@@ -462,6 +462,122 @@ echo "game-data" | nc 127.0.0.1 9100
 tail -f /tmp/nvelox-access.log
 ```
 
+## 29 — Static Files with try_files
+
+```bash
+# Create test files
+mkdir -p public
+echo "<h1>Hello</h1>" > public/index.html
+echo "body{}" > public/style.css
+
+./nvelox -config examples/29-static-files.yaml
+
+# Static file served directly
+curl http://127.0.0.1:9000/style.css
+# Expected: "body{}" with Cache-Control: max-age=31536000
+
+# HTML served with index
+curl http://127.0.0.1:9000/
+# Expected: "<h1>Hello</h1>"
+
+# Missing file falls back to backend
+curl http://127.0.0.1:9000/missing-page
+# Expected: proxied to backend (or 502 if no backend running)
+
+# Check cache headers
+curl -v http://127.0.0.1:9000/style.css 2>&1 | grep "Cache-Control"
+# Expected: Cache-Control: public, max-age=31536000
+```
+
+## 30 — PHP-FPM via FastCGI
+
+```bash
+# Prerequisites: PHP-FPM running on port 9000
+# On Ubuntu: sudo apt install php-fpm
+# Start php-fpm: sudo php-fpm -F
+
+# Create test PHP file
+sudo mkdir -p /var/www/html
+echo '<?php echo "Hello from PHP " . phpversion(); ?>' | sudo tee /var/www/html/index.php
+
+./nvelox -config examples/30-php-fpm-fastcgi.yaml
+
+# Test PHP execution
+curl http://127.0.0.1:9080/
+# Expected: "Hello from PHP 8.x"
+
+# Test static file (create one first)
+echo "body{}" | sudo tee /var/www/html/style.css
+curl -v http://127.0.0.1:9080/style.css 2>&1 | grep "Cache-Control"
+# Expected: static file served with 1y cache
+
+# Test PATH_INFO
+curl http://127.0.0.1:9080/index.php/some/path
+# Expected: PHP receives PATH_INFO=/some/path
+```
+
+### Nvelox vs Nginx — PHP-FPM Config Comparison
+
+**Nginx:**
+```nginx
+server {
+    listen 80;
+    root /var/www/html;
+
+    location ~ \.(css|js|png|jpg)$ {
+        expires 1y;
+        try_files $uri =404;
+    }
+
+    location ~ \.php(/|$) {
+        fastcgi_pass 127.0.0.1:9000;
+        fastcgi_split_path_info ^(.+\.php)(/.*)$;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT $document_root;
+        include fastcgi_params;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.php$is_args$args;
+    }
+}
+```
+
+**Nvelox:**
+```yaml
+listeners:
+  - name: "php-app"
+    bind: ":80"
+    protocol: "http"
+    routes:
+      - match:
+          path_regex: "\\.(css|js|png|jpg)$"
+        static:
+          root: "/var/www/html"
+        try_files:
+          files: ["$uri"]
+          fallback: "=404"
+        expires: "1y"
+
+      - match:
+          path_regex: "\\.php(/|$)"
+        fastcgi:
+          pass: "127.0.0.1:9000"
+          document_root: "/var/www/html"
+          split_path_info: "^(.+\\.php)(/.*)$"
+
+      - match:
+          path_prefix: "/"
+        static:
+          root: "/var/www/html"
+        try_files:
+          files: ["$uri", "$uri/"]
+          fallback: "/index.php$is_args$args"
+        fastcgi:
+          pass: "127.0.0.1:9000"
+          document_root: "/var/www/html"
+```
+
 ---
 
 ## Cleanup

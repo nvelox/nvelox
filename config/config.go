@@ -172,6 +172,17 @@ type RouteConfig struct {
 	Static   StaticConfig   `yaml:"static,omitempty"`   // Serve static files
 	TryFiles TryFilesConfig `yaml:"try_files,omitempty"` // try_files logic
 	Expires  string         `yaml:"expires,omitempty"`   // Cache-Control: "1y", "30d", "1h", "-1" (no cache)
+	FastCGI  FastCGIConfig  `yaml:"fastcgi,omitempty"`   // Forward to FastCGI (PHP-FPM)
+}
+
+// FastCGIConfig defines FastCGI upstream (e.g., PHP-FPM) settings.
+type FastCGIConfig struct {
+	Pass         string            `yaml:"pass"`                    // FastCGI address (e.g., "127.0.0.1:9000" or "unix:/var/run/php-fpm.sock")
+	DocumentRoot string            `yaml:"document_root,omitempty"` // DOCUMENT_ROOT for SCRIPT_FILENAME
+	ScriptName   string            `yaml:"script_name,omitempty"`   // Override SCRIPT_NAME (default: from URL path)
+	SplitPathInfo string           `yaml:"split_path_info,omitempty"` // Regex to split PATH_INFO (like fastcgi_split_path_info)
+	Params       map[string]string `yaml:"params,omitempty"`        // Extra FastCGI params
+	Index        string            `yaml:"index,omitempty"`         // Default script (e.g., "index.php")
 }
 
 // StaticConfig defines static file serving.
@@ -496,8 +507,10 @@ func validate(cfg *Config) error {
 			}
 			for i, r := range l.Routes {
 				hasRedirect := r.Redirect.URL != ""
-				// Backend is required unless the route is a redirect
-				if r.Backend == "" && !hasRedirect {
+				hasFastCGI := r.FastCGI.Pass != ""
+				hasStatic := r.Static.Root != ""
+				// Backend is required unless the route is a redirect, fastcgi, or static-only
+				if r.Backend == "" && !hasRedirect && !hasFastCGI && !hasStatic {
 					return fmt.Errorf("listener %s: route %d must have a backend", l.Name, i)
 				}
 				if r.Backend != "" && !backendNames[r.Backend] {
