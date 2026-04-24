@@ -174,6 +174,11 @@ func SetExpires(w http.ResponseWriter, expires string) {
 	}
 }
 
+// parseExpiresDuration parses "1y", "30d", etc. into time.Duration.
+// time.Duration is nanoseconds int64 — "292y" already overflows. Guard
+// against attacker-supplied configs like "9999y" by capping at ~100 years
+// which is already well beyond any reasonable cache lifetime and leaves
+// plenty of headroom below math.MaxInt64.
 func parseExpiresDuration(s string) time.Duration {
 	s = strings.TrimSpace(s)
 	if len(s) < 2 {
@@ -190,6 +195,18 @@ func parseExpiresDuration(s string) time.Duration {
 			return 0
 		}
 		return d
+	}
+	if num < 0 {
+		return 0
+	}
+
+	// 100 years in nanoseconds = ~3.15e18, safely under MaxInt64 (~9.2e18).
+	// Anything past this is either a typo or a hostile config — clamp so we
+	// never produce a negative Duration via overflow, which would disable
+	// Cache-Control entirely in SetExpires.
+	const maxYears = 100
+	if num > maxYears {
+		num = maxYears
 	}
 
 	switch unit {

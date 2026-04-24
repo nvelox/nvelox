@@ -302,3 +302,30 @@ func TestNewHTTPServer_BackendTLSWiring(t *testing.T) {
 		t.Errorf("tls backend scheme must be https, got %q", s.backendSchemes["tls"])
 	}
 }
+
+func TestParseByteSize_Overflow(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int64
+	}{
+		{"", 0},
+		{"1024", 1024},
+		{"10KB", 10 * 1024},
+		{"1MB", 1024 * 1024},
+		{"1GB", 1024 * 1024 * 1024},
+		{"-5MB", 0},                       // negative → 0
+		{"99999999999999999999GB", 0},     // Sscanf fails to parse, n=0
+		// Exact overflow: math.MaxInt64 / (1024*1024*1024) ≈ 8_589_934_591
+		// so (math.MaxInt64/1GB + 1) GB overflows — must clamp, not wrap negative.
+		{"9999999999GB", 9223372036854775807}, // math.MaxInt64
+	}
+	for _, c := range cases {
+		got := parseByteSize(c.in)
+		if got != c.want {
+			t.Errorf("parseByteSize(%q) = %d, want %d", c.in, got, c.want)
+		}
+		if got < 0 {
+			t.Errorf("parseByteSize(%q) returned negative %d — would disable size limits", c.in, got)
+		}
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"nvelox/config"
 )
@@ -188,3 +189,30 @@ func TestExpandTryFileVars(t *testing.T) {
 
 // Use http import
 var _ = http.StatusOK
+
+func TestParseExpiresDuration_Overflow(t *testing.T) {
+	cases := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"", 0},
+		{"1h", time.Hour},
+		{"1y", 365 * 24 * time.Hour},
+		{"-1", 0}, // handled by the "len<2" short-circuit + "s must be single-char"
+		{"0d", 0},
+		{"-5y", 0}, // negative clamped to 0
+		// Overflow: 9999y would overflow nanoseconds → negative Duration,
+		// which would then disable Cache-Control. Must clamp at 100y.
+		{"9999y", 100 * 365 * 24 * time.Hour},
+		{"99999999y", 100 * 365 * 24 * time.Hour},
+	}
+	for _, c := range cases {
+		got := parseExpiresDuration(c.in)
+		if got != c.want {
+			t.Errorf("parseExpiresDuration(%q) = %v, want %v", c.in, got, c.want)
+		}
+		if got < 0 {
+			t.Errorf("parseExpiresDuration(%q) returned negative %v — would disable Cache-Control", c.in, got)
+		}
+	}
+}

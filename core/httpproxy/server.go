@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -218,6 +219,10 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 	return s
 }
 
+// parseByteSize parses human-readable byte sizes ("10MB", "512KB") into bytes.
+// Returns 0 for invalid/empty input and clamps n*multiplier to math.MaxInt64
+// on overflow — prevents an attacker-supplied config like "99999GB" from
+// wrapping to a negative int64 which http.MaxBytesReader would treat as "no limit".
 func parseByteSize(s string) int64 {
 	if s == "" {
 		return 0
@@ -238,6 +243,13 @@ func parseByteSize(s string) int64 {
 	}
 	n := int64(0)
 	fmt.Sscanf(s, "%d", &n)
+	if n < 0 {
+		return 0 // negative input is invalid, treat as 0
+	}
+	// Overflow guard: if n*multiplier would exceed int64, return MaxInt64.
+	if multiplier > 0 && n > math.MaxInt64/multiplier {
+		return math.MaxInt64
+	}
 	return n * multiplier
 }
 
