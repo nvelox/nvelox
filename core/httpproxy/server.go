@@ -272,6 +272,9 @@ func (s *HTTPServer) Stop(ctx context.Context) error {
 
 // ServeHTTP handles incoming HTTP requests with routing, proxying, and header manipulation.
 func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Security headers on all responses
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
 	// Advertise HTTP/3 if enabled
 	if s.altSvcHeader != "" {
 		w.Header().Set("Alt-Svc", s.altSvcHeader)
@@ -744,12 +747,22 @@ func expandRedirectVars(url string, r *http.Request) string {
 	return replacer.Replace(url)
 }
 
+// sanitizeHeaderValue removes CR/LF/tab to prevent header injection.
+func sanitizeHeaderValue(v string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' || r == '\t' {
+			return -1
+		}
+		return r
+	}, v)
+}
+
 func applyRequestHeaders(r *http.Request, h *config.HeadersConfig) {
 	for k, v := range h.RequestAdd {
-		r.Header.Add(k, v)
+		r.Header.Add(sanitizeHeaderValue(k), sanitizeHeaderValue(v))
 	}
 	for k, v := range h.RequestSet {
-		r.Header.Set(k, v)
+		r.Header.Set(sanitizeHeaderValue(k), sanitizeHeaderValue(v))
 	}
 	for _, k := range h.RequestRemove {
 		r.Header.Del(k)
@@ -759,10 +772,10 @@ func applyRequestHeaders(r *http.Request, h *config.HeadersConfig) {
 // applyResponseHeaders applies header add/set/remove to the response.
 func applyResponseHeaders(h http.Header, cfg *config.HeadersConfig) {
 	for k, v := range cfg.ResponseAdd {
-		h.Add(k, v)
+		h.Add(sanitizeHeaderValue(k), sanitizeHeaderValue(v))
 	}
 	for k, v := range cfg.ResponseSet {
-		h.Set(k, v)
+		h.Set(sanitizeHeaderValue(k), sanitizeHeaderValue(v))
 	}
 	for _, k := range cfg.ResponseRemove {
 		h.Del(k)

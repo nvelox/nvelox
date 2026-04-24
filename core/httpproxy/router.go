@@ -57,6 +57,10 @@ func NewRouter(routes []config.RouteConfig, defaultBackend string) *Router {
 			fastcgi:    r.FastCGI,
 		}
 		if r.Match.PathRegex != "" {
+			// Validate regex length to mitigate ReDoS
+			if len(r.Match.PathRegex) > 1024 {
+				continue // skip overly complex regex
+			}
 			cr.pathRegex, _ = regexp.Compile(r.Match.PathRegex)
 		}
 		compiled[i] = cr
