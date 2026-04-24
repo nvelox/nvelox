@@ -369,7 +369,7 @@ func (e *Engine) initBackends() {
 		if be.ResolveInterval != "" {
 			interval, err := time.ParseDuration(be.ResolveInterval)
 			if err == nil && interval > 0 {
-				resolver := discovery.NewDNSResolver(be.Name, be.Servers, interval, func(servers []string) {
+				resolver := discovery.NewDNSResolver(be.Name, be.Servers, interval, be.AllowPrivateIPs, func(servers []string) {
 					balancer.UpdateServers(servers)
 				})
 				resolver.Start()

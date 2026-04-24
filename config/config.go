@@ -305,6 +305,11 @@ type Backend struct {
 	Retry         RetryConfig       `yaml:"retry,omitempty"`
 	StickySession StickyConfig      `yaml:"sticky_session,omitempty"`
 	ResolveInterval string           `yaml:"resolve_interval,omitempty"` // DNS re-resolve interval
+	// AllowPrivateIPs: if true, backend hostnames may resolve to RFC1918,
+	// loopback, link-local or CGNAT addresses. Default (false) blocks these
+	// to prevent DNS-rebinding / SSRF when a hostname is attacker-controlled.
+	// Set to true only when backends legitimately live on a private network.
+	AllowPrivateIPs bool              `yaml:"allow_private_ips,omitempty"`
 	BackendTLS     BackendTLSConfig  `yaml:"backend_tls,omitempty"`
 	CircuitBreaker CBConfig         `yaml:"circuit_breaker,omitempty"`
 	HealthCheck    HealthCheckConfig `yaml:"health_check,omitempty"`
