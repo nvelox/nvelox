@@ -602,11 +602,11 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case err := <-proxyErr:
 			excluded = append(excluded, target)
 			if attempt < maxAttempts-1 {
-				logging.Warn("[HTTP] Retry %d/%d for %s: %v", attempt+1, maxAttempts, r.URL.Path, err)
+				logging.Warn("[HTTP] Retry %d/%d for %s: %v", attempt+1, maxAttempts, logging.SanitizeLogField(r.URL.Path), err)
 				rec = &statusRecorder{ResponseWriter: w, status: 200} // reset recorder
 				continue
 			}
-			logging.Error("[HTTP] All retries exhausted for %s: %v", r.URL.Path, err)
+			logging.Error("[HTTP] All retries exhausted for %s: %v", logging.SanitizeLogField(r.URL.Path), err)
 			s.serveError(w, http.StatusBadGateway)
 		default:
 			// Success or non-retryable response

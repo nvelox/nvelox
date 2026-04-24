@@ -107,7 +107,9 @@ func (h *FastCGIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		origServeHTTP(w, r)
 	})
 
-	logging.Info("[FCGI] %s %s -> %s:%s (script: %s)", r.Method, r.URL.Path, h.network, h.address, scriptName)
+	logging.Info("[FCGI] %s %s -> %s:%s (script: %s)",
+		logging.SanitizeLogField(r.Method), logging.SanitizeLogField(r.URL.Path),
+		h.network, h.address, logging.SanitizeLogField(scriptName))
 	customHandler.ServeHTTP(w, r)
 }
 
@@ -178,7 +180,9 @@ func ServeFastCGI(w http.ResponseWriter, r *http.Request, cfg config.FastCGIConf
 
 	handler := gofast.NewHandler(chain(gofast.BasicSession), clientFactory)
 
-	logging.Info("[FCGI] %s %s -> %s:%s (script: %s)", r.Method, r.URL.Path, network, address, scriptFilename)
+	logging.Info("[FCGI] %s %s -> %s:%s (script: %s)",
+		logging.SanitizeLogField(r.Method), logging.SanitizeLogField(r.URL.Path),
+		network, address, logging.SanitizeLogField(scriptFilename))
 	handler.ServeHTTP(w, r)
 }
 

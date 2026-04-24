@@ -104,10 +104,57 @@ func Access(format string, v ...interface{}) {
 	accessLog.Printf(format, v...)
 }
 
-// AccessHTTP logs an HTTP request in CLF-like format.
+// SanitizeLogField strips CR/LF/tab and other control characters from strings
+// that may contain user-controlled input (request path, method, headers, …)
+// before they are written to a log line. Without this an attacker can inject
+// fake log lines via %0A in the URL path and fool SIEM/monitoring.
+func SanitizeLogField(s string) string {
+	if s == "" {
+		return s
+	}
+	// Fast path: scan for anything that needs replacing. Avoids allocating
+	// a new string for the common case of clean ASCII paths.
+	needs := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c == 0x7f {
+			needs = true
+			break
+		}
+	}
+	if !needs {
+		return s
+	}
+	b := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '\n':
+			b = append(b, '\\', 'n')
+		case c == '\r':
+			b = append(b, '\\', 'r')
+		case c == '\t':
+			b = append(b, '\\', 't')
+		case c < 0x20 || c == 0x7f:
+			b = append(b, '?') // other control chars → '?'
+		default:
+			b = append(b, c)
+		}
+	}
+	return string(b)
+}
+
+// AccessHTTP logs an HTTP request in CLF-like format. User-controlled
+// fields (method, path, proto, backend) are sanitized against CRLF log
+// injection; clientIP is produced by net.SplitHostPort and is trusted.
 func AccessHTTP(clientIP, method, path, proto string, status int, bytes int64, duration float64, backend string) {
 	accessLog.Printf("%s - \"%s %s %s\" %d %d %.3fms -> %s",
-		clientIP, method, path, proto, status, bytes, duration, backend)
+		clientIP,
+		SanitizeLogField(method),
+		SanitizeLogField(path),
+		SanitizeLogField(proto),
+		status, bytes, duration,
+		SanitizeLogField(backend))
 }
 
 func Fatal(format string, v ...interface{}) {
