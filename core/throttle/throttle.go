@@ -26,6 +26,11 @@ func NewReader(r io.Reader, bytesPerSec int64) *Reader {
 }
 
 func (t *Reader) Read(p []byte) (int, error) {
+	// Reserve tokens under the lock, then release the lock before the
+	// syscall. Refund the unused portion if Read returned less than the
+	// reservation. Two concurrent Reads can't both "see 100 available and
+	// each take 50 they hadn't yet paid for" anymore — the second reader
+	// sees tokens already decremented by the first's reservation.
 	t.mu.Lock()
 	now := time.Now()
 	elapsed := now.Sub(t.lastTime).Seconds()
@@ -35,7 +40,6 @@ func (t *Reader) Read(p []byte) (int, error) {
 		t.tokens = float64(t.bytesPerSec)
 	}
 
-	// Limit read size to available tokens
 	maxRead := int(t.tokens)
 	if maxRead <= 0 {
 		t.mu.Unlock()
@@ -45,14 +49,20 @@ func (t *Reader) Read(p []byte) (int, error) {
 	if maxRead > len(p) {
 		maxRead = len(p)
 	}
+	t.tokens -= float64(maxRead) // reserve before releasing lock
 	t.mu.Unlock()
 
 	n, err := t.r.Read(p[:maxRead])
 
-	t.mu.Lock()
-	t.tokens -= float64(n)
-	t.mu.Unlock()
-
+	// Refund unread portion if the inner Reader returned less than we reserved.
+	if n < maxRead {
+		t.mu.Lock()
+		t.tokens += float64(maxRead - n)
+		if t.tokens > float64(t.bytesPerSec) {
+			t.tokens = float64(t.bytesPerSec)
+		}
+		t.mu.Unlock()
+	}
 	return n, err
 }
 
@@ -101,6 +111,15 @@ func (t *Writer) Write(p []byte) (int, error) {
 		t.mu.Unlock()
 
 		n, err := t.w.Write(p[written : written+chunk])
+		// Refund unused reservation on partial write.
+		if n < chunk {
+			t.mu.Lock()
+			t.tokens += float64(chunk - n)
+			if t.tokens > float64(t.bytesPerSec) {
+				t.tokens = float64(t.bytesPerSec)
+			}
+			t.mu.Unlock()
+		}
 		written += n
 		if err != nil {
 			return written, err
