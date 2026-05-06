@@ -131,6 +131,8 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 				IPRateLimit:    l.IPRateLimit,
 				ACL:            l.ACL,
 				TrustedProxies: l.TrustedProxies,
+				ServerNames:    l.ServerNames,
+				DefaultServer:  l.DefaultServer,
 				Compression:    l.Compression,
 				ErrorPages:     l.ErrorPages,
 				Buffering:      l.Buffering,

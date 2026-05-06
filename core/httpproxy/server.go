@@ -110,6 +110,10 @@ type ListenerConfig struct {
 	ErrorPages     map[int]string
 	Buffering      config.BufferingConfig
 	Cache          config.CacheConfig
+	// Multi-server-per-port (nginx-style): SNI / Host names this site
+	// answers to, and whether it's the catch-all default for unknown SNI/Host.
+	ServerNames    []string
+	DefaultServer  bool
 }
 
 // NewHTTPServer creates an HTTP server for the given listener.

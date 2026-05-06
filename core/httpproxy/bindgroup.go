@@ -28,6 +28,10 @@ type BindGroup struct {
 	http3Server *http3.Server
 	sites       []*HTTPServer
 	primary     *HTTPServer // for shared TLS / HTTP3 config; first site for now
+
+	// Multi-cert dispatch state, populated by buildTLSConfig at Start.
+	certs       []siteCert
+	defaultCert *siteCert
 }
 
 // NewBindGroup creates a group bound to addr. Use AddSite to attach one or
@@ -55,9 +59,8 @@ func (g *BindGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.primary.ServeHTTP(w, r)
 }
 
-// Start opens the listening socket and (if HTTPS) loads the primary site's
-// TLS config. http.Server.Handler is set to the BindGroup so dispatch goes
-// through ServeHTTP.
+// Start opens the listening socket and builds a TLS config that supports
+// SNI-based cert selection across all sites in the group.
 func (g *BindGroup) Start() error {
 	if g.primary == nil {
 		return fmt.Errorf("bind group %s has no sites", g.addr)
@@ -74,17 +77,9 @@ func (g *BindGroup) Start() error {
 	primary := g.primary
 
 	if primary.Listener.TLS != nil {
-		warnIfKeyWorldReadable(primary.Listener.TLS.Key)
-		cert, err := tls.LoadX509KeyPair(primary.Listener.TLS.Cert, primary.Listener.TLS.Key)
+		tlsCfg, err := g.buildTLSConfig()
 		if err != nil {
-			return fmt.Errorf("failed to load TLS cert/key: %v", err)
-		}
-		tlsCfg := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			NextProtos:   []string{"h2", "http/1.1"},
-		}
-		if err := tlsutil.ApplyTLSVersionAndCiphers(tlsCfg, *primary.Listener.TLS); err != nil {
-			return fmt.Errorf("TLS listener %s: %v", primary.Listener.Name, err)
+			return err
 		}
 		g.httpServer.TLSConfig = tlsCfg
 
@@ -124,6 +119,104 @@ func (g *BindGroup) Start() error {
 		}()
 	}
 
+	return nil
+}
+
+// siteCert pairs one loaded TLS certificate with the server_names patterns
+// the owning Site claims. Built once at Start time; consulted on every
+// ClientHello via the GetCertificate callback.
+type siteCert struct {
+	patterns []string
+	cert     *tls.Certificate
+	site     *HTTPServer
+}
+
+// buildTLSConfig constructs the shared *tls.Config for the group:
+//   - Loads every site's cert/key once at startup.
+//   - GetCertificate picks by SNI: exact match wins, then wildcard, then
+//     the default site's cert. No match + no default → handshake error
+//     (Go's tls package treats nil cert + nil err as "no cert available").
+//   - MinVersion / MaxVersion / CipherSuites come from the PRIMARY site
+//     (Phase C constraint — same TLS profile across sites in a group).
+//   - NextProtos forces h2 + http/1.1 ALPN on every site.
+func (g *BindGroup) buildTLSConfig() (*tls.Config, error) {
+	if len(g.sites) == 0 {
+		return nil, fmt.Errorf("bind group %s: no sites", g.addr)
+	}
+
+	// Load each site's cert.
+	certs := make([]siteCert, 0, len(g.sites))
+	var defaultCert *siteCert
+	for _, s := range g.sites {
+		if s.Listener.TLS == nil || s.Listener.TLS.Cert == "" {
+			// HTTP-only site in a group with TLS sites — handled at validation
+			// time. Defensive: skip rather than panic.
+			continue
+		}
+		warnIfKeyWorldReadable(s.Listener.TLS.Key)
+		cert, err := tls.LoadX509KeyPair(s.Listener.TLS.Cert, s.Listener.TLS.Key)
+		if err != nil {
+			return nil, fmt.Errorf("site %s: failed to load TLS cert/key: %v", s.Listener.Name, err)
+		}
+		entry := siteCert{
+			patterns: s.Listener.ServerNames,
+			cert:     &cert,
+			site:     s,
+		}
+		certs = append(certs, entry)
+		if s.Listener.DefaultServer || defaultCert == nil {
+			// First site is the implicit default if no DefaultServer is set,
+			// preserving today's behaviour for single-site bind groups.
+			c := certs[len(certs)-1]
+			defaultCert = &c
+		}
+	}
+	if len(certs) == 0 {
+		return nil, fmt.Errorf("bind group %s: no TLS-enabled sites", g.addr)
+	}
+	g.certs = certs
+	g.defaultCert = defaultCert
+
+	tlsCfg := &tls.Config{
+		NextProtos: []string{"h2", "http/1.1"},
+		// Set Certificates to a single-element slice so callers/tooling that
+		// inspect c.Certificates see something sensible. The actual cert
+		// served at handshake time comes from GetCertificate below.
+		Certificates: []tls.Certificate{*defaultCert.cert},
+		GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return g.pickCert(chi.ServerName), nil
+		},
+	}
+	if err := tlsutil.ApplyTLSVersionAndCiphers(tlsCfg, *g.primary.Listener.TLS); err != nil {
+		return nil, fmt.Errorf("TLS bind group %s: %v", g.addr, err)
+	}
+	return tlsCfg, nil
+}
+
+// pickCert resolves an SNI hostname to the cert that should be served.
+// Exact match > wildcard > default site's cert. If sni is empty (e.g.
+// IP-only TLS connect with no SNI), we still return the default — same
+// as nginx and any L7 proxy.
+func (g *BindGroup) pickCert(sni string) *tls.Certificate {
+	if sni == "" {
+		if g.defaultCert != nil {
+			return g.defaultCert.cert
+		}
+		return nil
+	}
+	entries := make([]tlsutil.SiteEntry[*tls.Certificate], 0, len(g.certs))
+	for i := range g.certs {
+		entries = append(entries, tlsutil.SiteEntry[*tls.Certificate]{
+			Patterns: g.certs[i].patterns,
+			Payload:  g.certs[i].cert,
+		})
+	}
+	if cert, ok := tlsutil.MatchSite(sni, entries); ok {
+		return cert
+	}
+	if g.defaultCert != nil {
+		return g.defaultCert.cert
+	}
 	return nil
 }
 

@@ -72,6 +72,8 @@ type ListenerConfig struct {
 	IPRateLimit    config.IPRateLimitConfig
 	ACL            []config.ACLRule
 	TrustedProxies []string
+	ServerNames    []string
+	DefaultServer  bool
 	Compression    config.CompressionConfig
 	ErrorPages     map[int]string
 	Buffering      config.BufferingConfig
@@ -161,6 +163,8 @@ func (e *Engine) Start(ctx context.Context) error {
 			IPRateLimit:    l.IPRateLimit,
 			ACL:            l.ACL,
 			TrustedProxies: l.TrustedProxies,
+			ServerNames:    l.ServerNames,
+			DefaultServer:  l.DefaultServer,
 			Compression:    l.Compression,
 			ErrorPages:     l.ErrorPages,
 			Buffering:      l.Buffering,
