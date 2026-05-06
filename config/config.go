@@ -654,22 +654,49 @@ func validateServerName(s string) error {
 
 // validateBindGroups enforces the nginx-style multi-server-per-port rules
 // across the full set of listeners.
+//
+// "Bind group" here means listeners that actually share an OS socket. TCP
+// and UDP on the same port number do NOT share a socket (HTTP/3 + HTTPS
+// is the canonical example), so we group by (protocol-family, bind) pair.
+// Within HTTP and HTTPS, however, we treat them as one family because
+// they share an HTTP listener at the engine level — http+https on the
+// same port is still rejected.
 func validateBindGroups(listeners []Listener) error {
-	// Group listeners by bind address.
-	groups := make(map[string][]*Listener)
-	for i := range listeners {
-		l := &listeners[i]
-		groups[l.Bind] = append(groups[l.Bind], l)
+	// protocolFamily collapses protocols by underlying transport so we
+	// only flag genuine same-socket conflicts:
+	//   tcp, http, https → "tcp"  (all TCP-based — share a TCP socket)
+	//   udp              → "udp"  (independent UDP socket)
+	// HTTP+HTTPS on the same port still conflict (same TCP socket).
+	// TCP+UDP on the same port number do NOT conflict (different sockets,
+	// the canonical HTTP/3 + HTTPS pattern).
+	protocolFamily := func(p string) string {
+		switch p {
+		case "udp":
+			return "udp"
+		default:
+			return "tcp"
+		}
 	}
 
-	for bind, sites := range groups {
+	// Group by (family, bind).
+	type groupKey struct{ family, bind string }
+	groups := make(map[groupKey][]*Listener)
+	for i := range listeners {
+		l := &listeners[i]
+		k := groupKey{family: protocolFamily(l.Protocol), bind: l.Bind}
+		groups[k] = append(groups[k], l)
+	}
+
+	for key, sites := range groups {
+		bind := key.bind
 		if len(sites) < 2 {
 			// Single-listener groups behave exactly as today; no extra rules.
 			continue
 		}
 
-		// Rule: same protocol within a bind group. Mixing http+https or
-		// l4+l7 on the same socket is not supported.
+		// Rule: same protocol within a bind group. With the (family, bind)
+		// keying above this only fires for genuine same-socket conflicts
+		// (e.g. http+https-on-the-same-port if someone ever wrote that).
 		proto := sites[0].Protocol
 		for _, s := range sites[1:] {
 			if s.Protocol != proto {
@@ -707,12 +734,12 @@ func validateBindGroups(listeners []Listener) error {
 		seen := make(map[string]string) // name → owning listener
 		for _, s := range sites {
 			for _, sn := range s.ServerNames {
-				key := strings.ToLower(sn)
-				if owner, dup := seen[key]; dup {
+				lname := strings.ToLower(sn)
+				if owner, dup := seen[lname]; dup {
 					return fmt.Errorf("bind %s: server_name %q claimed by both %s and %s",
 						bind, sn, owner, s.Name)
 				}
-				seen[key] = s.Name
+				seen[lname] = s.Name
 			}
 		}
 

@@ -654,6 +654,16 @@ func TestValidateBindGroups_OK(t *testing.T) {
 			},
 		},
 		{
+			// TCP+UDP on the same port don't share a socket — canonical
+			// HTTP/3 + HTTPS pattern, also DNS, SIP, etc. Must not be
+			// flagged as a bind conflict.
+			name: "tcp and udp on same port",
+			in: []Listener{
+				mkListener("h2", ":443", "tcp"),
+				mkListener("h3", ":443", "udp"),
+			},
+		},
+		{
 			name: "two sites with names + default",
 			in: func() []Listener {
 				a := mkListener("a", ":443", "https")
