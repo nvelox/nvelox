@@ -59,7 +59,7 @@ type ListenerConfig struct {
 	Addr           string
 	Protocol       string
 	ZeroCopy       bool
-	DefaultBackend string
+	Backend        string
 	SendProxyV2    bool // Send PROXY protocol v2 to backend
 	Port           int
 	RateLimit      config.RateLimitConfig
@@ -164,7 +164,7 @@ func (e *Engine) Start(ctx context.Context) error {
 			Name:           l.Name,
 			Addr:           l.Addr,
 			Protocol:       l.Protocol,
-			DefaultBackend: l.DefaultBackend,
+			Backend:        l.Backend,
 			Port:           l.Port,
 			TLS:            l.TLS,
 			HTTP3:          l.HTTP3,
@@ -526,17 +526,17 @@ func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *
 	startTime := time.Now()
 
 	// Select backend
-	balancer, ok := e.Balancers[l.DefaultBackend]
+	balancer, ok := e.Balancers[l.Backend]
 	if !ok {
-		logging.Error("Balancer '%s' not found for TLS listener '%s'", l.DefaultBackend, l.Name)
+		logging.Error("Balancer '%s' not found for TLS listener '%s'", l.Backend, l.Name)
 		return
 	}
 
-	backend := e.Backends[l.DefaultBackend]
+	backend := e.Backends[l.Backend]
 
 	target, err := balancer.Next()
 	if err != nil {
-		logging.Error("Balancer '%s' error: %v", l.DefaultBackend, err)
+		logging.Error("Balancer '%s' error: %v", l.Backend, err)
 		return
 	}
 

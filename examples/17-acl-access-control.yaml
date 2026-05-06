@@ -7,7 +7,7 @@ listeners:
   - name: "acl-proxy"
     bind: ":9000"
     protocol: "http"
-    default_backend: "backend"
+    backend: "backend"
     acl:
       - match:
           method: ["DELETE", "PUT"]

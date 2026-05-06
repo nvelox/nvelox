@@ -46,7 +46,7 @@ listeners:
       cert: "/etc/nvelox/ssl/api.pem"
       key:  "/etc/nvelox/ssl/api.key"
       min_version: "1.2"
-    default_backend: "api-backend"
+    backend: "api-backend"
     headers:
       response_set:
         Strict-Transport-Security: "max-age=63072000; includeSubDomains"
@@ -60,7 +60,7 @@ listeners:
     tls:
       cert: "/etc/nvelox/ssl/agent.pem"
       key:  "/etc/nvelox/ssl/agent.key"
-    default_backend: "agent-backend"
+    backend: "agent-backend"
 
   - name: "web-default"
     bind: ":443"
@@ -69,7 +69,7 @@ listeners:
     tls:
       cert: "/etc/nvelox/ssl/wildcard.pem"
       key:  "/etc/nvelox/ssl/wildcard.key"
-    default_backend: "web-backend"
+    backend: "web-backend"
 
 backends:
   - name: "api-backend"

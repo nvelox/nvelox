@@ -7,7 +7,7 @@ listeners:
   - name: "http-lb"
     bind: ":9000"
     protocol: "http"
-    default_backend: "web-pool"
+    backend: "web-pool"
 backends:
   - name: "web-pool"
     balance: "leastconn"

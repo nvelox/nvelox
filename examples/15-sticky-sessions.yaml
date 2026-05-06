@@ -7,7 +7,7 @@ listeners:
   - name: "sticky"
     bind: ":9000"
     protocol: "http"
-    default_backend: "pool"
+    backend: "pool"
 backends:
   - name: "pool"
     balance: "roundrobin"

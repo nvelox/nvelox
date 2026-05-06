@@ -28,7 +28,7 @@ func TestHTTP_AccessLogging(t *testing.T) {
 		Logging: config.LoggingConfig{Level: "debug", AccessLog: accessLogPath},
 		Listeners: []config.Listener{{
 			Name: "log-test", Bind: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-			Protocol: "http", DefaultBackend: "be",
+			Protocol: "http", Backend:         "be",
 		}},
 		Backends: []config.Backend{{
 			Name: "be", Balance: "roundrobin", Servers: []string{backend},
@@ -38,7 +38,7 @@ func TestHTTP_AccessLogging(t *testing.T) {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{{
 		Name: "log-test", Addr: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-		Protocol: "http", DefaultBackend: "be", Port: proxyPort,
+		Protocol: "http", Backend:         "be", Port: proxyPort,
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -86,7 +86,7 @@ func TestHTTP_ConfigurableTimeout(t *testing.T) {
 		Logging: config.LoggingConfig{Level: "debug"},
 		Listeners: []config.Listener{{
 			Name: "timeout-test", Bind: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-			Protocol: "http", DefaultBackend: "be",
+			Protocol: "http", Backend:         "be",
 			Timeouts: config.TimeoutConfig{Connect: "2s", Read: "5s"},
 		}},
 		Backends: []config.Backend{{
@@ -98,7 +98,7 @@ func TestHTTP_ConfigurableTimeout(t *testing.T) {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{{
 		Name: "timeout-test", Addr: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-		Protocol: "http", DefaultBackend: "be", Port: proxyPort,
+		Protocol: "http", Backend:         "be", Port: proxyPort,
 		Timeouts: config.TimeoutConfig{Connect: "2s", Read: "5s"},
 	}}
 

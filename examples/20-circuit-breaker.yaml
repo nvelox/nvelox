@@ -7,7 +7,7 @@ listeners:
   - name: "cb-proxy"
     bind: ":9000"
     protocol: "http"
-    default_backend: "fragile"
+    backend: "fragile"
 backends:
   - name: "fragile"
     balance: "roundrobin"

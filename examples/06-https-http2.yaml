@@ -8,7 +8,7 @@ listeners:
   - name: "https-h2"
     bind: ":9443"
     protocol: "https"
-    default_backend: "backend"
+    backend: "backend"
     tls:
       cert: "examples/certs/server.pem"
       key: "examples/certs/server-key.pem"

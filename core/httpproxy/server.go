@@ -91,11 +91,11 @@ type HTTPServer struct {
 
 // ListenerConfig mirrors core.ListenerConfig to avoid circular imports.
 type ListenerConfig struct {
-	Name           string
-	Addr           string
-	Protocol       string
-	DefaultBackend string
-	Port           int
+	Name     string
+	Addr     string
+	Protocol string
+	Backend  string
+	Port     int
 	TLS            *config.TLSConfig
 	HTTP3          bool
 	Routes         []config.RouteConfig
@@ -120,7 +120,7 @@ type ListenerConfig struct {
 func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends map[string]*config.Backend, rateLimiter interface{ Allow() bool }, connLimiters map[string]ConnLimiterI, passiveHealth map[string]PassiveHealthI, stickyStores map[string]*sticky.Store, circuitBreakers map[string]CircuitBreakerI) *HTTPServer {
 	s := &HTTPServer{
 		Listener:      l,
-		router:        NewRouter(l.Routes, l.DefaultBackend),
+		router:        NewRouter(l.Routes, l.Backend),
 		Balancers:     balancers,
 		Backends:      backends,
 		ConnLimiters:  connLimiters,

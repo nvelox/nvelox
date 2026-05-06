@@ -88,7 +88,7 @@ backends:
 	engine := core.NewEngine(cfg)
 	// Mock Listeners
 	engine.Listeners = []*core.ListenerConfig{
-		{Name: "l1", Addr: ":9999", Protocol: "tcp", DefaultBackend: "b1"},
+		{Name: "l1", Addr: ":9999", Protocol: "tcp", Backend:         "b1"},
 	}
 
 	// 8. Run initBackends (manually triggering internal method logic by mocking)

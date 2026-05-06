@@ -79,7 +79,7 @@ func TestWebSocket_Proxy(t *testing.T) {
 		Logging: config.LoggingConfig{Level: "debug"},
 		Listeners: []config.Listener{{
 			Name: "ws-test", Bind: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-			Protocol: "http", DefaultBackend: "ws-be",
+			Protocol: "http", Backend:         "ws-be",
 		}},
 		Backends: []config.Backend{{
 			Name: "ws-be", Balance: "roundrobin", Servers: []string{wsBackend},
@@ -89,7 +89,7 @@ func TestWebSocket_Proxy(t *testing.T) {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{{
 		Name: "ws-test", Addr: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-		Protocol: "http", DefaultBackend: "ws-be", Port: proxyPort,
+		Protocol: "http", Backend:         "ws-be", Port: proxyPort,
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())

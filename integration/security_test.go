@@ -22,7 +22,7 @@ func TestHTTP_IPDenylist(t *testing.T) {
 		Logging: config.LoggingConfig{Level: "debug"},
 		Listeners: []config.Listener{{
 			Name: "deny-test", Bind: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-			Protocol: "http", DefaultBackend: "be",
+			Protocol: "http", Backend:         "be",
 			IPDenylist: []string{"127.0.0.1"},
 		}},
 		Backends: []config.Backend{{
@@ -33,7 +33,7 @@ func TestHTTP_IPDenylist(t *testing.T) {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{{
 		Name: "deny-test", Addr: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-		Protocol: "http", DefaultBackend: "be", Port: proxyPort,
+		Protocol: "http", Backend:         "be", Port: proxyPort,
 		IPDenylist: []string{"127.0.0.1"},
 	}}
 
@@ -64,7 +64,7 @@ func TestHTTP_ACL_DenyMethod(t *testing.T) {
 		Logging: config.LoggingConfig{Level: "debug"},
 		Listeners: []config.Listener{{
 			Name: "acl-test", Bind: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-			Protocol: "http", DefaultBackend: "be",
+			Protocol: "http", Backend:         "be",
 			ACL: []config.ACLRule{
 				{Match: config.ACLMatch{Method: []string{"DELETE"}}, Action: "deny"},
 			},
@@ -77,7 +77,7 @@ func TestHTTP_ACL_DenyMethod(t *testing.T) {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{{
 		Name: "acl-test", Addr: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-		Protocol: "http", DefaultBackend: "be", Port: proxyPort,
+		Protocol: "http", Backend:         "be", Port: proxyPort,
 		ACL: []config.ACLRule{
 			{Match: config.ACLMatch{Method: []string{"DELETE"}}, Action: "deny"},
 		},
@@ -125,7 +125,7 @@ func TestHTTP_MaxBodySize(t *testing.T) {
 		Logging: config.LoggingConfig{Level: "debug"},
 		Listeners: []config.Listener{{
 			Name: "body-test", Bind: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-			Protocol: "http", DefaultBackend: "be",
+			Protocol: "http", Backend:         "be",
 			MaxBodySize: "100B",
 		}},
 		Backends: []config.Backend{{
@@ -136,7 +136,7 @@ func TestHTTP_MaxBodySize(t *testing.T) {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{{
 		Name: "body-test", Addr: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-		Protocol: "http", DefaultBackend: "be", Port: proxyPort,
+		Protocol: "http", Backend:         "be", Port: proxyPort,
 		MaxBodySize: "100B",
 	}}
 
@@ -186,7 +186,7 @@ func TestHTTP_PerIPRateLimit(t *testing.T) {
 		Logging: config.LoggingConfig{Level: "debug"},
 		Listeners: []config.Listener{{
 			Name: "iprl-test", Bind: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-			Protocol: "http", DefaultBackend: "be",
+			Protocol: "http", Backend:         "be",
 			IPRateLimit: config.IPRateLimitConfig{RequestsPerSecond: 5, Burst: 2},
 		}},
 		Backends: []config.Backend{{
@@ -197,7 +197,7 @@ func TestHTTP_PerIPRateLimit(t *testing.T) {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{{
 		Name: "iprl-test", Addr: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-		Protocol: "http", DefaultBackend: "be", Port: proxyPort,
+		Protocol: "http", Backend:         "be", Port: proxyPort,
 		IPRateLimit: config.IPRateLimitConfig{RequestsPerSecond: 5, Burst: 2},
 	}}
 

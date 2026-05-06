@@ -7,7 +7,7 @@ listeners:
   - name: "path-router"
     bind: ":9000"
     protocol: "http"
-    default_backend: "web"
+    backend: "web"
     routes:
       - match:
           path_prefix: "/api"

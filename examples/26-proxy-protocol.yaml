@@ -7,7 +7,7 @@ listeners:
   - name: "pp-proxy"
     bind: ":9000"
     protocol: "tcp"
-    default_backend: "pp-backend"
+    backend: "pp-backend"
 backends:
   - name: "pp-backend"
     balance: "roundrobin"

@@ -8,7 +8,7 @@ listeners:
   - name: "redirector"
     bind: ":9000"
     protocol: "http"
-    default_backend: "backend"
+    backend: "backend"
     routes:
       - match:
           path_prefix: "/old"

@@ -7,7 +7,7 @@ listeners:
   - name: "cached"
     bind: ":9000"
     protocol: "http"
-    default_backend: "backend"
+    backend: "backend"
     cache:
       enabled: true
       max_size: "64MB"

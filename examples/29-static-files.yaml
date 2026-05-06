@@ -15,7 +15,7 @@ listeners:
   - name: "web"
     bind: ":9000"
     protocol: "http"
-    default_backend: "php"
+    backend: "php"
     routes:
       # Static assets with 1 year cache
       - match:

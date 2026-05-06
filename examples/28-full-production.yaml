@@ -25,7 +25,7 @@ listeners:
   - name: "http-redirect"
     bind: ":9080"
     protocol: "http"
-    default_backend: "web"
+    backend: "web"
     routes:
       - match:
           path_prefix: "/"
@@ -37,7 +37,7 @@ listeners:
   - name: "https-main"
     bind: ":9443"
     protocol: "https"
-    default_backend: "web"
+    backend: "web"
     tls:
       cert: "examples/certs/server.pem"
       key: "examples/certs/server-key.pem"
@@ -62,7 +62,7 @@ listeners:
   - name: "game-ports"
     bind: ":9100-9105"
     protocol: "tcp"
-    default_backend: "game"
+    backend: "game"
 
 backends:
   - name: "web"

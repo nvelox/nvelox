@@ -77,11 +77,22 @@ type LoggingConfig struct {
 //     DefaultServer: true. If no default exists, the connection is
 //     closed (or 421 returned, depending on strict_sni).
 type Listener struct {
-	Name           string `yaml:"name"`
-	Bind           string `yaml:"bind"`            // e.g., ":80" or "*:1024-2048"
-	Protocol       string `yaml:"protocol"`        // "tcp", "udp", "http", "https"
-	ZeroCopy       bool   `yaml:"zero_copy"`       // Use splice for TCP
-	DefaultBackend string `yaml:"default_backend"` // Name of the backend pool
+	Name     string `yaml:"name"`
+	Bind     string `yaml:"bind"`     // e.g., ":80" or "*:1024-2048"
+	Protocol string `yaml:"protocol"` // "tcp", "udp", "http", "https"
+	ZeroCopy bool   `yaml:"zero_copy"`
+
+	// Backend names the upstream pool. For TCP/UDP listeners it's the
+	// pool every connection is forwarded to. For HTTP/HTTPS listeners
+	// with `routes:` it's the fallback when no route matches; without
+	// `routes:` it's the single destination.
+	Backend string `yaml:"backend,omitempty"`
+
+	// DefaultBackend is the legacy YAML key (HAProxy-style). New configs
+	// should use `backend:` instead. Setting both is a config error;
+	// setting only this field still works and logs a deprecation warning
+	// at load time. Will be removed in a future release.
+	DefaultBackend string `yaml:"default_backend,omitempty"`
 
 	// Multi-server-per-port (nginx-style).
 	// ServerNames are SNI / Host names this listener answers to. Wildcards
@@ -441,8 +452,20 @@ func Load(path string) (*Config, error) {
 		cfg.Logging.Level = "info"
 	}
 	for i := range cfg.Listeners {
-		if cfg.Listeners[i].Protocol == "" {
-			cfg.Listeners[i].Protocol = "tcp"
+		l := &cfg.Listeners[i]
+		if l.Protocol == "" {
+			l.Protocol = "tcp"
+		}
+		// Migrate the deprecated `default_backend:` key into `backend:`.
+		// Setting both is a load error — it's almost always a typo or a
+		// half-finished migration and we shouldn't silently pick one.
+		if l.DefaultBackend != "" {
+			if l.Backend != "" {
+				return nil, fmt.Errorf("listener %s: both 'backend' and 'default_backend' are set — use 'backend' only", l.Name)
+			}
+			fmt.Fprintf(os.Stderr, "[CONFIG] listener %s: 'default_backend' is deprecated; use 'backend' instead\n", l.Name)
+			l.Backend = l.DefaultBackend
+			l.DefaultBackend = ""
 		}
 	}
 
@@ -520,8 +543,8 @@ func validate(cfg *Config) error {
 		if l.Bind == "" {
 			return fmt.Errorf("listener %s must have a bind address", l.Name)
 		}
-		if l.DefaultBackend != "" && !backendNames[l.DefaultBackend] {
-			return fmt.Errorf("listener %s references unknown backend: %s", l.Name, l.DefaultBackend)
+		if l.Backend != "" && !backendNames[l.Backend] {
+			return fmt.Errorf("listener %s references unknown backend: %s", l.Name, l.Backend)
 		}
 
 		// Validate bind address format
@@ -559,8 +582,8 @@ func validate(cfg *Config) error {
 
 		// Validate HTTP/HTTPS listener requirements
 		if l.Protocol == "http" || l.Protocol == "https" {
-			if l.DefaultBackend == "" && len(l.Routes) == 0 {
-				return fmt.Errorf("listener %s: HTTP listener requires default_backend or routes", l.Name)
+			if l.Backend == "" && len(l.Routes) == 0 {
+				return fmt.Errorf("listener %s: HTTP listener requires 'backend' or 'routes'", l.Name)
 			}
 			if l.Protocol == "https" && l.TLS.Cert == "" {
 				return fmt.Errorf("listener %s: HTTPS listener requires TLS cert/key", l.Name)

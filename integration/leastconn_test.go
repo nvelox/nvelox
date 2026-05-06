@@ -26,7 +26,7 @@ func TestLeastConn_EvenDistribution(t *testing.T) {
 				Name:           "lc-test",
 				Bind:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 				Protocol:       "tcp",
-				DefaultBackend: "lc-pool",
+				Backend:         "lc-pool",
 			},
 		},
 		Backends: []config.Backend{
@@ -44,7 +44,7 @@ func TestLeastConn_EvenDistribution(t *testing.T) {
 			Name:           "lc-test",
 			Addr:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 			Protocol:       "tcp",
-			DefaultBackend: "lc-pool",
+			Backend:         "lc-pool",
 			Port:           proxyPort,
 		},
 	}
@@ -121,7 +121,7 @@ func TestLeastConn_FailedDial_NoDoubleDecrement(t *testing.T) {
 				Name:           "lc-fail-test",
 				Bind:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 				Protocol:       "tcp",
-				DefaultBackend: "lc-fail-pool",
+				Backend:         "lc-fail-pool",
 			},
 		},
 		Backends: []config.Backend{
@@ -139,7 +139,7 @@ func TestLeastConn_FailedDial_NoDoubleDecrement(t *testing.T) {
 			Name:           "lc-fail-test",
 			Addr:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 			Protocol:       "tcp",
-			DefaultBackend: "lc-fail-pool",
+			Backend:         "lc-fail-pool",
 			Port:           proxyPort,
 		},
 	}

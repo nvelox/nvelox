@@ -7,7 +7,7 @@ listeners:
   - name: "http-hc"
     bind: ":9000"
     protocol: "http"
-    default_backend: "checked-pool"
+    backend: "checked-pool"
 backends:
   - name: "checked-pool"
     balance: "roundrobin"

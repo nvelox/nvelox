@@ -74,7 +74,7 @@ func TestTLS_EndToEnd(t *testing.T) {
 				Name:           "tls-test",
 				Bind:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 				Protocol:       "tcp",
-				DefaultBackend: "tls-pool",
+				Backend:         "tls-pool",
 			},
 		},
 		Backends: []config.Backend{
@@ -92,7 +92,7 @@ func TestTLS_EndToEnd(t *testing.T) {
 			Name:           "tls-test",
 			Addr:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 			Protocol:       "tcp",
-			DefaultBackend: "tls-pool",
+			Backend:         "tls-pool",
 			Port:           proxyPort,
 			TLS: &config.TLSConfig{
 				Cert: certFile,
@@ -166,7 +166,7 @@ func TestTLS_PlaintextClientFails(t *testing.T) {
 				Name:           "tls-plain-test",
 				Bind:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 				Protocol:       "tcp",
-				DefaultBackend: "tls-pool2",
+				Backend:         "tls-pool2",
 			},
 		},
 		Backends: []config.Backend{
@@ -184,7 +184,7 @@ func TestTLS_PlaintextClientFails(t *testing.T) {
 			Name:           "tls-plain-test",
 			Addr:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 			Protocol:       "tcp",
-			DefaultBackend: "tls-pool2",
+			Backend:         "tls-pool2",
 			Port:           proxyPort,
 			TLS: &config.TLSConfig{
 				Cert: certFile,
@@ -239,7 +239,7 @@ func TestTLS_InvalidCertFails(t *testing.T) {
 			Name:           "bad-tls",
 			Addr:           "127.0.0.1:19999",
 			Protocol:       "tcp",
-			DefaultBackend: "pool",
+			Backend:         "pool",
 			Port:           19999,
 			TLS: &config.TLSConfig{
 				Cert: certFile,

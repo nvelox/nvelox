@@ -96,7 +96,7 @@ func TestEndToEndTCP(t *testing.T) {
 			Protocol:       "tcp",
 			Addr:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 			Port:           proxyPort,
-			DefaultBackend: "backend1",
+			Backend:         "backend1",
 		},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -200,7 +200,7 @@ func TestEndToEndUDP(t *testing.T) {
 			Protocol:       "udp",
 			Addr:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 			Port:           proxyPort,
-			DefaultBackend: "backend-udp",
+			Backend:         "backend-udp",
 		},
 	}
 
@@ -259,8 +259,8 @@ func TestEndToEndMixed(t *testing.T) {
 	}
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{
-		{Name: "mix-tcp", Protocol: "tcp", Addr: fmt.Sprintf("127.0.0.1:%d", tcpPort), Port: tcpPort, DefaultBackend: "backend-tcp"},
-		{Name: "mix-udp", Protocol: "udp", Addr: fmt.Sprintf("127.0.0.1:%d", udpPort), Port: udpPort, DefaultBackend: "backend-udp"},
+		{Name: "mix-tcp", Protocol: "tcp", Addr: fmt.Sprintf("127.0.0.1:%d", tcpPort), Port: tcpPort, Backend:         "backend-tcp"},
+		{Name: "mix-udp", Protocol: "udp", Addr: fmt.Sprintf("127.0.0.1:%d", udpPort), Port: udpPort, Backend:         "backend-udp"},
 	}
 
 	// 4. Start

@@ -7,7 +7,7 @@ listeners:
   - name: "tcp-proxy"
     bind: ":9000"
     protocol: "tcp"
-    default_backend: "echo-servers"
+    backend: "echo-servers"
 backends:
   - name: "echo-servers"
     balance: "roundrobin"

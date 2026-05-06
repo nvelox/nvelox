@@ -7,7 +7,7 @@ listeners:
   - name: "regex-rewrite"
     bind: ":9000"
     protocol: "http"
-    default_backend: "backend"
+    backend: "backend"
     routes:
       - match:
           path_regex: "^/api/v(\\d+)/(.*)"

@@ -7,7 +7,7 @@ listeners:
   - name: "maxconn"
     bind: ":9000"
     protocol: "http"
-    default_backend: "limited"
+    backend: "limited"
 backends:
   - name: "limited"
     balance: "roundrobin"

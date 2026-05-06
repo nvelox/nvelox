@@ -47,7 +47,7 @@ func TestHTTP_BasicProxy(t *testing.T) {
 			Name:           "http-test",
 			Bind:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 			Protocol:       "http",
-			DefaultBackend: "web",
+			Backend:         "web",
 		}},
 		Backends: []config.Backend{{
 			Name:    "web",
@@ -61,7 +61,7 @@ func TestHTTP_BasicProxy(t *testing.T) {
 		Name:           "http-test",
 		Addr:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 		Protocol:       "http",
-		DefaultBackend: "web",
+		Backend:         "web",
 		Port:           proxyPort,
 	}}
 
@@ -97,7 +97,7 @@ func TestHTTP_HostRouting(t *testing.T) {
 			Name:     "http-route-test",
 			Bind:     fmt.Sprintf("127.0.0.1:%d", proxyPort),
 			Protocol: "http",
-			DefaultBackend: "web",
+			Backend:         "web",
 		}},
 		Backends: []config.Backend{
 			{Name: "api", Balance: "roundrobin", Servers: []string{apiBackend}},
@@ -110,7 +110,7 @@ func TestHTTP_HostRouting(t *testing.T) {
 		Name:           "http-route-test",
 		Addr:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 		Protocol:       "http",
-		DefaultBackend: "web",
+		Backend:         "web",
 		Port:           proxyPort,
 		Routes: []config.RouteConfig{
 			{Match: config.RouteMatch{Host: "api.test"}, Backend: "api"},
@@ -166,7 +166,7 @@ func TestHTTP_PathRouting(t *testing.T) {
 			Name:     "http-path-test",
 			Bind:     fmt.Sprintf("127.0.0.1:%d", proxyPort),
 			Protocol: "http",
-			DefaultBackend: "api",
+			Backend:         "api",
 		}},
 		Backends: []config.Backend{
 			{Name: "api", Balance: "roundrobin", Servers: []string{apiBackend}},
@@ -179,7 +179,7 @@ func TestHTTP_PathRouting(t *testing.T) {
 		Name:           "http-path-test",
 		Addr:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 		Protocol:       "http",
-		DefaultBackend: "api",
+		Backend:         "api",
 		Port:           proxyPort,
 		Routes: []config.RouteConfig{
 			{Match: config.RouteMatch{PathPrefix: "/static"}, Backend: "static"},
@@ -236,7 +236,7 @@ func TestHTTP_ForwardedHeaders(t *testing.T) {
 		Logging: config.LoggingConfig{Level: "debug"},
 		Listeners: []config.Listener{{
 			Name: "hdr-test", Bind: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-			Protocol: "http", DefaultBackend: "be",
+			Protocol: "http", Backend:         "be",
 		}},
 		Backends: []config.Backend{{
 			Name: "be", Balance: "roundrobin", Servers: []string{ln.Addr().String()},
@@ -246,7 +246,7 @@ func TestHTTP_ForwardedHeaders(t *testing.T) {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{{
 		Name: "hdr-test", Addr: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-		Protocol: "http", DefaultBackend: "be", Port: proxyPort,
+		Protocol: "http", Backend:         "be", Port: proxyPort,
 		Headers: config.HeadersConfig{
 			RequestAdd: map[string]string{"X-Custom": "nvelox"},
 		},
@@ -288,7 +288,7 @@ func TestHTTPS_HTTP2(t *testing.T) {
 		Logging: config.LoggingConfig{Level: "debug"},
 		Listeners: []config.Listener{{
 			Name: "https-test", Bind: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-			Protocol: "https", DefaultBackend: "be",
+			Protocol: "https", Backend:         "be",
 			TLS: config.TLSConfig{Cert: certFile, Key: keyFile},
 		}},
 		Backends: []config.Backend{{
@@ -299,7 +299,7 @@ func TestHTTPS_HTTP2(t *testing.T) {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{{
 		Name: "https-test", Addr: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-		Protocol: "https", DefaultBackend: "be", Port: proxyPort,
+		Protocol: "https", Backend:         "be", Port: proxyPort,
 		TLS: &config.TLSConfig{Cert: certFile, Key: keyFile},
 	}}
 
@@ -346,7 +346,7 @@ func TestHTTP3(t *testing.T) {
 		Logging: config.LoggingConfig{Level: "debug"},
 		Listeners: []config.Listener{{
 			Name: "h3-test", Bind: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-			Protocol: "https", DefaultBackend: "be", HTTP3: true,
+			Protocol: "https", Backend:         "be", HTTP3: true,
 			TLS: config.TLSConfig{Cert: certFile, Key: keyFile},
 		}},
 		Backends: []config.Backend{{
@@ -357,7 +357,7 @@ func TestHTTP3(t *testing.T) {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{{
 		Name: "h3-test", Addr: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-		Protocol: "https", DefaultBackend: "be", Port: proxyPort, HTTP3: true,
+		Protocol: "https", Backend:         "be", Port: proxyPort, HTTP3: true,
 		TLS: &config.TLSConfig{Cert: certFile, Key: keyFile},
 	}}
 
@@ -423,8 +423,8 @@ func TestHTTP_MixedWithTCP(t *testing.T) {
 		Version: "2",
 		Logging: config.LoggingConfig{Level: "debug"},
 		Listeners: []config.Listener{
-			{Name: "http-l", Bind: fmt.Sprintf("127.0.0.1:%d", httpPort), Protocol: "http", DefaultBackend: "http-be"},
-			{Name: "tcp-l", Bind: fmt.Sprintf("127.0.0.1:%d", tcpPort), Protocol: "tcp", DefaultBackend: "tcp-be"},
+			{Name: "http-l", Bind: fmt.Sprintf("127.0.0.1:%d", httpPort), Protocol: "http", Backend:         "http-be"},
+			{Name: "tcp-l", Bind: fmt.Sprintf("127.0.0.1:%d", tcpPort), Protocol: "tcp", Backend:         "tcp-be"},
 		},
 		Backends: []config.Backend{
 			{Name: "http-be", Balance: "roundrobin", Servers: []string{httpBackend}},
@@ -434,8 +434,8 @@ func TestHTTP_MixedWithTCP(t *testing.T) {
 
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{
-		{Name: "http-l", Addr: fmt.Sprintf("127.0.0.1:%d", httpPort), Protocol: "http", DefaultBackend: "http-be", Port: httpPort},
-		{Name: "tcp-l", Addr: fmt.Sprintf("127.0.0.1:%d", tcpPort), Protocol: "tcp", DefaultBackend: "tcp-be", Port: tcpPort},
+		{Name: "http-l", Addr: fmt.Sprintf("127.0.0.1:%d", httpPort), Protocol: "http", Backend:         "http-be", Port: httpPort},
+		{Name: "tcp-l", Addr: fmt.Sprintf("127.0.0.1:%d", tcpPort), Protocol: "tcp", Backend:         "tcp-be", Port: tcpPort},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

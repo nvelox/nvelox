@@ -8,7 +8,7 @@ listeners:
   - name: "tls-proxy"
     bind: ":9443"
     protocol: "tcp"
-    default_backend: "backend"
+    backend: "backend"
     tls:
       cert: "examples/certs/server.pem"
       key: "examples/certs/server-key.pem"

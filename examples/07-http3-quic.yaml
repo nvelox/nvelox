@@ -9,7 +9,7 @@ listeners:
     bind: ":9443"
     protocol: "https"
     http3: true
-    default_backend: "backend"
+    backend: "backend"
     tls:
       cert: "examples/certs/server.pem"
       key: "examples/certs/server-key.pem"

@@ -165,19 +165,19 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 }
 
 func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerConfig) {
-	balancer, ok := h.engine.Balancers[l.DefaultBackend]
+	balancer, ok := h.engine.Balancers[l.Backend]
 	if !ok {
-		logging.Error("Balancer '%s' not found for listener '%s'", l.DefaultBackend, l.Name)
+		logging.Error("Balancer '%s' not found for listener '%s'", l.Backend, l.Name)
 		clientConn.Close()
 		return
 	}
 
 	// Get backend config to check SendProxyV2
-	backend := h.engine.Backends[l.DefaultBackend]
+	backend := h.engine.Backends[l.Backend]
 
 	target, err := balancer.Next()
 	if err != nil {
-		logging.Error("Balancer '%s' error: %v", l.DefaultBackend, err)
+		logging.Error("Balancer '%s' error: %v", l.Backend, err)
 		clientConn.Close()
 		return
 	}

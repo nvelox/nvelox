@@ -149,7 +149,7 @@ listeners:
   - name: "web"
     bind: ":80"
     protocol: "http"
-    default_backend: "servers"
+    backend: "servers"
 backends:
   - name: "servers"
     balance: "roundrobin"
@@ -167,7 +167,7 @@ listeners:
     tls:
       cert: "/etc/ssl/cert.pem"
       key: "/etc/ssl/key.pem"
-    default_backend: "web"
+    backend: "web"
     compression:
       enabled: true
     headers:
@@ -241,7 +241,7 @@ listeners:
     tls:
       cert: "/etc/ssl/cert.pem"
       key: "/etc/ssl/key.pem"
-    default_backend: "web"
+    backend: "web"
     compression: { enabled: true }
     ip_rate_limit: { requests_per_second: 100, burst: 50 }
     routes:

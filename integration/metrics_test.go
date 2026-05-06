@@ -28,7 +28,7 @@ func TestMetrics_Endpoint(t *testing.T) {
 		},
 		Listeners: []config.Listener{{
 			Name: "metrics-test", Bind: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-			Protocol: "http", DefaultBackend: "be",
+			Protocol: "http", Backend:         "be",
 		}},
 		Backends: []config.Backend{{
 			Name: "be", Balance: "roundrobin", Servers: []string{backend},
@@ -38,7 +38,7 @@ func TestMetrics_Endpoint(t *testing.T) {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{{
 		Name: "metrics-test", Addr: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-		Protocol: "http", DefaultBackend: "be", Port: proxyPort,
+		Protocol: "http", Backend:         "be", Port: proxyPort,
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())

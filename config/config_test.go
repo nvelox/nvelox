@@ -392,20 +392,20 @@ func TestValidation_FullValid(t *testing.T) {
 				Name:           "http",
 				Bind:           ":80",
 				Protocol:       "tcp",
-				DefaultBackend: "web",
+				Backend: "web",
 			},
 			{
 				Name:           "https",
 				Bind:           ":443",
 				Protocol:       "tcp",
-				DefaultBackend: "web",
+				Backend: "web",
 				TLS:            TLSConfig{Cert: certFile, Key: keyFile},
 			},
 			{
 				Name:           "range",
 				Bind:           "0.0.0.0:3000-3005",
 				Protocol:       "tcp",
-				DefaultBackend: "web",
+				Backend: "web",
 			},
 		},
 		Backends: []Backend{
@@ -448,7 +448,7 @@ func TestValidation_HTTPListener(t *testing.T) {
 
 	t.Run("http with default_backend is valid", func(t *testing.T) {
 		cfg := base()
-		cfg.Listeners = []Listener{{Name: "l1", Bind: ":80", Protocol: "http", DefaultBackend: "web"}}
+		cfg.Listeners = []Listener{{Name: "l1", Bind: ":80", Protocol: "http", Backend: "web"}}
 		if err := validate(cfg); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -517,7 +517,7 @@ func TestValidation_HTTP3(t *testing.T) {
 			Backends: []Backend{{Name: "web", Servers: []string{"10.0.0.1:80"}}},
 			Listeners: []Listener{{
 				Name: "l1", Bind: ":80", Protocol: "http",
-				HTTP3: true, DefaultBackend: "web",
+				HTTP3: true, Backend: "web",
 			}},
 		}
 		if err := validate(cfg); err == nil {
@@ -537,7 +537,7 @@ func TestValidation_HTTP3(t *testing.T) {
 			Backends: []Backend{{Name: "web", Servers: []string{"10.0.0.1:80"}}},
 			Listeners: []Listener{{
 				Name: "l1", Bind: ":443", Protocol: "https",
-				HTTP3: true, DefaultBackend: "web",
+				HTTP3: true, Backend: "web",
 				TLS: TLSConfig{Cert: certFile, Key: keyFile},
 			}},
 		}
@@ -638,7 +638,7 @@ func TestValidateServerName(t *testing.T) {
 func mkListener(name, bind, proto string) Listener {
 	return Listener{
 		Name: name, Bind: bind, Protocol: proto,
-		DefaultBackend: "be",
+		Backend: "be",
 	}
 }
 
@@ -732,5 +732,55 @@ func TestValidateBindGroups_Rejections(t *testing.T) {
 				t.Errorf("error %q does not contain %q", err.Error(), c.want)
 			}
 		})
+	}
+}
+
+// TestLoad_BackendAlias verifies the `default_backend:` YAML key still
+// works (with deprecation warning) and migrates into Backend.
+func TestLoad_BackendAlias(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Legacy YAML using default_backend → migrates to Backend, no error.
+	legacy := filepath.Join(tmpDir, "legacy.yaml")
+	os.WriteFile(legacy, []byte(`
+version: '2'
+listeners:
+  - name: l1
+    bind: ":80"
+    protocol: tcp
+    default_backend: be
+backends:
+  - name: be
+    servers: ["127.0.0.1:8080"]
+`), 0644)
+	cfg, err := Load(legacy)
+	if err != nil {
+		t.Fatalf("legacy default_backend should still load: %v", err)
+	}
+	if cfg.Listeners[0].Backend != "be" {
+		t.Errorf("default_backend not migrated: Backend=%q", cfg.Listeners[0].Backend)
+	}
+	if cfg.Listeners[0].DefaultBackend != "" {
+		t.Errorf("DefaultBackend not cleared after migration: %q", cfg.Listeners[0].DefaultBackend)
+	}
+
+	// Both keys set is an error — protects against half-finished migration.
+	conflict := filepath.Join(tmpDir, "conflict.yaml")
+	os.WriteFile(conflict, []byte(`
+version: '2'
+listeners:
+  - name: l1
+    bind: ":80"
+    protocol: tcp
+    backend: be
+    default_backend: also-be
+backends:
+  - name: be
+    servers: ["127.0.0.1:8080"]
+  - name: also-be
+    servers: ["127.0.0.1:8081"]
+`), 0644)
+	if _, err := Load(conflict); err == nil {
+		t.Error("setting both backend and default_backend must error")
 	}
 }

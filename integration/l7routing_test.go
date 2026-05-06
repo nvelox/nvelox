@@ -21,7 +21,7 @@ func TestHTTP_Redirect(t *testing.T) {
 		Logging: config.LoggingConfig{Level: "debug"},
 		Listeners: []config.Listener{{
 			Name: "redir-test", Bind: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-			Protocol: "http", DefaultBackend: "be",
+			Protocol: "http", Backend:         "be",
 		}},
 		Backends: []config.Backend{{
 			Name: "be", Balance: "roundrobin",
@@ -32,7 +32,7 @@ func TestHTTP_Redirect(t *testing.T) {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{{
 		Name: "redir-test", Addr: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-		Protocol: "http", DefaultBackend: "be", Port: proxyPort,
+		Protocol: "http", Backend:         "be", Port: proxyPort,
 		Routes: []config.RouteConfig{
 			{
 				Match:    config.RouteMatch{PathPrefix: "/old"},
@@ -76,7 +76,7 @@ func TestHTTP_Compression(t *testing.T) {
 		Logging: config.LoggingConfig{Level: "debug"},
 		Listeners: []config.Listener{{
 			Name: "compress-test", Bind: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-			Protocol: "http", DefaultBackend: "be",
+			Protocol: "http", Backend:         "be",
 			Compression: config.CompressionConfig{Enabled: true},
 		}},
 		Backends: []config.Backend{{
@@ -87,7 +87,7 @@ func TestHTTP_Compression(t *testing.T) {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{{
 		Name: "compress-test", Addr: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-		Protocol: "http", DefaultBackend: "be", Port: proxyPort,
+		Protocol: "http", Backend:         "be", Port: proxyPort,
 		Compression: config.CompressionConfig{Enabled: true},
 	}}
 
@@ -136,7 +136,7 @@ func TestHTTP_RegexRouteWithRewrite(t *testing.T) {
 		Logging: config.LoggingConfig{Level: "debug"},
 		Listeners: []config.Listener{{
 			Name: "regex-test", Bind: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-			Protocol: "http", DefaultBackend: "be",
+			Protocol: "http", Backend:         "be",
 		}},
 		Backends: []config.Backend{{
 			Name: "be", Balance: "roundrobin", Servers: []string{backend},
@@ -146,7 +146,7 @@ func TestHTTP_RegexRouteWithRewrite(t *testing.T) {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{{
 		Name: "regex-test", Addr: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-		Protocol: "http", DefaultBackend: "be", Port: proxyPort,
+		Protocol: "http", Backend:         "be", Port: proxyPort,
 		Routes: []config.RouteConfig{
 			{
 				Match:   config.RouteMatch{PathRegex: `^/api/v(\d+)/(.*)`},

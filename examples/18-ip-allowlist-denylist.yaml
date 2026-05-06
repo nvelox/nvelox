@@ -7,7 +7,7 @@ listeners:
   - name: "ip-filter"
     bind: ":9000"
     protocol: "http"
-    default_backend: "backend"
+    backend: "backend"
     ip_allowlist:
       - "127.0.0.0/8"
       - "::1/128"

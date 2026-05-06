@@ -38,7 +38,7 @@ func TestHTTP_Retry_OnBackendFailure(t *testing.T) {
 		Logging: config.LoggingConfig{Level: "debug"},
 		Listeners: []config.Listener{{
 			Name: "retry-test", Bind: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-			Protocol: "http", DefaultBackend: "pool",
+			Protocol: "http", Backend:         "pool",
 		}},
 		Backends: []config.Backend{{
 			Name: "pool", Balance: "roundrobin",
@@ -50,7 +50,7 @@ func TestHTTP_Retry_OnBackendFailure(t *testing.T) {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{{
 		Name: "retry-test", Addr: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-		Protocol: "http", DefaultBackend: "pool", Port: proxyPort,
+		Protocol: "http", Backend:         "pool", Port: proxyPort,
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -84,7 +84,7 @@ func TestHTTP_MaxConnections(t *testing.T) {
 		Logging: config.LoggingConfig{Level: "debug"},
 		Listeners: []config.Listener{{
 			Name: "maxconn-test", Bind: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-			Protocol: "http", DefaultBackend: "pool",
+			Protocol: "http", Backend:         "pool",
 		}},
 		Backends: []config.Backend{{
 			Name: "pool", Balance: "roundrobin",
@@ -96,7 +96,7 @@ func TestHTTP_MaxConnections(t *testing.T) {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{{
 		Name: "maxconn-test", Addr: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-		Protocol: "http", DefaultBackend: "pool", Port: proxyPort,
+		Protocol: "http", Backend:         "pool", Port: proxyPort,
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -129,7 +129,7 @@ func TestHTTP_PassiveHealth(t *testing.T) {
 		Logging: config.LoggingConfig{Level: "debug"},
 		Listeners: []config.Listener{{
 			Name: "passive-test", Bind: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-			Protocol: "http", DefaultBackend: "pool",
+			Protocol: "http", Backend:         "pool",
 		}},
 		Backends: []config.Backend{{
 			Name: "pool", Balance: "roundrobin",
@@ -143,7 +143,7 @@ func TestHTTP_PassiveHealth(t *testing.T) {
 	engine := core.NewEngine(cfg)
 	engine.Listeners = []*core.ListenerConfig{{
 		Name: "passive-test", Addr: fmt.Sprintf("127.0.0.1:%d", proxyPort),
-		Protocol: "http", DefaultBackend: "pool", Port: proxyPort,
+		Protocol: "http", Backend:         "pool", Port: proxyPort,
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())

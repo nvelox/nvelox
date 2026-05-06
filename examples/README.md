@@ -635,13 +635,13 @@ listeners:
     protocol: https
     server_names: ["api.example.com"]
     tls: { cert: /etc/ssl/api.pem, key: /etc/ssl/api.key }
-    default_backend: api-backend
+    backend: api-backend
   - name: web-default
     bind: ":443"
     protocol: https
     default_server: true
     tls: { cert: /etc/ssl/wildcard.pem, key: /etc/ssl/wildcard.key }
-    default_backend: web-backend
+    backend: web-backend
 ```
 
 ---

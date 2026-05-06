@@ -8,7 +8,7 @@ listeners:
   - name: "range"
     bind: ":9000-9099"
     protocol: "tcp"
-    default_backend: "tunnel"
+    backend: "tunnel"
 backends:
   - name: "tunnel"
     balance: "roundrobin"

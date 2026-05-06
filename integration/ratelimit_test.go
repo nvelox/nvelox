@@ -25,7 +25,7 @@ func TestRateLimit_RejectsExcess(t *testing.T) {
 				Name:           "rl-test",
 				Bind:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 				Protocol:       "tcp",
-				DefaultBackend: "rl-pool",
+				Backend:         "rl-pool",
 				RateLimit: config.RateLimitConfig{
 					ConnectionsPerSecond: 5,
 					Burst:                3,
@@ -47,7 +47,7 @@ func TestRateLimit_RejectsExcess(t *testing.T) {
 			Name:           "rl-test",
 			Addr:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 			Protocol:       "tcp",
-			DefaultBackend: "rl-pool",
+			Backend:         "rl-pool",
 			Port:           proxyPort,
 			RateLimit: config.RateLimitConfig{
 				ConnectionsPerSecond: 5,
