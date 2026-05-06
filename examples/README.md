@@ -580,6 +580,72 @@ listeners:
 
 ---
 
+## 31 — Multi-Server-Per-Port (nginx-style)
+
+Multiple HTTPS sites can share one bind address (e.g. `:443`), each with
+its own TLS certificate, server_names, routes and policies. The right
+cert is selected by SNI; the request is then dispatched to the matching
+site by Host header.
+
+```bash
+# Build
+go build -o nvelox .
+
+# Validate the multi-site config (uses placeholder cert paths — adjust
+# to real certs to actually run it).
+./nvelox -config examples/31-multisite-per-port.yaml -test
+```
+
+Match precedence (both for cert selection and Host dispatch):
+
+1. **Exact** — `api.example.com` beats `*.example.com`.
+2. **Wildcard** — `*.foo.com` matches one extra leftmost label
+   (`api.foo.com` matches; `foo.com` and `x.y.foo.com` do not).
+3. **default_server** — catch-all when nothing matches. Optional; at
+   most one per bind group.
+
+Validation runs at config load — duplicate server_names, mixed
+protocols on the same port, missing server_names on a non-default site,
+and other footguns are caught before the listener starts.
+
+### Nvelox vs Nginx — multi-server config comparison
+
+**Nginx:**
+```nginx
+server {
+    listen 443 ssl;
+    server_name api.example.com;
+    ssl_certificate     /etc/ssl/api.pem;
+    ssl_certificate_key /etc/ssl/api.key;
+    location / { proxy_pass http://api-backend; }
+}
+server {
+    listen 443 ssl default_server;
+    ssl_certificate     /etc/ssl/wildcard.pem;
+    ssl_certificate_key /etc/ssl/wildcard.key;
+    location / { proxy_pass http://web-backend; }
+}
+```
+
+**Nvelox:**
+```yaml
+listeners:
+  - name: api-site
+    bind: ":443"
+    protocol: https
+    server_names: ["api.example.com"]
+    tls: { cert: /etc/ssl/api.pem, key: /etc/ssl/api.key }
+    default_backend: api-backend
+  - name: web-default
+    bind: ":443"
+    protocol: https
+    default_server: true
+    tls: { cert: /etc/ssl/wildcard.pem, key: /etc/ssl/wildcard.key }
+    default_backend: web-backend
+```
+
+---
+
 ## Cleanup
 
 ```bash

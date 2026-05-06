@@ -35,6 +35,7 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 - **Max Connections** — per-backend connection limit with 503 when full
 
 ### Routing (L7)
+- **Multi-server-per-port** — multiple HTTPS sites share one bind address (nginx-style); each picks its own TLS cert via SNI and dispatches by Host header. `server_names` + `default_server` control matching, leftmost wildcards (`*.foo.com`) supported.
 - **Host-based routing** — route by `Host` header (first-match-wins)
 - **Path prefix routing** — route by URL path prefix
 - **Regex routing** — regex path matching with capture groups

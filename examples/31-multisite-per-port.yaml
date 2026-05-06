@@ -1,0 +1,90 @@
+## 31 — Multi-Server-Per-Port (nginx-style)
+## Multiple listeners share the same bind address. Each one is a separate
+## "site" with its own TLS cert, server_names, routes, headers and ACLs.
+##
+## At connection time:
+##   - TLS cert is selected by SNI (exact > wildcard > default_server).
+##   - Once the handshake completes, the request is dispatched to the
+##     matching site by Host header (same precedence).
+##
+## Rules (validated at startup):
+##   - All sites on the same bind must share the same protocol.
+##   - At most one default_server: true per bind group.
+##   - Every non-default site in a multi-site group must declare
+##     server_names.
+##   - server_names must be unique across the bind group.
+##   - sni_routes (passthrough) and https (termination) cannot share a port.
+
+version: "2"
+logging:
+  level: "info"
+
+listeners:
+  # ── HTTP redirect on :80 ────────────────────────────────────────────
+  # One listener serves all hostnames here — we don't need server_names
+  # because there's only one site on this bind.
+  - name: "http-redirect"
+    bind: ":80"
+    protocol: "http"
+    routes:
+      - match:
+          path_prefix: "/"
+        redirect:
+          url: "https://${host}${path}"
+          code: 301
+
+  # ── Multi-site HTTPS on :443 ────────────────────────────────────────
+  # Three sites share the same socket. Each loads its own cert; SNI picks.
+
+  - name: "api-site"
+    bind: ":443"
+    protocol: "https"
+    server_names:
+      - "api.example.com"
+      - "api.example.org"
+    tls:
+      cert: "/etc/nvelox/ssl/api.pem"
+      key:  "/etc/nvelox/ssl/api.key"
+      min_version: "1.2"
+    default_backend: "api-backend"
+    headers:
+      response_set:
+        Strict-Transport-Security: "max-age=63072000; includeSubDomains"
+
+  - name: "agent-connect"
+    bind: ":443"
+    protocol: "https"
+    server_names:
+      - "connect.example.com"
+      - "*.region.example.com"      # leftmost-wildcard only
+    tls:
+      cert: "/etc/nvelox/ssl/agent.pem"
+      key:  "/etc/nvelox/ssl/agent.key"
+    default_backend: "agent-backend"
+
+  - name: "web-default"
+    bind: ":443"
+    protocol: "https"
+    default_server: true            # catch-all for unknown SNI / Host
+    tls:
+      cert: "/etc/nvelox/ssl/wildcard.pem"
+      key:  "/etc/nvelox/ssl/wildcard.key"
+    default_backend: "web-backend"
+
+backends:
+  - name: "api-backend"
+    balance: "roundrobin"
+    servers:
+      - "10.0.0.10:8080"
+      - "10.0.0.11:8080"
+
+  - name: "agent-backend"
+    balance: "leastconn"
+    servers:
+      - "10.0.0.20:9000"
+      - "10.0.0.21:9000"
+
+  - name: "web-backend"
+    balance: "roundrobin"
+    servers:
+      - "10.0.0.30:80"
