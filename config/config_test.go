@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -600,5 +601,136 @@ func TestResolveIncludeGlob_Accepts(t *testing.T) {
 	matches, err = resolveIncludeGlob("", mainConfig)
 	if err != nil || matches != nil {
 		t.Errorf("empty: want (nil, nil), got (%v, %v)", matches, err)
+	}
+}
+
+func TestValidateServerName(t *testing.T) {
+	good := []string{
+		"foo.com",
+		"api.foo.com",
+		"*.foo.com",
+		"a-b.foo.com",
+	}
+	for _, s := range good {
+		if err := validateServerName(s); err != nil {
+			t.Errorf("expected %q valid, got err: %v", s, err)
+		}
+	}
+
+	bad := []string{
+		"",
+		"*.*.foo.com",      // multiple wildcards
+		"foo.*",            // right-prefix wildcard
+		"foo.*.com",        // mid wildcard
+		"*.",               // wildcard with no hostname
+		"https://foo.com",  // scheme
+		"foo.com/bar",      // path
+		"foo.com:8080",     // port
+		"foo .com",         // space
+	}
+	for _, s := range bad {
+		if err := validateServerName(s); err == nil {
+			t.Errorf("expected %q invalid", s)
+		}
+	}
+}
+
+func mkListener(name, bind, proto string) Listener {
+	return Listener{
+		Name: name, Bind: bind, Protocol: proto,
+		DefaultBackend: "be",
+	}
+}
+
+func TestValidateBindGroups_OK(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []Listener
+	}{
+		{
+			name: "single listener no server_names",
+			in: []Listener{
+				mkListener("a", ":80", "http"),
+			},
+		},
+		{
+			name: "two sites with names + default",
+			in: func() []Listener {
+				a := mkListener("a", ":443", "https")
+				a.ServerNames = []string{"api.foo.com"}
+				b := mkListener("b", ":443", "https")
+				b.DefaultServer = true
+				return []Listener{a, b}
+			}(),
+		},
+		{
+			name: "wildcards distinct from exact",
+			in: func() []Listener {
+				a := mkListener("a", ":443", "https")
+				a.ServerNames = []string{"api.foo.com"}
+				b := mkListener("b", ":443", "https")
+				b.ServerNames = []string{"*.foo.com"}
+				return []Listener{a, b}
+			}(),
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if err := validateBindGroups(c.in); err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateBindGroups_Rejections(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []Listener
+		want string
+	}{
+		{
+			name: "mixed protocols on same bind",
+			in: []Listener{
+				func() Listener { l := mkListener("a", ":443", "http"); l.DefaultServer = true; return l }(),
+				func() Listener { l := mkListener("b", ":443", "https"); l.DefaultServer = true; return l }(),
+			},
+			want: "different protocols",
+		},
+		{
+			name: "two default_server",
+			in: []Listener{
+				func() Listener { l := mkListener("a", ":443", "https"); l.DefaultServer = true; return l }(),
+				func() Listener { l := mkListener("b", ":443", "https"); l.DefaultServer = true; return l }(),
+			},
+			want: "more than one listener marked default_server",
+		},
+		{
+			name: "non-default site without server_names",
+			in: []Listener{
+				func() Listener { l := mkListener("a", ":443", "https"); l.ServerNames = []string{"a.com"}; return l }(),
+				mkListener("b", ":443", "https"), // no names, no default
+			},
+			want: "no server_names",
+		},
+		{
+			name: "duplicate server_name across sites",
+			in: []Listener{
+				func() Listener { l := mkListener("a", ":443", "https"); l.ServerNames = []string{"api.foo.com"}; return l }(),
+				func() Listener { l := mkListener("b", ":443", "https"); l.ServerNames = []string{"api.foo.com"}; return l }(),
+			},
+			want: "claimed by both",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateBindGroups(c.in)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", c.want)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("error %q does not contain %q", err.Error(), c.want)
+			}
+		})
 	}
 }

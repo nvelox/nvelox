@@ -24,7 +24,14 @@ func TestConfigIncludeAndBackendInit(t *testing.T) {
 	// Init logging to avoid panic
 	logging.Init("debug", "", "")
 
-	// 2. Create Listeners Config (Main)
+	// 2. Create Listeners Config (Main).
+	// The include glob points to a dedicated subdir so it can't pick up
+	// the main file itself (which would cause l1 to be loaded twice
+	// and the new bind-group validator to flag the duplicate).
+	includeDir := filepath.Join(tmpDir, "conf.d")
+	if err := os.MkdirAll(includeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
 	mainConfig := fmt.Sprintf(`
 version: "2"
 server:
@@ -37,7 +44,7 @@ listeners:
     bind: ":9999"
     protocol: "tcp"
     default_backend: "b1"
-`, tmpDir)
+`, includeDir)
 	mainPath := filepath.Join(tmpDir, "nvelox.yaml")
 	if err := os.WriteFile(mainPath, []byte(mainConfig), 0644); err != nil {
 		t.Fatal(err)
@@ -52,7 +59,7 @@ backends:
     servers:
       - "127.0.0.1:8080"
 `
-	includePath := filepath.Join(tmpDir, "backend.yaml")
+	includePath := filepath.Join(includeDir, "backend.yaml")
 	if err := os.WriteFile(includePath, []byte(backendConfig), 0644); err != nil {
 		t.Fatal(err)
 	}

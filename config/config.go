@@ -67,12 +67,31 @@ type LoggingConfig struct {
 }
 
 // Listener defines a frontend listener.
+//
+// Multiple listeners may share the same `bind:` address (nginx-style
+// multi-server-per-port). When they do, ServerNames + DefaultServer
+// determine which one handles a given request:
+//   - SNI / Host header is matched against ServerNames (exact, then
+//     leftmost-wildcard "*.foo.com").
+//   - Unmatched requests fall through to the listener with
+//     DefaultServer: true. If no default exists, the connection is
+//     closed (or 421 returned, depending on strict_sni).
 type Listener struct {
 	Name           string `yaml:"name"`
 	Bind           string `yaml:"bind"`            // e.g., ":80" or "*:1024-2048"
 	Protocol       string `yaml:"protocol"`        // "tcp", "udp", "http", "https"
 	ZeroCopy       bool   `yaml:"zero_copy"`       // Use splice for TCP
 	DefaultBackend string `yaml:"default_backend"` // Name of the backend pool
+
+	// Multi-server-per-port (nginx-style).
+	// ServerNames are SNI / Host names this listener answers to. Wildcards
+	// allowed in the leftmost label only ("*.foo.com"). Empty + single
+	// listener on the bind = match-everything (back-compat).
+	ServerNames   []string `yaml:"server_names,omitempty"`
+	// DefaultServer marks this listener as the catch-all for its bind
+	// group when SNI / Host doesn't match any other site's ServerNames.
+	// At most one DefaultServer per bind group.
+	DefaultServer bool     `yaml:"default_server,omitempty"`
 
 	// Rate limiting
 	RateLimit RateLimitConfig `yaml:"rate_limit,omitempty"`
@@ -566,6 +585,127 @@ func validate(cfg *Config) error {
 		// Validate HTTP3 requires HTTPS
 		if l.HTTP3 && l.Protocol != "https" {
 			return fmt.Errorf("listener %s: http3 requires protocol 'https'", l.Name)
+		}
+
+		// Validate server_names format (early per-listener check; cross-
+		// listener uniqueness is checked in the bind-group pass below).
+		for _, sn := range l.ServerNames {
+			if err := validateServerName(sn); err != nil {
+				return fmt.Errorf("listener %s: server_names %q: %v", l.Name, sn, err)
+			}
+		}
+	}
+
+	// Cross-listener bind-group rules (nginx-style multi-server-per-port).
+	if err := validateBindGroups(cfg.Listeners); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateServerName checks a server_names entry. Allows exact hostnames and
+// leftmost-wildcard "*.foo.com" only — matches nginx semantics and avoids
+// surprises with right-prefix wildcards that few certificate authorities
+// support.
+func validateServerName(s string) error {
+	if s == "" {
+		return fmt.Errorf("empty server name")
+	}
+	if strings.Contains(s, "*") {
+		// Only "*.something" is allowed, and only one wildcard.
+		if !strings.HasPrefix(s, "*.") || strings.Count(s, "*") > 1 {
+			return fmt.Errorf("wildcard must be leftmost label only (e.g. \"*.foo.com\")")
+		}
+		// "*." alone is not a valid hostname.
+		if len(s) <= 2 {
+			return fmt.Errorf("wildcard must be followed by a hostname")
+		}
+	}
+	// Reject path-like or scheme-prefixed entries.
+	if strings.ContainsAny(s, "/:?# ") {
+		return fmt.Errorf("server name must be a bare hostname")
+	}
+	return nil
+}
+
+// validateBindGroups enforces the nginx-style multi-server-per-port rules
+// across the full set of listeners.
+func validateBindGroups(listeners []Listener) error {
+	// Group listeners by bind address.
+	groups := make(map[string][]*Listener)
+	for i := range listeners {
+		l := &listeners[i]
+		groups[l.Bind] = append(groups[l.Bind], l)
+	}
+
+	for bind, sites := range groups {
+		if len(sites) < 2 {
+			// Single-listener groups behave exactly as today; no extra rules.
+			continue
+		}
+
+		// Rule: same protocol within a bind group. Mixing http+https or
+		// l4+l7 on the same socket is not supported.
+		proto := sites[0].Protocol
+		for _, s := range sites[1:] {
+			if s.Protocol != proto {
+				return fmt.Errorf("bind %s: listeners %s (%s) and %s (%s) share a port but use different protocols",
+					bind, sites[0].Name, proto, s.Name, s.Protocol)
+			}
+		}
+
+		// Rule: at most one default_server per bind group.
+		defaults := 0
+		for _, s := range sites {
+			if s.DefaultServer {
+				defaults++
+			}
+		}
+		if defaults > 1 {
+			return fmt.Errorf("bind %s: more than one listener marked default_server", bind)
+		}
+
+		// Rule: every non-default site in a multi-site group must declare
+		// at least one server_name. Without it, host-based dispatch can't
+		// route to it — silent unreachable config is worse than a startup
+		// error.
+		for _, s := range sites {
+			if s.DefaultServer {
+				continue
+			}
+			if len(s.ServerNames) == 0 {
+				return fmt.Errorf("bind %s: listener %s shares a port but has no server_names and is not default_server",
+					bind, s.Name)
+			}
+		}
+
+		// Rule: each server_name appears in at most one site per bind group.
+		seen := make(map[string]string) // name → owning listener
+		for _, s := range sites {
+			for _, sn := range s.ServerNames {
+				key := strings.ToLower(sn)
+				if owner, dup := seen[key]; dup {
+					return fmt.Errorf("bind %s: server_name %q claimed by both %s and %s",
+						bind, sn, owner, s.Name)
+				}
+				seen[key] = s.Name
+			}
+		}
+
+		// Rule: SNI passthrough (sni_routes) and TLS termination (https)
+		// can't share a port — they're handled by entirely different paths.
+		hasSNI, hasHTTPS := false, false
+		for _, s := range sites {
+			if len(s.SNIRoutes) > 0 {
+				hasSNI = true
+			}
+			if s.Protocol == "https" {
+				hasHTTPS = true
+			}
+		}
+		if hasSNI && hasHTTPS {
+			return fmt.Errorf("bind %s: cannot mix sni_routes (passthrough) and https (termination) on the same port", bind)
 		}
 	}
 
