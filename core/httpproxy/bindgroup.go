@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"nvelox/core/logging"
@@ -53,10 +55,56 @@ func (g *BindGroup) AddSite(s *HTTPServer) {
 	}
 }
 
-// ServeHTTP routes the request to a Site. Phase B: always primary. Phase D
-// will replace this with Host-based dispatch using server_names.
+// ServeHTTP picks the Site that owns r.Host and delegates. Strategy:
+//   1. Strip port from Host.
+//   2. Try exact match against any site's ServerNames, then leftmost-wildcard.
+//   3. Fall back to the site marked DefaultServer; else the first site.
+//
+// Single-site bind groups skip the lookup entirely — keeps overhead at zero
+// for the common case.
 func (g *BindGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	g.primary.ServeHTTP(w, r)
+	if len(g.sites) == 1 {
+		g.sites[0].ServeHTTP(w, r)
+		return
+	}
+
+	host := r.Host
+	// Strip port if present (Host can be "api.foo.com:8443").
+	if i := strings.LastIndex(host, ":"); i != -1 {
+		// IPv6 literals come bracketed: "[::1]:8443" — only strip after the bracket.
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		} else if !strings.Contains(host[:i], "]") {
+			host = host[:i]
+		}
+	}
+
+	site := g.pickSite(host)
+	site.ServeHTTP(w, r)
+}
+
+// pickSite resolves a hostname to the owning Site. Mirrors pickCert's
+// precedence: exact > wildcard > default > first.
+func (g *BindGroup) pickSite(host string) *HTTPServer {
+	if host != "" && len(g.sites) > 1 {
+		entries := make([]tlsutil.SiteEntry[*HTTPServer], 0, len(g.sites))
+		for _, s := range g.sites {
+			entries = append(entries, tlsutil.SiteEntry[*HTTPServer]{
+				Patterns: s.Listener.ServerNames,
+				Payload:  s,
+			})
+		}
+		if site, ok := tlsutil.MatchSite(host, entries); ok {
+			return site
+		}
+	}
+	// Fallback: explicit default_server, else primary (first site).
+	for _, s := range g.sites {
+		if s.Listener.DefaultServer {
+			return s
+		}
+	}
+	return g.primary
 }
 
 // Start opens the listening socket and builds a TLS config that supports

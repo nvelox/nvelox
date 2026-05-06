@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,7 +46,8 @@ type Engine struct {
 	AdminServer     *admin.Server
 	metricsServer   *http.Server
 	UDPPool         *UDPPool                          // UDP session affinity pool
-	HTTPServers     []*httpproxy.HTTPServer           // L7 HTTP servers
+	HTTPServers     []*httpproxy.HTTPServer           // L7 HTTP sites (per listener config)
+	BindGroups      []*httpproxy.BindGroup            // socket-owning groups (one per bind addr)
 	ActiveConns  sync.WaitGroup            // tracks in-flight connections for graceful drain
 	DrainTimeout time.Duration             // max wait on shutdown (default 30s)
 	tlsListeners []net.Listener            // TLS listeners to close on shutdown
@@ -138,7 +140,18 @@ func (e *Engine) Start(ctx context.Context) error {
 		logging.Info("Metrics endpoint started on %s%s", e.Config.Metrics.Bind, metricsPath)
 	}
 
-	// 1d. Start HTTP/HTTPS listeners (L7)
+	// 1d. Start HTTP/HTTPS listeners (L7), grouped by bind address.
+	//
+	// Multiple listeners may share a bind: address (nginx-style multi-server-
+	// per-port). For each unique addr we open exactly one socket and attach
+	// every site (HTTPServer) that shares it. The BindGroup dispatches by
+	// SNI (TLS) and Host header (HTTP) to pick the right site per request.
+	type siteSpec struct {
+		listener *ListenerConfig
+		site     *httpproxy.HTTPServer
+	}
+	bindGroups := make(map[string][]siteSpec) // addr → sites in order
+	bindOrder := make([]string, 0)            // preserve config order for stable startup logging
 	for _, l := range e.Listeners {
 		if l.Protocol != "http" && l.Protocol != "https" {
 			continue
@@ -170,7 +183,6 @@ func (e *Engine) Start(ctx context.Context) error {
 			Buffering:      l.Buffering,
 			Cache:          l.Cache,
 		}
-		// Build interface maps for httpproxy
 		connLimiters := make(map[string]httpproxy.ConnLimiterI)
 		for k, v := range e.ConnLimiters {
 			connLimiters[k] = v
@@ -183,12 +195,35 @@ func (e *Engine) Start(ctx context.Context) error {
 		for k, v := range e.CircuitBreakers {
 			cbs[k] = v
 		}
-		srv := httpproxy.NewHTTPServer(httpL, e.Balancers, e.Backends, rl, connLimiters, passiveHealth, e.StickyStores, cbs)
-		if err := srv.Start(); err != nil {
-			return fmt.Errorf("HTTP listener %s start failed: %v", l.Name, err)
+		site := httpproxy.NewHTTPServer(httpL, e.Balancers, e.Backends, rl, connLimiters, passiveHealth, e.StickyStores, cbs)
+		e.HTTPServers = append(e.HTTPServers, site)
+
+		if _, seen := bindGroups[l.Addr]; !seen {
+			bindOrder = append(bindOrder, l.Addr)
 		}
-		e.HTTPServers = append(e.HTTPServers, srv)
-		logging.Info("HTTP listener %s started on %s (protocol: %s)", l.Name, l.Addr, l.Protocol)
+		bindGroups[l.Addr] = append(bindGroups[l.Addr], siteSpec{listener: l, site: site})
+	}
+
+	for _, addr := range bindOrder {
+		group := bindGroups[addr]
+		bg := httpproxy.NewBindGroup(addr, group[0].listener.Protocol)
+		for _, s := range group {
+			bg.AddSite(s.site)
+		}
+		if err := bg.Start(); err != nil {
+			return fmt.Errorf("HTTP bind group %s start failed: %v", addr, err)
+		}
+		e.BindGroups = append(e.BindGroups, bg)
+		if len(group) == 1 {
+			l := group[0].listener
+			logging.Info("HTTP listener %s started on %s (protocol: %s)", l.Name, l.Addr, l.Protocol)
+		} else {
+			names := make([]string, 0, len(group))
+			for _, s := range group {
+				names = append(names, s.listener.Name)
+			}
+			logging.Info("HTTP bind group %s started with %d sites (%s)", addr, len(group), strings.Join(names, ", "))
+		}
 	}
 
 	// 2. Setup Handler
@@ -258,10 +293,11 @@ func (e *Engine) Start(ctx context.Context) error {
 		e.metricsServer.Close()
 	}
 
-	// Stop HTTP servers (graceful with drain)
-	for _, srv := range e.HTTPServers {
+	// Stop HTTP bind groups (each owns the socket; HTTPServers are sites
+	// within them and have nothing to shut down on their own).
+	for _, bg := range e.BindGroups {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		srv.Stop(shutdownCtx)
+		bg.Stop(shutdownCtx)
 		cancel()
 	}
 
