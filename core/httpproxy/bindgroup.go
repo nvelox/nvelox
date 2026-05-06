@@ -131,11 +131,24 @@ func (g *BindGroup) Start() error {
 		}
 		g.httpServer.TLSConfig = tlsCfg
 
-		// Start HTTP/3 (QUIC) if enabled. altSvcHeader is written BEFORE
-		// the goroutine spawn so the goroutine-create happens-before
-		// covers the field's first read in ServeHTTP.
-		if primary.Listener.HTTP3 {
-			primary.altSvcHeader = fmt.Sprintf(`h3=":%d"; ma=86400`, primary.Listener.Port)
+		// Start HTTP/3 (QUIC) if ANY site in the group enables it. The
+		// shared QUIC listener uses the same multi-cert tls.Config — its
+		// GetCertificate already routes by SNI. Each site that opted into
+		// HTTP/3 gets its own altSvcHeader populated so its own responses
+		// carry the right Alt-Svc value (sites without http3:true don't
+		// advertise it).
+		//
+		// altSvcHeader values are written BEFORE the goroutine spawn so
+		// the goroutine-create happens-before relationship covers the
+		// field's first read in HTTPServer.ServeHTTP (race-detector clean).
+		var anyH3 bool
+		for _, s := range g.sites {
+			if s.Listener.HTTP3 {
+				s.altSvcHeader = fmt.Sprintf(`h3=":%d"; ma=86400`, s.Listener.Port)
+				anyH3 = true
+			}
+		}
+		if anyH3 {
 			g.http3Server = &http3.Server{
 				Addr:      g.addr,
 				Handler:   g,

@@ -181,3 +181,96 @@ func TestMultiSite_HTTPS_SNIDispatch(t *testing.T) {
 		t.Errorf("unknown SNI: body = %q, want from-web-backend (default)", body)
 	}
 }
+
+// TestMultiSite_HTTP3_PerSiteAltSvc verifies that in a bind group with two
+// HTTPS sites where only one has http3: true, only that site's HTTP/2
+// responses carry the Alt-Svc header advertising HTTP/3. The other site
+// — sharing the same socket and the same shared QUIC listener — must not
+// advertise H3 to its clients.
+func TestMultiSite_HTTP3_PerSiteAltSvc(t *testing.T) {
+	apiBE := startHTTPBackend(t, "api")
+	webBE := startHTTPBackend(t, "web")
+
+	port := getFreePort(t)
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	tmpDir := t.TempDir()
+	apiCert, apiKey, apiLeaf := genCertForHost(t, tmpDir, "api.example.test")
+	webCert, webKey, webLeaf := genCertForHost(t, tmpDir, "web.example.test")
+
+	cfg := &config.Config{
+		Version: "2",
+		Logging: config.LoggingConfig{Level: "warning"},
+		Backends: []config.Backend{
+			{Name: "api-be", Balance: "roundrobin", Servers: []string{apiBE}},
+			{Name: "web-be", Balance: "roundrobin", Servers: []string{webBE}},
+		},
+	}
+	engine := core.NewEngine(cfg)
+	engine.Listeners = []*core.ListenerConfig{
+		{
+			Name:           "api-h3",
+			Addr:           proxyAddr,
+			Protocol:       "https",
+			DefaultBackend: "api-be",
+			Port:           port,
+			HTTP3:          true, // only this one
+			ServerNames:    []string{"api.example.test"},
+			TLS:            &config.TLSConfig{Cert: apiCert, Key: apiKey},
+		},
+		{
+			Name:           "web-no-h3",
+			Addr:           proxyAddr,
+			Protocol:       "https",
+			DefaultBackend: "web-be",
+			Port:           port,
+			DefaultServer:  true,
+			TLS:            &config.TLSConfig{Cert: webCert, Key: webKey},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go engine.Start(ctx)
+	waitForPort(t, port)
+
+	// HTTP/2 client that overrides SNI per request.
+	dialAltSvc := func(sni string, leaf *x509.Certificate) string {
+		t.Helper()
+		pool := x509.NewCertPool()
+		pool.AddCert(leaf)
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{ServerName: sni, RootCAs: pool},
+			ForceAttemptHTTP2: true,
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				d := &net.Dialer{Timeout: 2 * time.Second}
+				raw, err := d.DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				tc := tls.Client(raw, &tls.Config{ServerName: sni, RootCAs: pool, NextProtos: []string{"h2", "http/1.1"}})
+				if err := tc.Handshake(); err != nil {
+					raw.Close()
+					return nil, err
+				}
+				return tc, nil
+			},
+		}
+		client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+		req, _ := http.NewRequest("GET", "https://"+proxyAddr+"/", nil)
+		req.Host = sni
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("dial %s: %v", sni, err)
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return resp.Header.Get("Alt-Svc")
+	}
+
+	if got := dialAltSvc("api.example.test", apiLeaf); got == "" {
+		t.Error("api site (http3: true) must advertise Alt-Svc, got empty")
+	}
+	if got := dialAltSvc("web.example.test", webLeaf); got != "" {
+		t.Errorf("web site (no http3) must not advertise Alt-Svc, got %q", got)
+	}
+}
