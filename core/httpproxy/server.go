@@ -20,10 +20,7 @@ import (
 	"nvelox/core/logging"
 	"nvelox/core/middleware"
 	"nvelox/core/sticky"
-	"nvelox/core/tlsutil"
 	"nvelox/lb"
-
-	"github.com/quic-go/quic-go/http3"
 )
 
 // ConnLimiterI is the interface for connection limiting.
@@ -59,11 +56,13 @@ type EngineRef struct {
 	RateLimiters interface{ Allow() bool } // nil if no rate limiter
 }
 
-// HTTPServer manages an HTTP/HTTPS listener with L7 routing.
+// HTTPServer is the per-site bundle of L7 state: routes, ACL, headers,
+// error pages, sticky stores, etc. It does NOT own a listening socket;
+// the BindGroup it's attached to does. ServeHTTP is the entry point the
+// BindGroup dispatches into.
 type HTTPServer struct {
 	Listener      *ListenerConfig
-	httpServer    *http.Server
-	http3Server   *http3.Server
+	bindGroup     *BindGroup // back-reference; set by Start() for back-compat
 	router        *Router
 	Balancers     map[string]lb.Balancer
 	Backends      map[string]*config.Backend
@@ -209,14 +208,8 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 		s.backendSchemes[name] = "https"
 	}
 
-	s.httpServer = &http.Server{
-		Addr:         l.Addr,
-		Handler:      s,
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
-	}
-
+	// http.Server / TLS / HTTP/3 setup now lives on BindGroup. Site is
+	// just the handler from here on.
 	return s
 }
 
@@ -314,73 +307,27 @@ func buildBackendTLSConfig(cfg config.BackendTLSConfig) (*tls.Config, error) {
 	return t, nil
 }
 
-// Start begins listening for HTTP/HTTPS connections.
+// Start is a back-compat shortcut: build a one-site BindGroup, attach this
+// HTTPServer, and start the group. New code should construct a BindGroup
+// directly so multiple sites can share the socket.
 func (s *HTTPServer) Start() error {
-	if s.Listener.TLS != nil {
-		warnIfKeyWorldReadable(s.Listener.TLS.Key)
-		cert, err := tls.LoadX509KeyPair(s.Listener.TLS.Cert, s.Listener.TLS.Key)
-		if err != nil {
-			return fmt.Errorf("failed to load TLS cert/key: %v", err)
-		}
-		tlsCfg := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			NextProtos:   []string{"h2", "http/1.1"},
-		}
-		if err := tlsutil.ApplyTLSVersionAndCiphers(tlsCfg, *s.Listener.TLS); err != nil {
-			return fmt.Errorf("TLS listener %s: %v", s.Listener.Name, err)
-		}
-		s.httpServer.TLSConfig = tlsCfg
-
-		// Start HTTP/3 (QUIC) if enabled.
-		// NOTE: altSvcHeader must be written BEFORE spawning the HTTP/3
-		// goroutine. The `go` statement establishes happens-before to the
-		// goroutine's first instruction, so any request handled by either
-		// the HTTP/3 path or the TLS-HTTP/2 path below sees the final value.
-		// Writing after `go func()` caused a data race when a request
-		// arrived in the tiny window before the assignment retired.
-		if s.Listener.HTTP3 {
-			s.altSvcHeader = fmt.Sprintf(`h3=":%d"; ma=86400`, s.Listener.Port)
-			// HTTP/3 server uses the same ServeHTTP handler
-			s.http3Server = &http3.Server{
-				Addr:      s.Listener.Addr,
-				Handler:   s, // HTTP/3 requests go through same routing
-				TLSConfig: http3.ConfigureTLSConfig(tlsCfg.Clone()),
-			}
-			go func() {
-				if err := s.http3Server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-					logging.Error("[HTTP3] Server error: %v", err)
-				}
-			}()
-			logging.Info("[HTTP3] QUIC listener started on %s", s.Listener.Addr)
-		}
-
-		go func() {
-			ln, err := tls.Listen("tcp", s.Listener.Addr, s.httpServer.TLSConfig)
-			if err != nil {
-				logging.Error("[HTTP] TLS listen failed on %s: %v", s.Listener.Addr, err)
-				return
-			}
-			if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
-				logging.Error("[HTTP] Server error: %v", err)
-			}
-		}()
-	} else {
-		go func() {
-			if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				logging.Error("[HTTP] Server error: %v", err)
-			}
-		}()
+	g := NewBindGroup(s.Listener.Addr, s.Listener.Protocol)
+	g.AddSite(s)
+	if err := g.Start(); err != nil {
+		return err
 	}
+	s.bindGroup = g
 	return nil
 }
 
-
-// Stop gracefully shuts down the HTTP server.
+// Stop gracefully shuts down the BindGroup this site was attached to via
+// Start(). If the site was attached to a multi-site group externally, the
+// caller should Stop the group, not the site.
 func (s *HTTPServer) Stop(ctx context.Context) error {
-	if s.http3Server != nil {
-		s.http3Server.Close()
+	if s.bindGroup != nil {
+		return s.bindGroup.Stop(ctx)
 	}
-	return s.httpServer.Shutdown(ctx)
+	return nil
 }
 
 // ServeHTTP handles incoming HTTP requests with routing, proxying, and header manipulation.
