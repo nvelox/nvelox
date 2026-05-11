@@ -2,4 +2,4 @@ listeners:
   - name: "test-listener"
     bind: ":8888"
     protocol: "tcp"
-    default_backend: "test-backend"
+    backend: "test-backend"

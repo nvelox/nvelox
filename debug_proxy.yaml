@@ -3,7 +3,7 @@ listeners:
     bind: ":9000"
     protocol: "tcp"
     zero_copy: false
-    default_backend: "echo-pool"
+    backend: "echo-pool"
 
 backends:
   - name: "echo-pool"

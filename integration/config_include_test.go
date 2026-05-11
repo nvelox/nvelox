@@ -43,7 +43,7 @@ listeners:
   - name: "l1"
     bind: ":9999"
     protocol: "tcp"
-    default_backend: "b1"
+    backend: "b1"
 `, includeDir)
 	mainPath := filepath.Join(tmpDir, "nvelox.yaml")
 	if err := os.WriteFile(mainPath, []byte(mainConfig), 0644); err != nil {

@@ -42,7 +42,7 @@ listeners:
   - name: test-listener
     bind: "127.0.0.1:19876"
     protocol: tcp
-    default_backend: backend1
+    backend: backend1
 backends:
   - name: backend1
     servers:

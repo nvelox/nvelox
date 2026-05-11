@@ -26,12 +26,24 @@ metrics:
 admin:
   enabled: true
   bind: "127.0.0.1:9091"
+  # api_key required when the API is reachable from anything other than
+  # loopback. Checked with constant-time compare; brute-force protection
+  # locks the source IP after 10 failed attempts in a 10m window.
+  # api_key: "set-from-env-or-vault"
   # Endpoints:
   #   GET  /api/v1/stats
   #   GET  /api/v1/backends
   #   POST /api/v1/backends/{name}/drain?server=addr
   #   POST /api/v1/backends/{name}/enable?server=addr
   #   POST /api/v1/backends/{name}/disable?server=addr
+
+# Hot reload: `kill -HUP $(pidof nvelox)` (or `systemctl reload nvelox`)
+# applies the current contents of this file without dropping connections.
+# Covers backends (balancer/sticky/CB state preserved on rename), per-
+# listener routes/ACL/headers, TLS certs (Let's Encrypt rotation), and
+# bind addresses (added or removed with 10s graceful drain). All-or-
+# nothing: pre-flight aborts the apply if any new bind addr is unbindable
+# or the new config is invalid. See examples/32-hot-reload.yaml.
 
 # ─── OpenTelemetry Tracing ─────────────────────────────────
 # tracing:
@@ -65,13 +77,25 @@ listeners:
     bind: ":443"
     protocol: "https"
     http3: true  # QUIC on same port, advertises Alt-Svc
-    default_backend: "web-cluster"
+    backend: "web-cluster"
+    # Multiple HTTPS listeners may share the same `bind:` — see the
+    # "Multi-server-per-port" section below for how SNI + server_names
+    # route requests across them.
     tls:
       cert: "/etc/ssl/certs/server.pem"
       key: "/etc/ssl/private/server.key"
       # ocsp_stapling: true
       # client_auth: "require"         # mTLS: "require", "request", "none"
       # client_ca: "/etc/ssl/ca.pem"
+      # min_version: "1.2"             # "1.2" or "1.3" (defaults 1.2)
+      # max_version: "1.3"             # defaults 1.3
+      # cipher_suites:                 # TLS 1.2 only; TLS 1.3 suites are
+      #   - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+      #   - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+    # trusted_proxies: ["10.0.0.0/8"]
+    #   When set, X-Forwarded-For / X-Real-IP from peers in these CIDRs
+    #   are trusted and appended; everyone else gets their forged
+    #   headers replaced with the authoritative peer IP.
 
     # Timeouts
     timeouts:
@@ -188,7 +212,7 @@ listeners:
     bind: ":10000-10100"
     protocol: "tcp"
     zero_copy: true
-    default_backend: "game-servers"
+    backend: "game-servers"
 
   # ─── TLS passthrough with SNI routing ──────────────────
   # - name: "tls-passthrough"
@@ -200,11 +224,30 @@ listeners:
   #     - server_name: "*.example.com"
   #       backend: "web-cluster"
 
+  # ─── Multi-server-per-port (nginx-style) ───────────────
+  # Multiple HTTPS listeners may share the same `bind:`. Each is its own
+  # "site": its own cert, its own routes/headers/ACL, its own backend.
+  # nvelox picks the cert via SNI and dispatches by Host header. Exact
+  # name > leftmost wildcard > default_server. Detailed walkthrough in
+  # examples/31-multisite-per-port.yaml.
+  # - name: "api-site"
+  #   bind: ":8443"
+  #   protocol: "https"
+  #   server_names: ["api.example.com", "api.example.org"]
+  #   tls: { cert: "/etc/ssl/api.pem", key: "/etc/ssl/api.key" }
+  #   backend: "api-servers"
+  # - name: "web-site-default"
+  #   bind: ":8443"
+  #   protocol: "https"
+  #   default_server: true                        # catch-all for unknown SNI
+  #   tls: { cert: "/etc/ssl/wildcard.pem", key: "/etc/ssl/wildcard.key" }
+  #   backend: "web-cluster"
+
   # ─── UDP proxy ─────────────────────────────────────────
   - name: "dns-proxy"
     bind: ":5353"
     protocol: "udp"
-    default_backend: "dns-servers"
+    backend: "dns-servers"
 
 # ═══════════════════════════════════════════════════════════
 # BACKENDS
@@ -249,14 +292,23 @@ backends:
       timeout: "30s"           # Time before half-open probe
       half_open_max: 2         # Probe requests in half-open state
 
-    # Backend TLS (connect to upstream via TLS)
+    # Backend TLS (connect to upstream via TLS — L7 only). Defaults are
+    # secure: InsecureSkipVerify=false, system roots, MinVersion=TLS1.2.
+    # Setting `insecure: true` explicitly opts out of cert verification
+    # and is logged at WARN on startup.
     # backend_tls:
     #   enabled: true
     #   ca_cert: "/etc/ssl/ca.pem"
+    #   client_cert: "/etc/ssl/client.pem"       # mTLS to backend
+    #   client_key:  "/etc/ssl/client.key"       # both or neither
     #   insecure: false
 
-    # DNS service discovery (re-resolve hostnames)
+    # DNS service discovery (re-resolve hostnames in `servers:`).
     # resolve_interval: "30s"
+    # allow_private_ips: false                   # default. When true,
+    #   backend hostnames may resolve to RFC1918 / 127/8 / link-local /
+    #   CGNAT. Leave false unless backends actually live on a private
+    #   network — prevents DNS-rebinding SSRF on public hostnames.
 
     servers:
       - "10.0.0.1:8080"
