@@ -52,6 +52,7 @@ type Engine struct {
 	ActiveConns  sync.WaitGroup            // tracks in-flight connections for graceful drain
 	DrainTimeout time.Duration             // max wait on shutdown (default 30s)
 	tlsListeners []net.Listener            // TLS listeners to close on shutdown
+	reloadMu     sync.Mutex                // serializes concurrent SIGHUPs
 	configPath   string                    // path for reload
 }
 
@@ -313,28 +314,64 @@ func (e *Engine) Start(ctx context.Context) error {
 //     routes / ACL / headers / error pages / compression / cache all
 //     hot-swapped via atomic.Pointer. In-flight requests keep their
 //     old site reference; new requests see the new config.
+//   - Bind-group composition changes: new bind addrs start a fresh
+//     BindGroup, removed addrs gracefully drain.
 //   - TLS certs hot-swapped on every BindGroup via atomic.Pointer
 //     (operators can rotate Let's Encrypt certs without restart).
 //
-// Listener add/remove (new bind addresses) is F3 work — still requires
-// restart for those.
-func (e *Engine) Reload(cfg *config.Config) {
-	logging.Info("Reloading config...")
+// All-or-nothing: every NEW bind addr is probed via net.Listen BEFORE
+// any mutation. If any probe fails (port in use, missing perms), Reload
+// returns the error and no state changes — operators keep their last
+// good config running.
+//
+// Concurrency: serialized by reloadMu. Two SIGHUPs in quick succession
+// queue; the second waits for the first to complete. Metrics are
+// emitted via the engine's Metrics registry.
+func (e *Engine) Reload(cfg *config.Config) error {
+	e.reloadMu.Lock()
+	defer e.reloadMu.Unlock()
 
+	logging.Info("Reloading config...")
+	start := time.Now()
+
+	// Pre-flight 1: listener expansion must succeed.
+	expanded, err := ExpandListeners(cfg.Listeners)
+	if err != nil {
+		e.recordReload("fail", start)
+		return fmt.Errorf("reload: listener expansion: %w", err)
+	}
+
+	// Pre-flight 2: any NEW L7 bind addr must be bindable RIGHT NOW.
+	// We check before mutating engine state so a port conflict doesn't
+	// leave the engine half-reconfigured.
+	bgByAddr := make(map[string]struct{}, len(e.BindGroups))
+	for _, bg := range e.BindGroups {
+		bgByAddr[bg.Addr()] = struct{}{}
+	}
+	for _, l := range expanded {
+		if l.Protocol != "http" && l.Protocol != "https" {
+			continue
+		}
+		if _, kept := bgByAddr[l.Addr]; kept {
+			continue
+		}
+		probe, perr := net.Listen("tcp", l.Addr)
+		if perr != nil {
+			e.recordReload("fail", start)
+			return fmt.Errorf("reload: cannot bind new addr %s: %w", l.Addr, perr)
+		}
+		probe.Close()
+	}
+
+	// Pre-flight passed — apply mutations.
 	e.Config = cfg
 	beAdded, beRemoved, beUpdated := e.reconcileBackends(cfg)
 	sitesSwapped, bgAdded, bgRemoved := e.reloadL7Sites(cfg)
 
-	// Hot-reload TLS certs on every HTTPS bind group. Failures here are
-	// isolated to the site that broke; the rest of the bind group keeps
-	// running with the previous snapshot.
 	totalRotated := 0
 	for _, bg := range e.BindGroups {
 		rotated, err := bg.ReloadCerts()
 		if err != nil {
-			// loadCertState validates presence of TLS-enabled sites; on
-			// a plain-HTTP bind group ReloadCerts also errors with "no
-			// TLS-enabled sites" — silently skip those.
 			logging.Debug("[RELOAD] bind group cert reload skipped: %v", err)
 			continue
 		}
@@ -342,6 +379,20 @@ func (e *Engine) Reload(cfg *config.Config) {
 	}
 	logging.Info("Reload complete: backends +%d/-%d/~%d, bind groups +%d/-%d, %d sites swapped, %d TLS certs rotated",
 		beAdded, beRemoved, beUpdated, bgAdded, bgRemoved, sitesSwapped, totalRotated)
+	e.recordReload("ok", start)
+	return nil
+}
+
+// recordReload emits the reload outcome to the metrics registry.
+// nvelox_reload_total{result="ok|fail"} counts total reloads; the
+// duration histogram tracks how long each Reload took (operators can
+// alert on slow reloads which usually indicate slow drains).
+func (e *Engine) recordReload(result string, start time.Time) {
+	if e.Metrics == nil {
+		return
+	}
+	e.Metrics.GetCounter("nvelox_reload_total", map[string]string{"result": result}).Inc()
+	e.Metrics.GetHistogram("nvelox_reload_duration_seconds").Observe(time.Since(start).Seconds())
 }
 
 // reloadL7Sites reconciles the L7 (HTTP/HTTPS) listener set against the

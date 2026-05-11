@@ -87,12 +87,13 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 					logging.Info("Received SIGHUP, reloading configuration from %s", *configPath)
 					newCfg, err := config.Load(*configPath)
 					if err != nil {
-						logging.Error("Config reload failed: %v (keeping current config)", err)
+						logging.Error("Config reload failed (validation): %v — keeping current config", err)
 						continue
 					}
-					logging.Info("Configuration reloaded successfully")
-					// Re-initialize backends with new config
-					engine.Reload(newCfg)
+					if err := engine.Reload(newCfg); err != nil {
+						logging.Error("Config reload failed (apply): %v — keeping current config", err)
+						continue
+					}
 				}
 			}
 		}()

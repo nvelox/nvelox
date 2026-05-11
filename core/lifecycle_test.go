@@ -534,3 +534,93 @@ func TestReloadL7Sites_PreflightAbortsOnPortConflict(t *testing.T) {
 		t.Errorf("aborted reload should keep current bind groups (got %d)", len(engine.BindGroups))
 	}
 }
+
+// TestReload_AllOrNothing_AbortOnPortConflict: when a new bind addr in
+// the new config can't be claimed, Reload returns an error and engine
+// state is untouched (backends NOT reconciled).
+func TestReload_AllOrNothing_AbortOnPortConflict(t *testing.T) {
+	freeAddr := func() string {
+		l, _ := net.Listen("tcp", "127.0.0.1:0")
+		addr := l.Addr().String()
+		l.Close()
+		return addr
+	}
+	existingAddr := freeAddr()
+	holdLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	heldAddr := holdLn.Addr().String()
+	defer holdLn.Close()
+
+	cfg := &config.Config{
+		Backends:  []config.Backend{{Name: "be", Servers: []string{"10.0.0.1:80"}}},
+		Listeners: []config.Listener{{Name: "a", Bind: existingAddr, Protocol: "http", Backend: "be"}},
+	}
+	expanded, _ := ExpandListeners(cfg.Listeners)
+	engine := NewEngine(cfg)
+	engine.Listeners = expanded
+	engine.initBackends()
+	bg := httpproxy.NewBindGroup(existingAddr, "http")
+	bg.AddSite(engine.buildL7Site(expanded[0]))
+	bg.Start()
+	engine.BindGroups = append(engine.BindGroups, bg)
+	defer bg.Stop(context.Background())
+
+	// New config introduces a backend "be2" AND a new bind addr that's
+	// held by another process. Reload must abort BEFORE applying the
+	// backend change.
+	newCfg := &config.Config{
+		Backends: []config.Backend{
+			{Name: "be", Servers: []string{"10.0.0.1:80"}},
+			{Name: "be2", Servers: []string{"10.0.0.2:80"}}, // would have been added
+		},
+		Listeners: []config.Listener{
+			{Name: "a", Bind: existingAddr, Protocol: "http", Backend: "be"},
+			{Name: "b", Bind: heldAddr, Protocol: "http", Backend: "be2"},
+		},
+	}
+	err := engine.Reload(newCfg)
+	if err == nil {
+		t.Fatal("Reload must return error when a new bind addr can't be claimed")
+	}
+	// All-or-nothing: be2 was NOT added because pre-flight aborted first.
+	if _, exists := engine.Balancers["be2"]; exists {
+		t.Error("all-or-nothing violated: backend be2 was added despite pre-flight failure")
+	}
+	if len(engine.BindGroups) != 1 {
+		t.Errorf("bind group count changed: got %d, want 1", len(engine.BindGroups))
+	}
+}
+
+// TestReload_Metrics: a successful Reload increments the OK counter
+// and records duration; a failed one increments the fail counter.
+func TestReload_Metrics(t *testing.T) {
+	cfg := &config.Config{
+		Backends: []config.Backend{{Name: "be", Servers: []string{"10.0.0.1:80"}}},
+	}
+	engine := NewEngine(cfg)
+	engine.initBackends()
+
+	// Successful reload.
+	if err := engine.Reload(cfg); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	okCounter := engine.Metrics.GetCounter("nvelox_reload_total", map[string]string{"result": "ok"})
+	if okCounter.Get() < 1 {
+		t.Error("OK reload should increment nvelox_reload_total{result=ok}")
+	}
+
+	// Failed reload — point at a config with a busted listener bind.
+	holdLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	heldAddr := holdLn.Addr().String()
+	defer holdLn.Close()
+	badCfg := &config.Config{
+		Backends:  []config.Backend{{Name: "be", Servers: []string{"10.0.0.1:80"}}},
+		Listeners: []config.Listener{{Name: "x", Bind: heldAddr, Protocol: "http", Backend: "be"}},
+	}
+	if err := engine.Reload(badCfg); err == nil {
+		t.Fatal("Reload with held port must fail")
+	}
+	failCounter := engine.Metrics.GetCounter("nvelox_reload_total", map[string]string{"result": "fail"})
+	if failCounter.Get() < 1 {
+		t.Error("failed reload should increment nvelox_reload_total{result=fail}")
+	}
+}
