@@ -15,12 +15,20 @@ var (
 // Balancer selects a backend server for a new connection.
 type Balancer interface {
 	Next() (string, error)
+	// NextExcluding selects a server excluding the given list (for retries).
+	NextExcluding(exclude []string) (string, error)
 	// OnConnect notifies the balancer that a connection has been established (for leastconn).
 	OnConnect(server string)
 	// OnDisconnect notifies the balancer that a connection has closed (for leastconn).
 	OnDisconnect(server string)
 	// UpdateStatus updates the health status of a server.
 	UpdateStatus(server string, healthy bool)
+	// MarkDraining marks a server as draining (no new connections, existing continue).
+	MarkDraining(server string)
+	// IsHealthy returns whether a server is currently in the healthy pool.
+	IsHealthy(server string) bool
+	// UpdateServers replaces the server list (for DNS-based discovery).
+	UpdateServers(servers []string)
 }
 
 // NewBalancer creates a new load balancer based on the algorithm name.
@@ -97,6 +105,46 @@ func (b *RoundRobin) UpdateStatus(server string, healthy bool) {
 func (b *RoundRobin) OnConnect(server string)    {}
 func (b *RoundRobin) OnDisconnect(server string) {}
 
+func (b *RoundRobin) MarkDraining(server string) {
+	b.UpdateStatus(server, false)
+}
+
+func (b *RoundRobin) IsHealthy(server string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.status[server]
+}
+
+func (b *RoundRobin) UpdateServers(servers []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.allServers = make([]string, len(servers))
+	copy(b.allServers, servers)
+	b.status = make(map[string]bool)
+	for _, s := range b.allServers {
+		b.status[s] = true
+	}
+	b.healthy = append([]string{}, b.allServers...)
+}
+
+func (b *RoundRobin) NextExcluding(exclude []string) (string, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	excl := make(map[string]bool, len(exclude))
+	for _, e := range exclude {
+		excl[e] = true
+	}
+	for i := 0; i < len(b.healthy); i++ {
+		next := atomic.AddUint64(&b.current, 1)
+		idx := (next - 1) % uint64(len(b.healthy))
+		s := b.healthy[idx]
+		if !excl[s] {
+			return s, nil
+		}
+	}
+	return "", ErrNoServers
+}
+
 // Random implementation.
 type Random struct {
 	allServers []string
@@ -152,6 +200,47 @@ func (b *Random) UpdateStatus(server string, healthy bool) {
 
 func (r *Random) OnConnect(server string)    {}
 func (r *Random) OnDisconnect(server string) {}
+
+func (r *Random) MarkDraining(server string) {
+	r.UpdateStatus(server, false)
+}
+
+func (r *Random) IsHealthy(server string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.status[server]
+}
+
+func (r *Random) UpdateServers(servers []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.allServers = make([]string, len(servers))
+	copy(r.allServers, servers)
+	r.status = make(map[string]bool)
+	for _, s := range r.allServers {
+		r.status[s] = true
+	}
+	r.healthy = append([]string{}, r.allServers...)
+}
+
+func (r *Random) NextExcluding(exclude []string) (string, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	excl := make(map[string]bool, len(exclude))
+	for _, e := range exclude {
+		excl[e] = true
+	}
+	candidates := make([]string, 0, len(r.healthy))
+	for _, s := range r.healthy {
+		if !excl[s] {
+			candidates = append(candidates, s)
+		}
+	}
+	if len(candidates) == 0 {
+		return "", ErrNoServers
+	}
+	return candidates[r.rnd.Intn(len(candidates))], nil
+}
 
 // LeastConn implementation
 type LeastConn struct {
@@ -231,8 +320,64 @@ func (b *LeastConn) OnConnect(server string) {
 	b.conns[server]++
 }
 
+// OnDisconnect decrements the active connection count for server, clamped
+// at 0. An unpaired disconnect (or double-disconnect on an error path)
+// used to drive the counter negative — making that server look like
+// "most idle" forever and concentrating all new traffic on it.
 func (b *LeastConn) OnDisconnect(server string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.conns[server]--
+	if b.conns[server] > 0 {
+		b.conns[server]--
+	}
+}
+
+func (b *LeastConn) MarkDraining(server string) {
+	b.UpdateStatus(server, false)
+}
+
+func (b *LeastConn) IsHealthy(server string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.status[server]
+}
+
+func (b *LeastConn) UpdateServers(servers []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.allServers = make([]string, len(servers))
+	copy(b.allServers, servers)
+	b.status = make(map[string]bool)
+	newConns := make(map[string]int64)
+	for _, s := range b.allServers {
+		b.status[s] = true
+		newConns[s] = b.conns[s] // preserve existing counts
+	}
+	b.conns = newConns
+	b.healthy = append([]string{}, b.allServers...)
+}
+
+func (b *LeastConn) NextExcluding(exclude []string) (string, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	excl := make(map[string]bool, len(exclude))
+	for _, e := range exclude {
+		excl[e] = true
+	}
+	best := ""
+	min := int64(1<<63 - 1)
+	for _, s := range b.healthy {
+		if excl[s] {
+			continue
+		}
+		c := b.conns[s]
+		if c < min {
+			best = s
+			min = c
+		}
+	}
+	if best == "" {
+		return "", ErrNoServers
+	}
+	return best, nil
 }

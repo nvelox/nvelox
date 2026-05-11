@@ -1,0 +1,23 @@
+## 23 — Configurable Timeouts
+## Custom connect/read/write/idle timeouts on listener and backend.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "timed"
+    bind: ":9000"
+    protocol: "http"
+    backend: "backend"
+    timeouts:
+      connect: "3s"
+      read: "30s"
+      write: "30s"
+      idle: "120s"
+backends:
+  - name: "backend"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"
+    timeouts:
+      connect: "2s"
+      read: "10s"

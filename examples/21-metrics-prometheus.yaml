@@ -1,0 +1,19 @@
+## 21 — Prometheus Metrics Endpoint
+## Exposes /metrics on :9090 for scraping.
+version: "2"
+logging:
+  level: "debug"
+metrics:
+  enabled: true
+  bind: ":9090"
+  path: "/metrics"
+listeners:
+  - name: "web"
+    bind: ":9000"
+    protocol: "http"
+    backend: "backend"
+backends:
+  - name: "backend"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"

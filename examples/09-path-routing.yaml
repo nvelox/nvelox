@@ -1,0 +1,30 @@
+## 09 — Path-Based Routing
+## Routes /api/* to API backend, /static/* to CDN, everything else to web.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "path-router"
+    bind: ":9000"
+    protocol: "http"
+    backend: "web"
+    routes:
+      - match:
+          path_prefix: "/api"
+        backend: "api"
+      - match:
+          path_prefix: "/static"
+        backend: "cdn"
+backends:
+  - name: "web"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"
+  - name: "api"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8082"
+  - name: "cdn"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8083"

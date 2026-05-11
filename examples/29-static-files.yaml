@@ -1,0 +1,55 @@
+## 29 — Static File Serving with try_files
+## Serves static files from ./public, with try_files fallback to PHP backend.
+## Equivalent nginx config:
+##   location ~ \.(css|js|png|jpg|gif|ico)$ {
+##       expires 1y;
+##       try_files $uri =404;
+##   }
+##   location / {
+##       try_files $uri $uri/ /index.php$is_args$args;
+##   }
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "web"
+    bind: ":9000"
+    protocol: "http"
+    backend: "php"
+    routes:
+      # Static assets with 1 year cache
+      - match:
+          path_regex: "\\.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$"
+        static:
+          root: "./public"
+        try_files:
+          files: ["$uri"]
+          fallback: "=404"
+        expires: "1y"
+
+      # PDFs and documents (no cache)
+      - match:
+          path_regex: "\\.(pdf|xml|xlsx)$"
+        static:
+          root: "./public"
+        try_files:
+          files: ["$uri"]
+          fallback: "/index.php$is_args$args"
+        expires: "-1"
+
+      # Everything else — try static first, fall back to PHP
+      - match:
+          path_prefix: "/"
+        static:
+          root: "./public"
+          index: ["index.html", "index.htm"]
+        try_files:
+          files: ["$uri", "$uri/"]
+          fallback: "/index.php$is_args$args"
+        backend: "php"
+
+backends:
+  - name: "php"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"

@@ -1,0 +1,32 @@
+## 11 — Redirect Rules
+## Redirects /old/* to /new with 301, HTTP→HTTPS with variable substitution.
+## Supported variables: ${host}, ${path}, ${query}, ${scheme}, ${uri}, ${port}
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "redirector"
+    bind: ":9000"
+    protocol: "http"
+    backend: "backend"
+    routes:
+      - match:
+          path_prefix: "/old"
+        redirect:
+          url: "/new"
+          code: 301
+      - match:
+          path_prefix: "/secure"
+        redirect:
+          url: "https://${host}${path}"
+          code: 301
+      - match:
+          path_prefix: "/moved"
+        redirect:
+          url: "https://example.com${uri}"
+          code: 302
+backends:
+  - name: "backend"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"

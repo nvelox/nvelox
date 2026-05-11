@@ -133,7 +133,5 @@ func (c *Checker) updateStatus(addr string, healthy bool) {
 		if c.OnStatusChange != nil {
 			c.OnStatusChange(addr, healthy)
 		}
-
-		// TODO: Notify Balancer to remove/add server
 	}
 }

@@ -2,8 +2,12 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -13,16 +17,47 @@ type Config struct {
 	Version string        `yaml:"version"`
 	Server  ServerConfig  `yaml:"server"`
 	Logging LoggingConfig `yaml:"logging"`
+	Metrics MetricsConfig `yaml:"metrics,omitempty"`
+	Admin   AdminConfig   `yaml:"admin,omitempty"`
+	Tracing TracingConfig `yaml:"tracing,omitempty"`
 	Include string        `yaml:"include"`
 
 	Listeners []Listener `yaml:"listeners"`
 	Backends  []Backend  `yaml:"backends"`
 }
 
+// MetricsConfig defines the Prometheus metrics endpoint.
+type MetricsConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Bind    string `yaml:"bind"`
+	Path    string `yaml:"path"`
+}
+
+// AdminConfig defines the admin REST API endpoint.
+type AdminConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	Bind     string `yaml:"bind"`      // e.g., "127.0.0.1:9091"
+	APIKey   string `yaml:"api_key"`   // Required for all requests (via X-API-Key header)
+}
+
+// TracingConfig defines OpenTelemetry tracing settings.
+type TracingConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	Endpoint string `yaml:"endpoint"` // OTLP endpoint
+	Service  string `yaml:"service"`  // service name
+}
+
+// ThrottleConfig defines bandwidth throttling settings.
+type ThrottleConfig struct {
+	ReadRate  string `yaml:"read_rate,omitempty"`  // e.g., "10MB/s"
+	WriteRate string `yaml:"write_rate,omitempty"` // e.g., "10MB/s"
+}
+
 type ServerConfig struct {
 	User    string `yaml:"user"`
 	Group   string `yaml:"group"`
 	PidFile string `yaml:"pid_file"`
+	Workers int    `yaml:"workers,omitempty"` // SO_REUSEPORT workers (0 = single process)
 }
 
 type LoggingConfig struct {
@@ -32,39 +67,325 @@ type LoggingConfig struct {
 }
 
 // Listener defines a frontend listener.
+//
+// Multiple listeners may share the same `bind:` address (nginx-style
+// multi-server-per-port). When they do, ServerNames + DefaultServer
+// determine which one handles a given request:
+//   - SNI / Host header is matched against ServerNames (exact, then
+//     leftmost-wildcard "*.foo.com").
+//   - Unmatched requests fall through to the listener with
+//     DefaultServer: true. If no default exists, the connection is
+//     closed (or 421 returned, depending on strict_sni).
 type Listener struct {
-	Name           string `yaml:"name"`
-	Bind           string `yaml:"bind"`            // e.g., ":80" or "*:1024-2048"
-	Protocol       string `yaml:"protocol"`        // "tcp", "udp", "http", "https"
-	ZeroCopy       bool   `yaml:"zero_copy"`       // Use splice for TCP
-	DefaultBackend string `yaml:"default_backend"` // Name of the backend pool
+	Name     string `yaml:"name"`
+	Bind     string `yaml:"bind"`     // e.g., ":80" or "*:1024-2048"
+	Protocol string `yaml:"protocol"` // "tcp", "udp", "http", "https"
+	ZeroCopy bool   `yaml:"zero_copy"`
 
-	// L7 fields (Placeholder for future)
-	TLS    TLSConfig     `yaml:"tls,omitempty"`
-	Routes []RouteConfig `yaml:"routes,omitempty"`
+	// Backend names the upstream pool. For TCP/UDP listeners it's the
+	// pool every connection is forwarded to. For HTTP/HTTPS listeners
+	// with `routes:` it's the fallback when no route matches; without
+	// `routes:` it's the single destination.
+	Backend string `yaml:"backend,omitempty"`
+
+	// DefaultBackend is the legacy YAML key (HAProxy-style). New configs
+	// should use `backend:` instead. Setting both is a config error;
+	// setting only this field still works and logs a deprecation warning
+	// at load time. Will be removed in a future release.
+	DefaultBackend string `yaml:"default_backend,omitempty"`
+
+	// Multi-server-per-port (nginx-style).
+	// ServerNames are SNI / Host names this listener answers to. Wildcards
+	// allowed in the leftmost label only ("*.foo.com"). Empty + single
+	// listener on the bind = match-everything (back-compat).
+	ServerNames   []string `yaml:"server_names,omitempty"`
+	// DefaultServer marks this listener as the catch-all for its bind
+	// group when SNI / Host doesn't match any other site's ServerNames.
+	// At most one DefaultServer per bind group.
+	DefaultServer bool     `yaml:"default_server,omitempty"`
+
+	// Rate limiting
+	RateLimit RateLimitConfig `yaml:"rate_limit,omitempty"`
+
+	// Timeouts
+	Timeouts TimeoutConfig `yaml:"timeouts,omitempty"`
+
+	// TLS
+	TLS TLSConfig `yaml:"tls,omitempty"`
+
+	// SNI routing (TLS passthrough without termination)
+	SNIRoutes []SNIRoute `yaml:"sni_routes,omitempty"`
+
+	// Security
+	IPAllowlist []string          `yaml:"ip_allowlist,omitempty"` // CIDR allow list
+	IPDenylist  []string          `yaml:"ip_denylist,omitempty"`  // CIDR deny list
+	MaxBodySize string            `yaml:"max_body_size,omitempty"` // e.g., "10MB"
+	IPRateLimit IPRateLimitConfig `yaml:"ip_rate_limit,omitempty"`
+	ACL         []ACLRule         `yaml:"acl,omitempty"`
+
+	// TrustedProxies: CIDRs whose X-Forwarded-For / X-Real-IP / X-Forwarded-Proto
+	// headers are trusted and extended. Requests from any other source have
+	// these headers *replaced* (not appended) so a direct client can't spoof
+	// their source IP by presenting a forged XFF chain.
+	// If empty, no peer is trusted → XFF is always replaced with the peer IP.
+	TrustedProxies []string `yaml:"trusted_proxies,omitempty"`
+
+	// L7 fields
+	HTTP3       bool              `yaml:"http3,omitempty"`
+	Routes      []RouteConfig     `yaml:"routes,omitempty"`
+	Headers     HeadersConfig     `yaml:"headers,omitempty"`
+	Compression CompressionConfig `yaml:"compression,omitempty"`
+	ErrorPages  map[int]string    `yaml:"error_pages,omitempty"` // status code -> file path
+	Root        string            `yaml:"root,omitempty"`        // Document root for static files
+	Buffering   BufferingConfig   `yaml:"buffering,omitempty"`
+	Cache       CacheConfig       `yaml:"cache,omitempty"`
+	GRPC        bool              `yaml:"grpc,omitempty"`        // Enable gRPC-aware proxying
+	Throttle    ThrottleConfig    `yaml:"throttle,omitempty"`    // Bandwidth throttling
 }
 
-// TLSConfig placeholder
+// BufferingConfig defines request/response buffer sizes.
+type BufferingConfig struct {
+	RequestBodyBuffer string `yaml:"request_body_buffer,omitempty"` // e.g., "64KB"
+	ResponseBuffer    string `yaml:"response_buffer,omitempty"`     // e.g., "256KB"
+}
+
+// CacheConfig defines response caching settings.
+type CacheConfig struct {
+	Enabled    bool     `yaml:"enabled"`
+	MaxSize    string   `yaml:"max_size,omitempty"`    // e.g., "256MB"
+	DefaultTTL string   `yaml:"default_ttl,omitempty"` // e.g., "5m"
+	Methods    []string `yaml:"methods,omitempty"`     // default ["GET"]
+}
+
+// CompressionConfig defines response compression settings.
+type CompressionConfig struct {
+	Enabled   bool     `yaml:"enabled"`
+	Types     []string `yaml:"types,omitempty"`      // content types to compress
+	MinLength int      `yaml:"min_length,omitempty"` // minimum response size in bytes
+}
+
+// IPRateLimitConfig defines per-IP rate limiting.
+type IPRateLimitConfig struct {
+	RequestsPerSecond float64 `yaml:"requests_per_second"`
+	Burst             int     `yaml:"burst"`
+}
+
+// ACLRule defines an access control rule.
+type ACLRule struct {
+	Match  ACLMatch `yaml:"match"`
+	Action string   `yaml:"action"` // "allow" or "deny"
+}
+
+// ACLMatch defines conditions for an ACL rule.
+type ACLMatch struct {
+	SourceIP []string          `yaml:"source_ip,omitempty"` // CIDR notation
+	Method   []string          `yaml:"method,omitempty"`
+	Headers  map[string]string `yaml:"headers,omitempty"`
+}
+
+// RateLimitConfig defines per-listener connection rate limiting.
+type RateLimitConfig struct {
+	ConnectionsPerSecond float64 `yaml:"connections_per_second"`
+	Burst                int     `yaml:"burst"`
+}
+
+// TLSConfig defines TLS certificate configuration.
 type TLSConfig struct {
-	Cert     string `yaml:"cert"`
-	Key      string `yaml:"key"`
-	AutoCert bool   `yaml:"auto_cert"`
+	Cert          string `yaml:"cert"`
+	Key           string `yaml:"key"`
+	AutoCert      bool   `yaml:"auto_cert"`
+	OCSPStapling  bool   `yaml:"ocsp_stapling,omitempty"`  // Enable OCSP stapling
+	ClientAuth    string `yaml:"client_auth,omitempty"`     // "require", "request", "none"
+	ClientCA      string `yaml:"client_ca,omitempty"`       // CA cert for client verification
+
+	// MinVersion is the lowest TLS protocol version this listener accepts.
+	// Values: "1.2", "1.3". Empty defaults to "1.2".
+	MinVersion string `yaml:"min_version,omitempty"`
+	// MaxVersion is the highest TLS protocol version this listener accepts.
+	// Values: "1.2", "1.3". Empty defaults to "1.3".
+	MaxVersion string `yaml:"max_version,omitempty"`
+	// CipherSuites is an allowlist of cipher-suite names (TLS 1.2 only;
+	// TLS 1.3 suites are mandatory and not configurable per RFC 8446).
+	// Names must match Go's tls.CipherSuites(). Empty keeps Go's safe
+	// default list. Example: ["TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"].
+	CipherSuites []string `yaml:"cipher_suites,omitempty"`
 }
 
-// RouteConfig placeholder
+// RouteConfig defines an L7 route matching rule.
 type RouteConfig struct {
-	Match   map[string]string `yaml:"match"`
-	Backend string            `yaml:"backend"`
+	Match    RouteMatch     `yaml:"match"`
+	Backend  string         `yaml:"backend,omitempty"`
+	Headers  HeadersConfig  `yaml:"headers,omitempty"`
+	Rewrite  RewriteConfig  `yaml:"rewrite,omitempty"`
+	Redirect RedirectConfig `yaml:"redirect,omitempty"`
+	Scripts  ScriptsConfig  `yaml:"scripts,omitempty"`
+	Static   StaticConfig   `yaml:"static,omitempty"`   // Serve static files
+	TryFiles TryFilesConfig `yaml:"try_files,omitempty"` // try_files logic
+	Expires  string         `yaml:"expires,omitempty"`   // Cache-Control: "1y", "30d", "1h", "-1" (no cache)
+	FastCGI  FastCGIConfig  `yaml:"fastcgi,omitempty"`   // Forward to FastCGI (PHP-FPM)
+}
+
+// FastCGIConfig defines FastCGI upstream (e.g., PHP-FPM) settings.
+type FastCGIConfig struct {
+	Pass         string            `yaml:"pass"`                    // FastCGI address (e.g., "127.0.0.1:9000" or "unix:/var/run/php-fpm.sock")
+	DocumentRoot string            `yaml:"document_root,omitempty"` // DOCUMENT_ROOT for SCRIPT_FILENAME
+	ScriptName   string            `yaml:"script_name,omitempty"`   // Override SCRIPT_NAME (default: from URL path)
+	SplitPathInfo string           `yaml:"split_path_info,omitempty"` // Regex to split PATH_INFO (like fastcgi_split_path_info)
+	Params       map[string]string `yaml:"params,omitempty"`        // Extra FastCGI params
+	Index        string            `yaml:"index,omitempty"`         // Default script (e.g., "index.php")
+}
+
+// StaticConfig defines static file serving.
+type StaticConfig struct {
+	Root      string   `yaml:"root"`                  // Document root directory
+	Index     []string `yaml:"index,omitempty"`        // Index files (default: ["index.html"])
+	Autoindex bool     `yaml:"autoindex,omitempty"`    // Directory listing
+}
+
+// TryFilesConfig defines try_files behavior.
+type TryFilesConfig struct {
+	Files    []string `yaml:"files"`     // e.g., ["$uri", "$uri/", "/index.php$is_args$args"]
+	Fallback string   `yaml:"fallback"`  // Fallback path or =status (e.g., "=404", "/fallback.html")
+}
+
+// ScriptsConfig defines Lua script hooks for a route.
+type ScriptsConfig struct {
+	RequestScript  string `yaml:"request_script,omitempty"`  // path to Lua file
+	ResponseScript string `yaml:"response_script,omitempty"` // path to Lua file
+}
+
+// RouteMatch defines the conditions for matching an HTTP request.
+type RouteMatch struct {
+	Host       string `yaml:"host,omitempty"`        // Exact host match (case-insensitive)
+	PathPrefix string `yaml:"path_prefix,omitempty"` // URL path prefix match
+	PathRegex  string `yaml:"path_regex,omitempty"`  // Regex path match (captures available for rewrite)
+}
+
+// RewriteConfig defines URL rewriting.
+type RewriteConfig struct {
+	Path string `yaml:"path,omitempty"` // Replace path (supports $1 captures from regex)
+}
+
+// RedirectConfig defines HTTP redirect responses.
+type RedirectConfig struct {
+	URL  string `yaml:"url,omitempty"`
+	Code int    `yaml:"code,omitempty"` // 301 or 302 (default 302)
+}
+
+// SNIRoute defines TLS passthrough routing based on server name.
+type SNIRoute struct {
+	ServerName string `yaml:"server_name"` // hostname or *.example.com pattern
+	Backend    string `yaml:"backend"`
+}
+
+// TimeoutConfig defines configurable timeouts for listeners and backends.
+type TimeoutConfig struct {
+	Connect string `yaml:"connect,omitempty"` // dial timeout (default "10s")
+	Read    string `yaml:"read,omitempty"`    // read timeout
+	Write   string `yaml:"write,omitempty"`   // write timeout
+	Idle    string `yaml:"idle,omitempty"`    // idle connection timeout
+}
+
+// ParseConnect returns the connect timeout duration, defaulting to 10s.
+func (t TimeoutConfig) ParseConnect() time.Duration {
+	if t.Connect == "" {
+		return 10 * time.Second
+	}
+	d, err := time.ParseDuration(t.Connect)
+	if err != nil {
+		return 10 * time.Second
+	}
+	return d
+}
+
+// ParseRead returns the read timeout duration, or 0 (no timeout) if not set.
+func (t TimeoutConfig) ParseRead() time.Duration {
+	if t.Read == "" {
+		return 0
+	}
+	d, _ := time.ParseDuration(t.Read)
+	return d
+}
+
+// ParseWrite returns the write timeout duration, or 0 (no timeout) if not set.
+func (t TimeoutConfig) ParseWrite() time.Duration {
+	if t.Write == "" {
+		return 0
+	}
+	d, _ := time.ParseDuration(t.Write)
+	return d
+}
+
+// ParseIdle returns the idle timeout duration, or 0 (no timeout) if not set.
+func (t TimeoutConfig) ParseIdle() time.Duration {
+	if t.Idle == "" {
+		return 0
+	}
+	d, _ := time.ParseDuration(t.Idle)
+	return d
+}
+
+// HeadersConfig defines request/response header manipulation.
+type HeadersConfig struct {
+	RequestAdd     map[string]string `yaml:"request_add,omitempty"`
+	RequestSet     map[string]string `yaml:"request_set,omitempty"`
+	RequestRemove  []string          `yaml:"request_remove,omitempty"`
+	ResponseAdd    map[string]string `yaml:"response_add,omitempty"`
+	ResponseSet    map[string]string `yaml:"response_set,omitempty"`
+	ResponseRemove []string          `yaml:"response_remove,omitempty"`
 }
 
 // Backend defines a server pool.
 type Backend struct {
-	Name        string   `yaml:"name"`
-	Balance     string   `yaml:"balance"`       // "roundrobin", "leastconn", "random"
-	SendProxyV2 bool     `yaml:"send_proxy_v2"` // Send PROXY Protocol v2 header to backend
-	Servers     []string `yaml:"servers"`       // List of server addresses
+	Name           string   `yaml:"name"`
+	Balance        string   `yaml:"balance"`          // "roundrobin", "leastconn", "random"
+	SendProxyV2    bool     `yaml:"send_proxy_v2"`    // Send PROXY Protocol v2 header to backend
+	Servers        []string `yaml:"servers"`          // List of server addresses
+	MaxConnections int      `yaml:"max_connections"`  // Max concurrent connections (0 = unlimited)
 
-	HealthCheck HealthCheckConfig `yaml:"health_check,omitempty"`
+	Timeouts      TimeoutConfig     `yaml:"timeouts,omitempty"`
+	Retry         RetryConfig       `yaml:"retry,omitempty"`
+	StickySession StickyConfig      `yaml:"sticky_session,omitempty"`
+	ResolveInterval string           `yaml:"resolve_interval,omitempty"` // DNS re-resolve interval
+	// AllowPrivateIPs: if true, backend hostnames may resolve to RFC1918,
+	// loopback, link-local or CGNAT addresses. Default (false) blocks these
+	// to prevent DNS-rebinding / SSRF when a hostname is attacker-controlled.
+	// Set to true only when backends legitimately live on a private network.
+	AllowPrivateIPs bool              `yaml:"allow_private_ips,omitempty"`
+	BackendTLS     BackendTLSConfig  `yaml:"backend_tls,omitempty"`
+	CircuitBreaker CBConfig         `yaml:"circuit_breaker,omitempty"`
+	HealthCheck    HealthCheckConfig `yaml:"health_check,omitempty"`
+}
+
+// CBConfig defines circuit breaker settings per backend.
+type CBConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	Threshold   int    `yaml:"threshold"`       // failures to open
+	Timeout     string `yaml:"timeout"`          // time in open state before half-open
+	HalfOpenMax int    `yaml:"half_open_max"`    // max requests in half-open
+}
+
+// BackendTLSConfig defines TLS settings for connecting to backend servers.
+type BackendTLSConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	CACert     string `yaml:"ca_cert,omitempty"`
+	ClientCert string `yaml:"client_cert,omitempty"`
+	ClientKey  string `yaml:"client_key,omitempty"`
+	Insecure   bool   `yaml:"insecure,omitempty"` // skip certificate verification
+}
+
+// RetryConfig defines retry behavior on backend failure.
+type RetryConfig struct {
+	Attempts int    `yaml:"attempts"` // max attempts (default 1 = no retry)
+	On       string `yaml:"on"`       // comma-separated: "connect_failure,502,503"
+}
+
+// StickyConfig defines session persistence.
+type StickyConfig struct {
+	Type       string `yaml:"type"`        // "cookie", "header", "ip_hash"
+	CookieName string `yaml:"cookie_name"` // for cookie type (default "NVELOX_SRV")
+	HeaderName string `yaml:"header_name"` // for header type
+	TTL        string `yaml:"ttl"`         // session TTL (default "1h")
 }
 
 type HealthCheckConfig struct {
@@ -96,11 +417,17 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	// Process Include
+	// Process Include.
+	//
+	// Security: resolve the glob relative to the main config file's
+	// directory and require every match to stay under it. Without this,
+	// a config loaded from an untrusted source (or generated by a template)
+	// could include a pattern like "/etc/*/passwd" and pull in arbitrary
+	// filesystem contents at parse time.
 	if cfg.Include != "" {
-		matches, err := filepath.Glob(cfg.Include)
+		matches, err := resolveIncludeGlob(cfg.Include, path)
 		if err != nil {
-			return nil, fmt.Errorf("bad include glob pattern: %w", err)
+			return nil, err
 		}
 
 		for _, match := range matches {
@@ -125,8 +452,20 @@ func Load(path string) (*Config, error) {
 		cfg.Logging.Level = "info"
 	}
 	for i := range cfg.Listeners {
-		if cfg.Listeners[i].Protocol == "" {
-			cfg.Listeners[i].Protocol = "tcp"
+		l := &cfg.Listeners[i]
+		if l.Protocol == "" {
+			l.Protocol = "tcp"
+		}
+		// Migrate the deprecated `default_backend:` key into `backend:`.
+		// Setting both is a load error — it's almost always a typo or a
+		// half-finished migration and we shouldn't silently pick one.
+		if l.DefaultBackend != "" {
+			if l.Backend != "" {
+				return nil, fmt.Errorf("listener %s: both 'backend' and 'default_backend' are set — use 'backend' only", l.Name)
+			}
+			fmt.Fprintf(os.Stderr, "[CONFIG] listener %s: 'default_backend' is deprecated; use 'backend' instead\n", l.Name)
+			l.Backend = l.DefaultBackend
+			l.DefaultBackend = ""
 		}
 	}
 
@@ -143,6 +482,8 @@ func validate(cfg *Config) error {
 	}
 
 	backendNames := make(map[string]bool)
+	validAlgorithms := map[string]bool{"": true, "roundrobin": true, "leastconn": true, "random": true}
+
 	for _, b := range cfg.Backends {
 		if b.Name == "" {
 			return fmt.Errorf("backend must have a name")
@@ -151,6 +492,48 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("duplicate backend name: %s", b.Name)
 		}
 		backendNames[b.Name] = true
+
+		if len(b.Servers) == 0 {
+			return fmt.Errorf("backend %s must have at least one server", b.Name)
+		}
+
+		if !validAlgorithms[b.Balance] {
+			return fmt.Errorf("backend %s has invalid balance algorithm: %q (must be roundrobin, leastconn, or random)", b.Name, b.Balance)
+		}
+
+		for _, s := range b.Servers {
+			if s == "" {
+				return fmt.Errorf("backend %s has empty server address", b.Name)
+			}
+			if _, _, err := net.SplitHostPort(s); err != nil {
+				// Allow bare IP/hostname without port (1:1 port mapping for port ranges)
+				if net.ParseIP(s) != nil {
+					continue // valid bare IP
+				}
+				// Not a bare IP — reject if it has invalid chars, allow hostnames
+				if strings.ContainsAny(s, ":/ ") {
+					return fmt.Errorf("backend %s has invalid server address %q: %v", b.Name, s, err)
+				}
+			}
+		}
+
+		if b.HealthCheck.Active.Interval != "" {
+			if _, err := time.ParseDuration(b.HealthCheck.Active.Interval); err != nil {
+				return fmt.Errorf("backend %s has invalid health check interval %q: %v", b.Name, b.HealthCheck.Active.Interval, err)
+			}
+		}
+		if b.HealthCheck.Active.Timeout != "" {
+			if _, err := time.ParseDuration(b.HealthCheck.Active.Timeout); err != nil {
+				return fmt.Errorf("backend %s has invalid health check timeout %q: %v", b.Name, b.HealthCheck.Active.Timeout, err)
+			}
+		}
+
+		// Validate backend timeouts
+		if b.Timeouts.Connect != "" {
+			if _, err := time.ParseDuration(b.Timeouts.Connect); err != nil {
+				return fmt.Errorf("backend %s has invalid connect timeout %q: %v", b.Name, b.Timeouts.Connect, err)
+			}
+		}
 	}
 
 	for _, l := range cfg.Listeners {
@@ -160,10 +543,313 @@ func validate(cfg *Config) error {
 		if l.Bind == "" {
 			return fmt.Errorf("listener %s must have a bind address", l.Name)
 		}
-		if l.DefaultBackend != "" && !backendNames[l.DefaultBackend] {
-			return fmt.Errorf("listener %s references unknown backend: %s", l.Name, l.DefaultBackend)
+		if l.Backend != "" && !backendNames[l.Backend] {
+			return fmt.Errorf("listener %s references unknown backend: %s", l.Name, l.Backend)
+		}
+
+		// Validate bind address format
+		if err := validateBindAddress(l.Bind); err != nil {
+			return fmt.Errorf("listener %s has invalid bind address %q: %v", l.Name, l.Bind, err)
+		}
+
+		// Validate TLS config
+		if l.TLS.Cert != "" || l.TLS.Key != "" {
+			if l.TLS.Cert == "" {
+				return fmt.Errorf("listener %s: TLS key is set but cert is missing", l.Name)
+			}
+			if l.TLS.Key == "" {
+				return fmt.Errorf("listener %s: TLS cert is set but key is missing", l.Name)
+			}
+			if _, err := os.Stat(l.TLS.Cert); err != nil {
+				return fmt.Errorf("listener %s: TLS cert file not found: %v", l.Name, err)
+			}
+			if _, err := os.Stat(l.TLS.Key); err != nil {
+				return fmt.Errorf("listener %s: TLS key file not found: %v", l.Name, err)
+			}
+		}
+
+		// Validate listener timeouts
+		for _, field := range []struct{ name, val string }{
+			{"connect", l.Timeouts.Connect}, {"read", l.Timeouts.Read},
+			{"write", l.Timeouts.Write}, {"idle", l.Timeouts.Idle},
+		} {
+			if field.val != "" {
+				if _, err := time.ParseDuration(field.val); err != nil {
+					return fmt.Errorf("listener %s has invalid %s timeout %q: %v", l.Name, field.name, field.val, err)
+				}
+			}
+		}
+
+		// Validate HTTP/HTTPS listener requirements
+		if l.Protocol == "http" || l.Protocol == "https" {
+			if l.Backend == "" && len(l.Routes) == 0 {
+				return fmt.Errorf("listener %s: HTTP listener requires 'backend' or 'routes'", l.Name)
+			}
+			if l.Protocol == "https" && l.TLS.Cert == "" {
+				return fmt.Errorf("listener %s: HTTPS listener requires TLS cert/key", l.Name)
+			}
+			for i, r := range l.Routes {
+				hasRedirect := r.Redirect.URL != ""
+				hasFastCGI := r.FastCGI.Pass != ""
+				hasStatic := r.Static.Root != ""
+				// Backend is required unless the route is a redirect, fastcgi, or static-only
+				if r.Backend == "" && !hasRedirect && !hasFastCGI && !hasStatic {
+					return fmt.Errorf("listener %s: route %d must have a backend", l.Name, i)
+				}
+				if r.Backend != "" && !backendNames[r.Backend] {
+					return fmt.Errorf("listener %s: route %d references unknown backend: %s", l.Name, i, r.Backend)
+				}
+				if r.Match.Host == "" && r.Match.PathPrefix == "" && r.Match.PathRegex == "" {
+					return fmt.Errorf("listener %s: route %d must have at least host, path_prefix, or path_regex", l.Name, i)
+				}
+			}
+		}
+
+		// Validate HTTP3 requires HTTPS
+		if l.HTTP3 && l.Protocol != "https" {
+			return fmt.Errorf("listener %s: http3 requires protocol 'https'", l.Name)
+		}
+
+		// Validate server_names format (early per-listener check; cross-
+		// listener uniqueness is checked in the bind-group pass below).
+		for _, sn := range l.ServerNames {
+			if err := validateServerName(sn); err != nil {
+				return fmt.Errorf("listener %s: server_names %q: %v", l.Name, sn, err)
+			}
+		}
+	}
+
+	// Cross-listener bind-group rules (nginx-style multi-server-per-port).
+	if err := validateBindGroups(cfg.Listeners); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateServerName checks a server_names entry. Allows exact hostnames and
+// leftmost-wildcard "*.foo.com" only — matches nginx semantics and avoids
+// surprises with right-prefix wildcards that few certificate authorities
+// support.
+func validateServerName(s string) error {
+	if s == "" {
+		return fmt.Errorf("empty server name")
+	}
+	if strings.Contains(s, "*") {
+		// Only "*.something" is allowed, and only one wildcard.
+		if !strings.HasPrefix(s, "*.") || strings.Count(s, "*") > 1 {
+			return fmt.Errorf("wildcard must be leftmost label only (e.g. \"*.foo.com\")")
+		}
+		// "*." alone is not a valid hostname.
+		if len(s) <= 2 {
+			return fmt.Errorf("wildcard must be followed by a hostname")
+		}
+	}
+	// Reject path-like or scheme-prefixed entries.
+	if strings.ContainsAny(s, "/:?# ") {
+		return fmt.Errorf("server name must be a bare hostname")
+	}
+	return nil
+}
+
+// validateBindGroups enforces the nginx-style multi-server-per-port rules
+// across the full set of listeners.
+//
+// "Bind group" here means listeners that actually share an OS socket. TCP
+// and UDP on the same port number do NOT share a socket (HTTP/3 + HTTPS
+// is the canonical example), so we group by (protocol-family, bind) pair.
+// Within HTTP and HTTPS, however, we treat them as one family because
+// they share an HTTP listener at the engine level — http+https on the
+// same port is still rejected.
+func validateBindGroups(listeners []Listener) error {
+	// protocolFamily collapses protocols by underlying transport so we
+	// only flag genuine same-socket conflicts:
+	//   tcp, http, https → "tcp"  (all TCP-based — share a TCP socket)
+	//   udp              → "udp"  (independent UDP socket)
+	// HTTP+HTTPS on the same port still conflict (same TCP socket).
+	// TCP+UDP on the same port number do NOT conflict (different sockets,
+	// the canonical HTTP/3 + HTTPS pattern).
+	protocolFamily := func(p string) string {
+		switch p {
+		case "udp":
+			return "udp"
+		default:
+			return "tcp"
+		}
+	}
+
+	// Group by (family, bind).
+	type groupKey struct{ family, bind string }
+	groups := make(map[groupKey][]*Listener)
+	for i := range listeners {
+		l := &listeners[i]
+		k := groupKey{family: protocolFamily(l.Protocol), bind: l.Bind}
+		groups[k] = append(groups[k], l)
+	}
+
+	for key, sites := range groups {
+		bind := key.bind
+		if len(sites) < 2 {
+			// Single-listener groups behave exactly as today; no extra rules.
+			continue
+		}
+
+		// Rule: same protocol within a bind group. With the (family, bind)
+		// keying above this only fires for genuine same-socket conflicts
+		// (e.g. http+https-on-the-same-port if someone ever wrote that).
+		proto := sites[0].Protocol
+		for _, s := range sites[1:] {
+			if s.Protocol != proto {
+				return fmt.Errorf("bind %s: listeners %s (%s) and %s (%s) share a port but use different protocols",
+					bind, sites[0].Name, proto, s.Name, s.Protocol)
+			}
+		}
+
+		// Rule: at most one default_server per bind group.
+		defaults := 0
+		for _, s := range sites {
+			if s.DefaultServer {
+				defaults++
+			}
+		}
+		if defaults > 1 {
+			return fmt.Errorf("bind %s: more than one listener marked default_server", bind)
+		}
+
+		// Rule: every non-default site in a multi-site group must declare
+		// at least one server_name. Without it, host-based dispatch can't
+		// route to it — silent unreachable config is worse than a startup
+		// error.
+		for _, s := range sites {
+			if s.DefaultServer {
+				continue
+			}
+			if len(s.ServerNames) == 0 {
+				return fmt.Errorf("bind %s: listener %s shares a port but has no server_names and is not default_server",
+					bind, s.Name)
+			}
+		}
+
+		// Rule: each server_name appears in at most one site per bind group.
+		seen := make(map[string]string) // name → owning listener
+		for _, s := range sites {
+			for _, sn := range s.ServerNames {
+				lname := strings.ToLower(sn)
+				if owner, dup := seen[lname]; dup {
+					return fmt.Errorf("bind %s: server_name %q claimed by both %s and %s",
+						bind, sn, owner, s.Name)
+				}
+				seen[lname] = s.Name
+			}
+		}
+
+		// Rule: SNI passthrough (sni_routes) and TLS termination (https)
+		// can't share a port — they're handled by entirely different paths.
+		hasSNI, hasHTTPS := false, false
+		for _, s := range sites {
+			if len(s.SNIRoutes) > 0 {
+				hasSNI = true
+			}
+			if s.Protocol == "https" {
+				hasHTTPS = true
+			}
+		}
+		if hasSNI && hasHTTPS {
+			return fmt.Errorf("bind %s: cannot mix sni_routes (passthrough) and https (termination) on the same port", bind)
 		}
 	}
 
 	return nil
+}
+
+func validateBindAddress(addr string) error {
+	lastColon := strings.LastIndex(addr, ":")
+	if lastColon == -1 {
+		return fmt.Errorf("missing port")
+	}
+	portStr := addr[lastColon+1:]
+
+	if strings.Contains(portStr, "-") {
+		parts := strings.Split(portStr, "-")
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid port range format")
+		}
+		start, err := strconv.Atoi(parts[0])
+		if err != nil {
+			return fmt.Errorf("invalid range start port: %v", err)
+		}
+		end, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return fmt.Errorf("invalid range end port: %v", err)
+		}
+		if start < 1 || start > 65535 || end < 1 || end > 65535 {
+			return fmt.Errorf("port out of range (1-65535)")
+		}
+		if start > end {
+			return fmt.Errorf("port range start (%d) is greater than end (%d)", start, end)
+		}
+		return nil
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return fmt.Errorf("invalid port: %v", err)
+	}
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("port %d out of range (1-65535)", port)
+	}
+	return nil
+}
+
+// resolveIncludeGlob expands an `include:` pattern and enforces that every
+// match stays under the main config file's directory. Patterns may be
+// relative (resolved against the main-config dir) or absolute, but any
+// match that doesn't live under the main-config dir — or any pattern
+// containing ".." traversal — is rejected.
+//
+// This prevents a templated / externally-authored config from pulling in
+// arbitrary filesystem contents ("/etc/*/passwd", "../../../secrets/*")
+// at parse time.
+func resolveIncludeGlob(pattern, mainConfigPath string) ([]string, error) {
+	if pattern == "" {
+		return nil, nil
+	}
+	baseDir, err := filepath.Abs(filepath.Dir(mainConfigPath))
+	if err != nil {
+		return nil, fmt.Errorf("resolve include base dir: %w", err)
+	}
+
+	// Refuse ".." traversal in the pattern. This catches both explicit
+	// upward traversal and any attempt to use it as a cross-dir bypass.
+	for _, seg := range strings.Split(filepath.ToSlash(pattern), "/") {
+		if seg == ".." {
+			return nil, fmt.Errorf("include pattern %q must not contain '..' path segments", pattern)
+		}
+	}
+
+	// Resolve to absolute. Relative patterns are rooted at baseDir; absolute
+	// patterns must still land under baseDir to be accepted.
+	full := pattern
+	if !filepath.IsAbs(pattern) {
+		full = filepath.Join(baseDir, pattern)
+	}
+
+	matches, err := filepath.Glob(full)
+	if err != nil {
+		return nil, fmt.Errorf("bad include glob pattern: %w", err)
+	}
+
+	// Verify each resolved match actually lives under baseDir.
+	clean := make([]string, 0, len(matches))
+	for _, m := range matches {
+		abs, err := filepath.Abs(m)
+		if err != nil {
+			continue
+		}
+		if abs != baseDir && !strings.HasPrefix(abs, baseDir+string(filepath.Separator)) {
+			return nil, fmt.Errorf("include match %q escapes config dir %q", abs, baseDir)
+		}
+		clean = append(clean, abs)
+	}
+	return clean, nil
 }

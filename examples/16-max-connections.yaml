@@ -1,0 +1,16 @@
+## 16 — Max Connections Per Backend
+## Limits backend to 5 concurrent connections; returns 503 when full.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "maxconn"
+    bind: ":9000"
+    protocol: "http"
+    backend: "limited"
+backends:
+  - name: "limited"
+    balance: "roundrobin"
+    max_connections: 5
+    servers:
+      - "127.0.0.1:8081"

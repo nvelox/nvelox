@@ -2,10 +2,10 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"log"
 	"math/rand"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,7 +42,9 @@ func main() {
 				default:
 					// Pick random port
 					port := *startPort + rand.Intn(*endPort-*startPort+1)
-					addr := fmt.Sprintf("%s:%d", *targetHost, port)
+					// JoinHostPort instead of Sprintf so IPv6 literals
+					// like "::1" produce a valid socket address.
+					addr := net.JoinHostPort(*targetHost, strconv.Itoa(port))
 
 					start := time.Now()
 					conn, err := net.DialTimeout("tcp", addr, 1*time.Second)

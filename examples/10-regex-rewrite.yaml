@@ -1,0 +1,21 @@
+## 10 — Regex Routing with URL Rewrite
+## Matches /api/v{N}/resource and rewrites to /v{N}/resource.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "regex-rewrite"
+    bind: ":9000"
+    protocol: "http"
+    backend: "backend"
+    routes:
+      - match:
+          path_regex: "^/api/v(\\d+)/(.*)"
+        rewrite:
+          path: "/v$1/$2"
+        backend: "backend"
+backends:
+  - name: "backend"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"

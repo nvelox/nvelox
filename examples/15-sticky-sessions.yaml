@@ -1,0 +1,20 @@
+## 15 — Sticky Sessions (cookie-based)
+## Same client always routed to same backend via NVELOX_SRV cookie.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "sticky"
+    bind: ":9000"
+    protocol: "http"
+    backend: "pool"
+backends:
+  - name: "pool"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"
+      - "127.0.0.1:8082"
+    sticky_session:
+      type: "cookie"
+      cookie_name: "NVELOX_SRV"
+      ttl: "1h"

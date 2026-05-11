@@ -1,0 +1,22 @@
+## 24 — Response Caching
+## Caches GET responses for 5 minutes, up to 64MB.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "cached"
+    bind: ":9000"
+    protocol: "http"
+    backend: "backend"
+    cache:
+      enabled: true
+      max_size: "64MB"
+      default_ttl: "5m"
+      methods:
+        - "GET"
+        - "HEAD"
+backends:
+  - name: "backend"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"

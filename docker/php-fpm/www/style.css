@@ -1,0 +1,3 @@
+/* Static file — nvelox should serve this directly without hitting PHP-FPM.
+   Look for the absence of X-Served-By in the response. */
+body { font-family: sans-serif; }

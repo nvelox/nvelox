@@ -1,0 +1,23 @@
+## 17 — ACL Access Control
+## Deny DELETE method, deny specific IP range.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "acl-proxy"
+    bind: ":9000"
+    protocol: "http"
+    backend: "backend"
+    acl:
+      - match:
+          method: ["DELETE", "PUT"]
+        action: "deny"
+      - match:
+          source_ip: ["192.168.0.0/16"]
+          method: ["POST"]
+        action: "deny"
+backends:
+  - name: "backend"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"

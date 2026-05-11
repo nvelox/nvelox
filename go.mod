@@ -3,16 +3,20 @@ module nvelox
 go 1.25.0
 
 require (
-	github.com/panjf2000/gnet/v2 v2.9.7
+	github.com/lesismal/nbio v1.6.8
+	github.com/pires/go-proxyproto v0.8.1
+	github.com/quic-go/quic-go v0.59.0
+	github.com/yookoala/gofast v0.8.0
+	github.com/yuin/gopher-lua v1.1.2
+	golang.org/x/crypto v0.50.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
-	github.com/panjf2000/ants/v2 v2.11.3 // indirect
-	github.com/valyala/bytebufferpool v1.0.0 // indirect
-	go.uber.org/multierr v1.11.0 // indirect
-	go.uber.org/zap v1.27.0 // indirect
-	golang.org/x/sync v0.11.0 // indirect
-	golang.org/x/sys v0.39.0 // indirect
-	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
+	github.com/kr/text v0.2.0 // indirect
+	github.com/quic-go/qpack v0.6.0 // indirect
+	golang.org/x/net v0.52.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
+	golang.org/x/text v0.36.0 // indirect
+	golang.org/x/tools/godoc v0.1.0-deprecated // indirect
 )

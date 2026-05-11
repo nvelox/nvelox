@@ -1,0 +1,16 @@
+## 25 — Port Range Binding
+## Binds 100 ports (9000-9099) with a single config line.
+## 1:1 port mapping — traffic on :9050 goes to backend:9050.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "range"
+    bind: ":9000-9099"
+    protocol: "tcp"
+    backend: "tunnel"
+backends:
+  - name: "tunnel"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1"

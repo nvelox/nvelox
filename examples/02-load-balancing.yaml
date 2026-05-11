@@ -1,0 +1,17 @@
+## 02 — Load Balancing (roundrobin, leastconn, random)
+## Distributes HTTP requests across 3 backends.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "http-lb"
+    bind: ":9000"
+    protocol: "http"
+    backend: "web-pool"
+backends:
+  - name: "web-pool"
+    balance: "leastconn"
+    servers:
+      - "127.0.0.1:8081"
+      - "127.0.0.1:8082"
+      - "127.0.0.1:8083"

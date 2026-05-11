@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -155,9 +156,11 @@ func TestLoadConfig_Errors(t *testing.T) {
 version: '2'
 backends:
   - name: b1
-    servers: []
+    servers:
+      - "10.0.0.1:80"
   - name: b1
-    servers: []
+    servers:
+      - "10.0.0.2:80"
 `), 0644)
 	if _, err := Load(badBackend); err == nil {
 		t.Error("expected error duplicate backend")
@@ -196,5 +199,598 @@ listeners:
 `), 0644)
 	if _, err := Load(badListener3); err == nil {
 		t.Error("expected error listener unknown backend")
+	}
+}
+
+func TestValidation_ServerAddress(t *testing.T) {
+	tests := []struct {
+		name    string
+		servers []string
+		wantErr bool
+	}{
+		{"valid host:port", []string{"10.0.0.1:80"}, false},
+		{"valid localhost:port", []string{"127.0.0.1:8080"}, false},
+		{"bare IP (1:1 port mapping)", []string{"10.0.0.1"}, false},
+		{"hostname without port", []string{"backend.local"}, false},
+		{"empty string", []string{""}, true},
+		{"invalid with slash", []string{"10.0.0.1/path"}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				Version:  "2",
+				Backends: []Backend{{Name: "b1", Servers: tt.servers}},
+			}
+			err := validate(cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidation_BindAddress(t *testing.T) {
+	tests := []struct {
+		name    string
+		bind    string
+		wantErr bool
+	}{
+		{"valid :port", ":8080", false},
+		{"valid host:port", "127.0.0.1:80", false},
+		{"valid port range", ":1024-2048", false},
+		{"valid host:range", "0.0.0.0:3000-3005", false},
+		{"port zero", ":0", true},
+		{"port 65536", ":65536", true},
+		{"non-numeric port", ":abc", true},
+		{"range start > end", ":5000-4000", true},
+		{"missing port", "127.0.0.1", true},
+		{"range non-numeric start", ":abc-100", true},
+		{"range non-numeric end", ":100-abc", true},
+		{"range port zero", ":0-100", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				Version:   "2",
+				Listeners: []Listener{{Name: "l1", Bind: tt.bind}},
+			}
+			err := validate(cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validate() bind=%q error = %v, wantErr %v", tt.bind, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidation_HealthCheckDurations(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval string
+		timeout  string
+		wantErr  bool
+	}{
+		{"valid durations", "5s", "1s", false},
+		{"valid interval only", "10s", "", false},
+		{"invalid interval", "abc", "", true},
+		{"invalid timeout", "5s", "xyz", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				Version: "2",
+				Backends: []Backend{{
+					Name:    "b1",
+					Servers: []string{"10.0.0.1:80"},
+					HealthCheck: HealthCheckConfig{
+						Active: ActiveHealthCheck{
+							Interval: tt.interval,
+							Timeout:  tt.timeout,
+						},
+					},
+				}},
+			}
+			err := validate(cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidation_BalanceAlgorithm(t *testing.T) {
+	tests := []struct {
+		name    string
+		balance string
+		wantErr bool
+	}{
+		{"empty (default)", "", false},
+		{"roundrobin", "roundrobin", false},
+		{"leastconn", "leastconn", false},
+		{"random", "random", false},
+		{"invalid", "hash", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				Version:  "2",
+				Backends: []Backend{{Name: "b1", Balance: tt.balance, Servers: []string{"10.0.0.1:80"}}},
+			}
+			err := validate(cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validate() balance=%q error = %v, wantErr %v", tt.balance, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidation_EmptyServers(t *testing.T) {
+	cfg := &Config{
+		Version:  "2",
+		Backends: []Backend{{Name: "b1", Servers: []string{}}},
+	}
+	err := validate(cfg)
+	if err == nil {
+		t.Error("expected error for backend with no servers")
+	}
+}
+
+func TestValidation_TLS(t *testing.T) {
+	tmpDir := t.TempDir()
+	certFile := filepath.Join(tmpDir, "cert.pem")
+	keyFile := filepath.Join(tmpDir, "key.pem")
+	os.WriteFile(certFile, []byte("cert"), 0644)
+	os.WriteFile(keyFile, []byte("key"), 0644)
+
+	tests := []struct {
+		name    string
+		cert    string
+		key     string
+		wantErr bool
+	}{
+		{"no TLS", "", "", false},
+		{"valid TLS", certFile, keyFile, false},
+		{"cert without key", certFile, "", true},
+		{"key without cert", "", keyFile, true},
+		{"cert file not found", "/nonexistent/cert.pem", keyFile, true},
+		{"key file not found", certFile, "/nonexistent/key.pem", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				Version: "2",
+				Listeners: []Listener{{
+					Name: "l1",
+					Bind: ":443",
+					TLS:  TLSConfig{Cert: tt.cert, Key: tt.key},
+				}},
+			}
+			err := validate(cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidation_FullValid(t *testing.T) {
+	tmpDir := t.TempDir()
+	certFile := filepath.Join(tmpDir, "cert.pem")
+	keyFile := filepath.Join(tmpDir, "key.pem")
+	os.WriteFile(certFile, []byte("cert"), 0644)
+	os.WriteFile(keyFile, []byte("key"), 0644)
+
+	cfg := &Config{
+		Version: "2",
+		Logging: LoggingConfig{Level: "info"},
+		Listeners: []Listener{
+			{
+				Name:           "http",
+				Bind:           ":80",
+				Protocol:       "tcp",
+				Backend: "web",
+			},
+			{
+				Name:           "https",
+				Bind:           ":443",
+				Protocol:       "tcp",
+				Backend: "web",
+				TLS:            TLSConfig{Cert: certFile, Key: keyFile},
+			},
+			{
+				Name:           "range",
+				Bind:           "0.0.0.0:3000-3005",
+				Protocol:       "tcp",
+				Backend: "web",
+			},
+		},
+		Backends: []Backend{
+			{
+				Name:    "web",
+				Balance: "leastconn",
+				Servers: []string{"10.0.0.1:80", "10.0.0.2:80"},
+				HealthCheck: HealthCheckConfig{
+					Active: ActiveHealthCheck{
+						Type:     "http",
+						Path:     "/health",
+						Interval: "5s",
+						Timeout:  "1s",
+					},
+				},
+			},
+		},
+	}
+	err := validate(cfg)
+	if err != nil {
+		t.Errorf("expected no error for valid config, got: %v", err)
+	}
+}
+
+func TestValidation_HTTPListener(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			Version:  "2",
+			Backends: []Backend{{Name: "web", Servers: []string{"10.0.0.1:80"}}},
+		}
+	}
+
+	t.Run("http requires backend or routes", func(t *testing.T) {
+		cfg := base()
+		cfg.Listeners = []Listener{{Name: "l1", Bind: ":80", Protocol: "http"}}
+		if err := validate(cfg); err == nil {
+			t.Error("expected error for HTTP listener without backend or routes")
+		}
+	})
+
+	t.Run("http with default_backend is valid", func(t *testing.T) {
+		cfg := base()
+		cfg.Listeners = []Listener{{Name: "l1", Bind: ":80", Protocol: "http", Backend: "web"}}
+		if err := validate(cfg); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("http with routes is valid", func(t *testing.T) {
+		cfg := base()
+		cfg.Listeners = []Listener{{
+			Name: "l1", Bind: ":80", Protocol: "http",
+			Routes: []RouteConfig{{
+				Match:   RouteMatch{Host: "api.example.com"},
+				Backend: "web",
+			}},
+		}}
+		if err := validate(cfg); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("route with unknown backend", func(t *testing.T) {
+		cfg := base()
+		cfg.Listeners = []Listener{{
+			Name: "l1", Bind: ":80", Protocol: "http",
+			Routes: []RouteConfig{{
+				Match:   RouteMatch{Host: "api.example.com"},
+				Backend: "nonexistent",
+			}},
+		}}
+		if err := validate(cfg); err == nil {
+			t.Error("expected error for route referencing unknown backend")
+		}
+	})
+
+	t.Run("route without match fields", func(t *testing.T) {
+		cfg := base()
+		cfg.Listeners = []Listener{{
+			Name: "l1", Bind: ":80", Protocol: "http",
+			Routes: []RouteConfig{{
+				Match:   RouteMatch{},
+				Backend: "web",
+			}},
+		}}
+		if err := validate(cfg); err == nil {
+			t.Error("expected error for route without host or path_prefix")
+		}
+	})
+
+	t.Run("route without backend", func(t *testing.T) {
+		cfg := base()
+		cfg.Listeners = []Listener{{
+			Name: "l1", Bind: ":80", Protocol: "http",
+			Routes: []RouteConfig{{
+				Match: RouteMatch{Host: "example.com"},
+			}},
+		}}
+		if err := validate(cfg); err == nil {
+			t.Error("expected error for route without backend")
+		}
+	})
+}
+
+func TestValidation_HTTP3(t *testing.T) {
+	t.Run("http3 requires https", func(t *testing.T) {
+		cfg := &Config{
+			Version:  "2",
+			Backends: []Backend{{Name: "web", Servers: []string{"10.0.0.1:80"}}},
+			Listeners: []Listener{{
+				Name: "l1", Bind: ":80", Protocol: "http",
+				HTTP3: true, Backend: "web",
+			}},
+		}
+		if err := validate(cfg); err == nil {
+			t.Error("expected error for http3 without https protocol")
+		}
+	})
+
+	t.Run("http3 with https is valid", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		certFile := filepath.Join(tmpDir, "cert.pem")
+		keyFile := filepath.Join(tmpDir, "key.pem")
+		os.WriteFile(certFile, []byte("cert"), 0644)
+		os.WriteFile(keyFile, []byte("key"), 0644)
+
+		cfg := &Config{
+			Version:  "2",
+			Backends: []Backend{{Name: "web", Servers: []string{"10.0.0.1:80"}}},
+			Listeners: []Listener{{
+				Name: "l1", Bind: ":443", Protocol: "https",
+				HTTP3: true, Backend: "web",
+				TLS: TLSConfig{Cert: certFile, Key: keyFile},
+			}},
+		}
+		if err := validate(cfg); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestResolveIncludeGlob_Rejections(t *testing.T) {
+	tmpDir := t.TempDir()
+	mainConfig := filepath.Join(tmpDir, "nvelox.yaml")
+	os.WriteFile(mainConfig, []byte("version: '2'"), 0644)
+
+	cases := []struct {
+		name    string
+		pattern string
+	}{
+		{"dotdot relative", "../*.yaml"},
+		{"dotdot nested", "sub/../../*.yaml"},
+		{"absolute outside", "/etc/*/passwd"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := resolveIncludeGlob(c.pattern, mainConfig)
+			if err == nil {
+				t.Errorf("pattern %q must be rejected", c.pattern)
+			}
+		})
+	}
+}
+
+func TestResolveIncludeGlob_Accepts(t *testing.T) {
+	tmpDir := t.TempDir()
+	mainConfig := filepath.Join(tmpDir, "nvelox.yaml")
+	os.WriteFile(mainConfig, []byte("version: '2'"), 0644)
+	// Create two includable files in the same dir.
+	os.WriteFile(filepath.Join(tmpDir, "a.yaml"), []byte("backends: []"), 0644)
+	os.WriteFile(filepath.Join(tmpDir, "b.yaml"), []byte("backends: []"), 0644)
+
+	// Relative pattern.
+	matches, err := resolveIncludeGlob("*.yaml", mainConfig)
+	if err != nil {
+		t.Fatalf("relative: %v", err)
+	}
+	// Should match nvelox.yaml + a.yaml + b.yaml.
+	if len(matches) != 3 {
+		t.Errorf("relative *.yaml: want 3 matches, got %d: %v", len(matches), matches)
+	}
+
+	// Absolute path inside baseDir — allowed.
+	matches, err = resolveIncludeGlob(filepath.Join(tmpDir, "a.yaml"), mainConfig)
+	if err != nil {
+		t.Fatalf("absolute inside baseDir: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Errorf("absolute inside: want 1 match, got %d", len(matches))
+	}
+
+	// Empty pattern is a no-op.
+	matches, err = resolveIncludeGlob("", mainConfig)
+	if err != nil || matches != nil {
+		t.Errorf("empty: want (nil, nil), got (%v, %v)", matches, err)
+	}
+}
+
+func TestValidateServerName(t *testing.T) {
+	good := []string{
+		"foo.com",
+		"api.foo.com",
+		"*.foo.com",
+		"a-b.foo.com",
+	}
+	for _, s := range good {
+		if err := validateServerName(s); err != nil {
+			t.Errorf("expected %q valid, got err: %v", s, err)
+		}
+	}
+
+	bad := []string{
+		"",
+		"*.*.foo.com",      // multiple wildcards
+		"foo.*",            // right-prefix wildcard
+		"foo.*.com",        // mid wildcard
+		"*.",               // wildcard with no hostname
+		"https://foo.com",  // scheme
+		"foo.com/bar",      // path
+		"foo.com:8080",     // port
+		"foo .com",         // space
+	}
+	for _, s := range bad {
+		if err := validateServerName(s); err == nil {
+			t.Errorf("expected %q invalid", s)
+		}
+	}
+}
+
+func mkListener(name, bind, proto string) Listener {
+	return Listener{
+		Name: name, Bind: bind, Protocol: proto,
+		Backend: "be",
+	}
+}
+
+func TestValidateBindGroups_OK(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []Listener
+	}{
+		{
+			name: "single listener no server_names",
+			in: []Listener{
+				mkListener("a", ":80", "http"),
+			},
+		},
+		{
+			// TCP+UDP on the same port don't share a socket — canonical
+			// HTTP/3 + HTTPS pattern, also DNS, SIP, etc. Must not be
+			// flagged as a bind conflict.
+			name: "tcp and udp on same port",
+			in: []Listener{
+				mkListener("h2", ":443", "tcp"),
+				mkListener("h3", ":443", "udp"),
+			},
+		},
+		{
+			name: "two sites with names + default",
+			in: func() []Listener {
+				a := mkListener("a", ":443", "https")
+				a.ServerNames = []string{"api.foo.com"}
+				b := mkListener("b", ":443", "https")
+				b.DefaultServer = true
+				return []Listener{a, b}
+			}(),
+		},
+		{
+			name: "wildcards distinct from exact",
+			in: func() []Listener {
+				a := mkListener("a", ":443", "https")
+				a.ServerNames = []string{"api.foo.com"}
+				b := mkListener("b", ":443", "https")
+				b.ServerNames = []string{"*.foo.com"}
+				return []Listener{a, b}
+			}(),
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if err := validateBindGroups(c.in); err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateBindGroups_Rejections(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []Listener
+		want string
+	}{
+		{
+			name: "mixed protocols on same bind",
+			in: []Listener{
+				func() Listener { l := mkListener("a", ":443", "http"); l.DefaultServer = true; return l }(),
+				func() Listener { l := mkListener("b", ":443", "https"); l.DefaultServer = true; return l }(),
+			},
+			want: "different protocols",
+		},
+		{
+			name: "two default_server",
+			in: []Listener{
+				func() Listener { l := mkListener("a", ":443", "https"); l.DefaultServer = true; return l }(),
+				func() Listener { l := mkListener("b", ":443", "https"); l.DefaultServer = true; return l }(),
+			},
+			want: "more than one listener marked default_server",
+		},
+		{
+			name: "non-default site without server_names",
+			in: []Listener{
+				func() Listener { l := mkListener("a", ":443", "https"); l.ServerNames = []string{"a.com"}; return l }(),
+				mkListener("b", ":443", "https"), // no names, no default
+			},
+			want: "no server_names",
+		},
+		{
+			name: "duplicate server_name across sites",
+			in: []Listener{
+				func() Listener { l := mkListener("a", ":443", "https"); l.ServerNames = []string{"api.foo.com"}; return l }(),
+				func() Listener { l := mkListener("b", ":443", "https"); l.ServerNames = []string{"api.foo.com"}; return l }(),
+			},
+			want: "claimed by both",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateBindGroups(c.in)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", c.want)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("error %q does not contain %q", err.Error(), c.want)
+			}
+		})
+	}
+}
+
+// TestLoad_BackendAlias verifies the `default_backend:` YAML key still
+// works (with deprecation warning) and migrates into Backend.
+func TestLoad_BackendAlias(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Legacy YAML using default_backend → migrates to Backend, no error.
+	legacy := filepath.Join(tmpDir, "legacy.yaml")
+	os.WriteFile(legacy, []byte(`
+version: '2'
+listeners:
+  - name: l1
+    bind: ":80"
+    protocol: tcp
+    default_backend: be
+backends:
+  - name: be
+    servers: ["127.0.0.1:8080"]
+`), 0644)
+	cfg, err := Load(legacy)
+	if err != nil {
+		t.Fatalf("legacy default_backend should still load: %v", err)
+	}
+	if cfg.Listeners[0].Backend != "be" {
+		t.Errorf("default_backend not migrated: Backend=%q", cfg.Listeners[0].Backend)
+	}
+	if cfg.Listeners[0].DefaultBackend != "" {
+		t.Errorf("DefaultBackend not cleared after migration: %q", cfg.Listeners[0].DefaultBackend)
+	}
+
+	// Both keys set is an error — protects against half-finished migration.
+	conflict := filepath.Join(tmpDir, "conflict.yaml")
+	os.WriteFile(conflict, []byte(`
+version: '2'
+listeners:
+  - name: l1
+    bind: ":80"
+    protocol: tcp
+    backend: be
+    default_backend: also-be
+backends:
+  - name: be
+    servers: ["127.0.0.1:8080"]
+  - name: also-be
+    servers: ["127.0.0.1:8081"]
+`), 0644)
+	if _, err := Load(conflict); err == nil {
+		t.Error("setting both backend and default_backend must error")
 	}
 }

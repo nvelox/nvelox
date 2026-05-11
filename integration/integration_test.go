@@ -96,7 +96,7 @@ func TestEndToEndTCP(t *testing.T) {
 			Protocol:       "tcp",
 			Addr:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 			Port:           proxyPort,
-			DefaultBackend: "backend1",
+			Backend:         "backend1",
 		},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -176,6 +176,7 @@ func getFreeUDPPort(t *testing.T) int {
 }
 
 func TestEndToEndUDP(t *testing.T) {
+	// t.Skip("UDP not yet supported in NBIO engine")
 	backendAddr := startUDPEchoServer(t)
 	proxyPort := getFreeUDPPort(t)
 
@@ -199,7 +200,7 @@ func TestEndToEndUDP(t *testing.T) {
 			Protocol:       "udp",
 			Addr:           fmt.Sprintf("127.0.0.1:%d", proxyPort),
 			Port:           proxyPort,
-			DefaultBackend: "backend-udp",
+			Backend:         "backend-udp",
 		},
 	}
 
@@ -238,4 +239,68 @@ func TestEndToEndUDP(t *testing.T) {
 	if string(buf[:n]) != msg {
 		t.Errorf("Expected %q, got %q", msg, string(buf[:n]))
 	}
+}
+
+func TestEndToEndMixed(t *testing.T) {
+	// 1. Start Backends
+	tcpBackendAddr := startEchoServer(t)
+	udpBackendAddr := startUDPEchoServer(t)
+
+	// 2. Get Free Ports
+	tcpPort := getFreePort(t)
+	udpPort := getFreeUDPPort(t)
+
+	// 3. Configure
+	cfg := &config.Config{
+		Backends: []config.Backend{
+			{Name: "backend-tcp", Balance: "roundrobin", Servers: []string{tcpBackendAddr}},
+			{Name: "backend-udp", Balance: "roundrobin", Servers: []string{udpBackendAddr}},
+		},
+	}
+	engine := core.NewEngine(cfg)
+	engine.Listeners = []*core.ListenerConfig{
+		{Name: "mix-tcp", Protocol: "tcp", Addr: fmt.Sprintf("127.0.0.1:%d", tcpPort), Port: tcpPort, Backend:         "backend-tcp"},
+		{Name: "mix-udp", Protocol: "udp", Addr: fmt.Sprintf("127.0.0.1:%d", udpPort), Port: udpPort, Backend:         "backend-udp"},
+	}
+
+	// 4. Start
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go engine.Start(ctx)
+
+	waitForPort(t, tcpPort)            // Wait for TCP at least
+	time.Sleep(500 * time.Millisecond) // Wait for UDP
+
+	// 5. Verify TCP
+	c1, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", tcpPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c1.Write([]byte("tcp-mix"))
+	b1 := make([]byte, 1024)
+	n1, err := c1.Read(b1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b1[:n1]) != "tcp-mix" {
+		t.Error("TCP mix mismatch")
+	}
+	c1.Close()
+
+	// 6. Verify UDP
+	c2, err := net.Dial("udp", fmt.Sprintf("127.0.0.1:%d", udpPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2.Write([]byte("udp-mix"))
+	c2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	b2 := make([]byte, 1024)
+	n2, err := c2.Read(b2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b2[:n2]) != "udp-mix" {
+		t.Error("UDP mix mismatch")
+	}
+	c2.Close()
 }
