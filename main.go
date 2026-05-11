@@ -15,8 +15,11 @@ import (
 )
 
 var (
-	// Version is injected by build flags: -ldflags "-X main.Version=vX.Y.Z"
-	Version = "v0.2.1"
+	// Version is injected at link time by goreleaser:
+	//   -ldflags "-X main.Version={{.Tag}}"
+	// Plain `go build` with no ldflags leaves this as "dev" so an
+	// operator running an unstamped binary sees it immediately.
+	Version = "dev"
 )
 
 func main() {

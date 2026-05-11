@@ -11,7 +11,10 @@ builds:
       - amd64
       - arm64
     ldflags:
-      - -s -w -X main.Version={{.Version}}
+      # {{.Tag}} is "v1.0.0" (with the "v"); {{.Version}} is "1.0.0".
+      # The source default is "dev", so a release binary reports
+      # "nvelox v1.0.0" while a `go build` reports "nvelox dev".
+      - -s -w -X main.Version={{.Tag}}
 
 archives:
   - format: tar.gz
