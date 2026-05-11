@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"nvelox/core/logging"
@@ -31,7 +32,18 @@ type BindGroup struct {
 	sites       []*HTTPServer
 	primary     *HTTPServer // for shared TLS / HTTP3 config; first site for now
 
-	// Multi-cert dispatch state, populated by buildTLSConfig at Start.
+	// Multi-cert SNI dispatch state. Lives behind an atomic.Pointer so
+	// ReloadCerts can swap it without disturbing in-flight handshakes —
+	// the GetCertificate callback does a Load() on every ClientHello,
+	// which is lock-free.
+	tlsState atomic.Pointer[tlsState]
+}
+
+// tlsState is the immutable snapshot of every site's loaded cert for
+// SNI dispatch. ReloadCerts builds a fresh tlsState and atomic-stores it;
+// the old one stays alive until the last in-flight handshake using it
+// completes, then it's GC'd.
+type tlsState struct {
 	certs       []siteCert
 	defaultCert *siteCert
 }
@@ -192,58 +204,27 @@ type siteCert struct {
 	site     *HTTPServer
 }
 
-// buildTLSConfig constructs the shared *tls.Config for the group:
-//   - Loads every site's cert/key once at startup.
-//   - GetCertificate picks by SNI: exact match wins, then wildcard, then
-//     the default site's cert. No match + no default → handshake error
-//     (Go's tls package treats nil cert + nil err as "no cert available").
-//   - MinVersion / MaxVersion / CipherSuites come from the PRIMARY site
-//     (Phase C constraint — same TLS profile across sites in a group).
-//   - NextProtos forces h2 + http/1.1 ALPN on every site.
+// buildTLSConfig constructs the shared *tls.Config for the group and
+// publishes the initial cert snapshot via tlsState.Store. Subsequent
+// reloads can swap the snapshot atomically without rebuilding tls.Config.
+//
+// GetCertificate uses tlsState.Load — lock-free on the handshake hot path.
+// MinVersion / MaxVersion / CipherSuites come from the PRIMARY site
+// (same TLS profile across sites in a group). NextProtos forces h2 +
+// http/1.1 ALPN on every site.
 func (g *BindGroup) buildTLSConfig() (*tls.Config, error) {
-	if len(g.sites) == 0 {
-		return nil, fmt.Errorf("bind group %s: no sites", g.addr)
+	state, err := g.loadCertState()
+	if err != nil {
+		return nil, err
 	}
-
-	// Load each site's cert.
-	certs := make([]siteCert, 0, len(g.sites))
-	var defaultCert *siteCert
-	for _, s := range g.sites {
-		if s.Listener.TLS == nil || s.Listener.TLS.Cert == "" {
-			// HTTP-only site in a group with TLS sites — handled at validation
-			// time. Defensive: skip rather than panic.
-			continue
-		}
-		warnIfKeyWorldReadable(s.Listener.TLS.Key)
-		cert, err := tls.LoadX509KeyPair(s.Listener.TLS.Cert, s.Listener.TLS.Key)
-		if err != nil {
-			return nil, fmt.Errorf("site %s: failed to load TLS cert/key: %v", s.Listener.Name, err)
-		}
-		entry := siteCert{
-			patterns: s.Listener.ServerNames,
-			cert:     &cert,
-			site:     s,
-		}
-		certs = append(certs, entry)
-		if s.Listener.DefaultServer || defaultCert == nil {
-			// First site is the implicit default if no DefaultServer is set,
-			// preserving today's behaviour for single-site bind groups.
-			c := certs[len(certs)-1]
-			defaultCert = &c
-		}
-	}
-	if len(certs) == 0 {
-		return nil, fmt.Errorf("bind group %s: no TLS-enabled sites", g.addr)
-	}
-	g.certs = certs
-	g.defaultCert = defaultCert
+	g.tlsState.Store(state)
 
 	tlsCfg := &tls.Config{
 		NextProtos: []string{"h2", "http/1.1"},
 		// Set Certificates to a single-element slice so callers/tooling that
 		// inspect c.Certificates see something sensible. The actual cert
 		// served at handshake time comes from GetCertificate below.
-		Certificates: []tls.Certificate{*defaultCert.cert},
+		Certificates: []tls.Certificate{*state.defaultCert.cert},
 		GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			return g.pickCert(chi.ServerName), nil
 		},
@@ -254,29 +235,162 @@ func (g *BindGroup) buildTLSConfig() (*tls.Config, error) {
 	return tlsCfg, nil
 }
 
+// loadCertState walks the group's sites and reads each TLS cert/key from
+// disk. Returns a fresh tlsState ready to publish, or an error if any
+// site's cert fails to load. Used both at Start and by ReloadCerts.
+//
+// Note: all-or-nothing during initial Start — if any cert is broken at
+// startup we refuse to listen. ReloadCerts handles partial failure
+// differently (keeps the prior cert for that site).
+func (g *BindGroup) loadCertState() (*tlsState, error) {
+	if len(g.sites) == 0 {
+		return nil, fmt.Errorf("bind group %s: no sites", g.addr)
+	}
+	certs := make([]siteCert, 0, len(g.sites))
+	var defaultCert *siteCert
+	for _, s := range g.sites {
+		if s.Listener.TLS == nil || s.Listener.TLS.Cert == "" {
+			continue
+		}
+		warnIfKeyWorldReadable(s.Listener.TLS.Key)
+		cert, err := tls.LoadX509KeyPair(s.Listener.TLS.Cert, s.Listener.TLS.Key)
+		if err != nil {
+			return nil, fmt.Errorf("site %s: failed to load TLS cert/key: %v", s.Listener.Name, err)
+		}
+		certs = append(certs, siteCert{
+			patterns: s.Listener.ServerNames,
+			cert:     &cert,
+			site:     s,
+		})
+		if s.Listener.DefaultServer || defaultCert == nil {
+			c := certs[len(certs)-1]
+			defaultCert = &c
+		}
+	}
+	if len(certs) == 0 {
+		return nil, fmt.Errorf("bind group %s: no TLS-enabled sites", g.addr)
+	}
+	return &tlsState{certs: certs, defaultCert: defaultCert}, nil
+}
+
+// ReloadCerts re-reads every site's TLS cert from disk and atomically
+// publishes a new tlsState. The TLS handshake hot path is unaffected:
+// in-flight handshakes complete against the old snapshot, new handshakes
+// see the new one.
+//
+// Per-site failure is isolated. If a single cert fails to load (file
+// missing, expired, corrupt), that site keeps its previous cert from
+// the current snapshot and we log the failure. Operators get a partial
+// reload rather than nothing.
+//
+// Returns the number of certs that were actually rotated (i.e. their
+// raw bytes changed). Zero means no-op; logging.Info can show the count.
+func (g *BindGroup) ReloadCerts() (int, error) {
+	prev := g.tlsState.Load()
+	if prev == nil {
+		// No initial snapshot — bind group never started. Caller bug.
+		return 0, fmt.Errorf("bind group %s: ReloadCerts before Start", g.addr)
+	}
+
+	// Index the previous state by site name for fallback on per-site failure.
+	prevByName := make(map[string]siteCert, len(prev.certs))
+	for _, c := range prev.certs {
+		if c.site != nil {
+			prevByName[c.site.Listener.Name] = c
+		}
+	}
+
+	certs := make([]siteCert, 0, len(g.sites))
+	var defaultCert *siteCert
+	rotated := 0
+	for _, s := range g.sites {
+		if s.Listener.TLS == nil || s.Listener.TLS.Cert == "" {
+			continue
+		}
+		warnIfKeyWorldReadable(s.Listener.TLS.Key)
+		cert, err := tls.LoadX509KeyPair(s.Listener.TLS.Cert, s.Listener.TLS.Key)
+		if err != nil {
+			old, ok := prevByName[s.Listener.Name]
+			if !ok {
+				return rotated, fmt.Errorf("site %s: cert reload failed and no previous cert to fall back to: %v",
+					s.Listener.Name, err)
+			}
+			logging.Warn("[TLS] site %s: cert reload failed, keeping previous cert: %v",
+				s.Listener.Name, err)
+			certs = append(certs, old)
+		} else {
+			if old, ok := prevByName[s.Listener.Name]; ok && !certBytesEqual(old.cert, &cert) {
+				rotated++
+			} else if !ok {
+				rotated++ // new site since last load
+			}
+			certs = append(certs, siteCert{
+				patterns: s.Listener.ServerNames,
+				cert:     &cert,
+				site:     s,
+			})
+		}
+		if s.Listener.DefaultServer || defaultCert == nil {
+			c := certs[len(certs)-1]
+			defaultCert = &c
+		}
+	}
+	if len(certs) == 0 {
+		return 0, fmt.Errorf("bind group %s: no TLS-enabled sites after reload", g.addr)
+	}
+
+	g.tlsState.Store(&tlsState{certs: certs, defaultCert: defaultCert})
+	return rotated, nil
+}
+
+// certBytesEqual reports whether two loaded certs carry the same DER bytes.
+// Used by ReloadCerts to count actual rotations vs. no-ops. Comparing the
+// raw Certificate slice (the chain) is sufficient — if any byte changed,
+// the cert changed.
+func certBytesEqual(a, b *tls.Certificate) bool {
+	if a == nil || b == nil || len(a.Certificate) != len(b.Certificate) {
+		return false
+	}
+	for i := range a.Certificate {
+		if len(a.Certificate[i]) != len(b.Certificate[i]) {
+			return false
+		}
+		for j := range a.Certificate[i] {
+			if a.Certificate[i][j] != b.Certificate[i][j] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // pickCert resolves an SNI hostname to the cert that should be served.
 // Exact match > wildcard > default site's cert. If sni is empty (e.g.
 // IP-only TLS connect with no SNI), we still return the default — same
 // as nginx and any L7 proxy.
 func (g *BindGroup) pickCert(sni string) *tls.Certificate {
+	state := g.tlsState.Load()
+	if state == nil {
+		return nil
+	}
 	if sni == "" {
-		if g.defaultCert != nil {
-			return g.defaultCert.cert
+		if state.defaultCert != nil {
+			return state.defaultCert.cert
 		}
 		return nil
 	}
-	entries := make([]tlsutil.SiteEntry[*tls.Certificate], 0, len(g.certs))
-	for i := range g.certs {
+	entries := make([]tlsutil.SiteEntry[*tls.Certificate], 0, len(state.certs))
+	for i := range state.certs {
 		entries = append(entries, tlsutil.SiteEntry[*tls.Certificate]{
-			Patterns: g.certs[i].patterns,
-			Payload:  g.certs[i].cert,
+			Patterns: state.certs[i].patterns,
+			Payload:  state.certs[i].cert,
 		})
 	}
 	if cert, ok := tlsutil.MatchSite(sni, entries); ok {
 		return cert
 	}
-	if g.defaultCert != nil {
-		return g.defaultCert.cert
+	if state.defaultCert != nil {
+		return state.defaultCert.cert
 	}
 	return nil
 }

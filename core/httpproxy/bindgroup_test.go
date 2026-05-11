@@ -135,3 +135,121 @@ func TestBindGroup_PickCert_NoDefault(t *testing.T) {
 		t.Errorf("implicit default: got CN %q, want a.example.com", leaf.Subject.CommonName)
 	}
 }
+
+// TestBindGroup_ReloadCerts rotates a single site's cert on disk and
+// verifies that pickCert returns the new cert after ReloadCerts. This is
+// the unit-test backbone for F1 (TLS cert hot-reload).
+func TestBindGroup_ReloadCerts(t *testing.T) {
+	dir := t.TempDir()
+	apiCert, apiKey := genCertWithCN(t, dir, "api.example.com")
+	defCert, defKey := genCertWithCN(t, dir, "default.example.com")
+
+	g := NewBindGroup(":443", "https")
+	g.AddSite(newSite("api", []string{"api.example.com"}, false, apiCert, apiKey))
+	g.AddSite(newSite("default", nil, true, defCert, defKey))
+
+	if _, err := g.buildTLSConfig(); err != nil {
+		t.Fatalf("buildTLSConfig: %v", err)
+	}
+
+	// Sanity: pre-reload the api site serves the original cert.
+	got, _ := x509.ParseCertificate(g.pickCert("api.example.com").Certificate[0])
+	if got.Subject.CommonName != "api.example.com" {
+		t.Fatalf("pre-reload CN = %q, want api.example.com", got.Subject.CommonName)
+	}
+
+	// Rotate the api site's cert on disk to a DIFFERENT cert. We reuse
+	// the helper but write to the same paths so the file mtime/contents change.
+	newCert, newKey := genCertWithCN(t, dir, "rotated.api.example.com")
+	// Move the rotated PEMs over the api site's paths.
+	must := func(err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	in, _ := os.ReadFile(newCert)
+	must(os.WriteFile(apiCert, in, 0644))
+	in, _ = os.ReadFile(newKey)
+	must(os.WriteFile(apiKey, in, 0600))
+
+	rotated, err := g.ReloadCerts()
+	if err != nil {
+		t.Fatalf("ReloadCerts: %v", err)
+	}
+	if rotated != 1 {
+		t.Errorf("expected 1 rotated cert, got %d", rotated)
+	}
+
+	got, _ = x509.ParseCertificate(g.pickCert("api.example.com").Certificate[0])
+	if got.Subject.CommonName != "rotated.api.example.com" {
+		t.Errorf("post-reload CN = %q, want rotated.api.example.com", got.Subject.CommonName)
+	}
+
+	// The default site's cert is untouched — should still be the original.
+	got, _ = x509.ParseCertificate(g.pickCert("default.example.com").Certificate[0])
+	if got.Subject.CommonName != "default.example.com" {
+		t.Errorf("default site CN = %q, want default.example.com (unchanged)", got.Subject.CommonName)
+	}
+
+	// Calling ReloadCerts again with no changes on disk → 0 rotations.
+	rotated, err = g.ReloadCerts()
+	if err != nil {
+		t.Fatalf("idempotent ReloadCerts: %v", err)
+	}
+	if rotated != 0 {
+		t.Errorf("idempotent reload should rotate 0 certs, got %d", rotated)
+	}
+}
+
+// TestBindGroup_ReloadCerts_PartialFailure: if a single site's cert
+// becomes unreadable, the rest of the group must still update, and the
+// broken site must keep its previous cert (no nil cert returned).
+func TestBindGroup_ReloadCerts_PartialFailure(t *testing.T) {
+	dir := t.TempDir()
+	apiCert, apiKey := genCertWithCN(t, dir, "api.example.com")
+	webCert, webKey := genCertWithCN(t, dir, "web.example.com")
+
+	g := NewBindGroup(":443", "https")
+	g.AddSite(newSite("api", []string{"api.example.com"}, false, apiCert, apiKey))
+	g.AddSite(newSite("web", nil, true, webCert, webKey))
+
+	if _, err := g.buildTLSConfig(); err != nil {
+		t.Fatalf("buildTLSConfig: %v", err)
+	}
+
+	// Truncate the api site's cert to empty bytes so the next load fails.
+	if err := os.WriteFile(apiCert, []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Rotate the web site's cert legitimately.
+	newWebCert, newWebKey := genCertWithCN(t, dir, "rotated.web.example.com")
+	in, _ := os.ReadFile(newWebCert)
+	os.WriteFile(webCert, in, 0644)
+	in, _ = os.ReadFile(newWebKey)
+	os.WriteFile(webKey, in, 0600)
+
+	_, err := g.ReloadCerts()
+	if err != nil {
+		t.Fatalf("ReloadCerts must succeed despite per-site failure: %v", err)
+	}
+
+	// api site falls back to previous cert.
+	got, _ := x509.ParseCertificate(g.pickCert("api.example.com").Certificate[0])
+	if got.Subject.CommonName != "api.example.com" {
+		t.Errorf("api site after failed reload: CN = %q, want api.example.com (kept previous)",
+			got.Subject.CommonName)
+	}
+	// web site sees the new cert.
+	got, _ = x509.ParseCertificate(g.pickCert("web.example.com").Certificate[0])
+	if got.Subject.CommonName != "rotated.web.example.com" {
+		t.Errorf("web site after reload: CN = %q, want rotated.web.example.com", got.Subject.CommonName)
+	}
+}
+
+// TestBindGroup_ReloadCerts_BeforeStart guards against a caller bug.
+func TestBindGroup_ReloadCerts_BeforeStart(t *testing.T) {
+	g := NewBindGroup(":443", "https")
+	if _, err := g.ReloadCerts(); err == nil {
+		t.Error("ReloadCerts on an unstarted bind group must error")
+	}
+}

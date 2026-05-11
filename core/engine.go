@@ -341,8 +341,12 @@ func (e *Engine) Start(ctx context.Context) error {
 	return nil
 }
 
-// Reload updates backends and health checkers from a new config.
-// Listeners are not changed at runtime (requires restart for listener changes).
+// Reload applies a new config to a running engine. Today it handles:
+//   - Backends (balancer + health checker) rebuilt from scratch.
+//   - TLS certs hot-swapped on every BindGroup via atomic.Pointer
+//     (operators can rotate Let's Encrypt certs without restart).
+//
+// Listener add/remove/route-edit still requires restart (F2/F3 work).
 func (e *Engine) Reload(cfg *config.Config) {
 	logging.Info("Reloading backends...")
 
@@ -356,7 +360,26 @@ func (e *Engine) Reload(cfg *config.Config) {
 	e.Config = cfg
 	e.initBackends()
 
-	logging.Info("Reload complete: %d backends configured", len(cfg.Backends))
+	// Hot-reload TLS certs on every HTTPS bind group. Failures here are
+	// isolated to the site that broke; the rest of the bind group keeps
+	// running with the previous snapshot.
+	totalRotated := 0
+	for _, bg := range e.BindGroups {
+		rotated, err := bg.ReloadCerts()
+		if err != nil {
+			// loadCertState validates presence of TLS-enabled sites; on
+			// a plain-HTTP bind group ReloadCerts also errors with "no
+			// TLS-enabled sites" — silently skip those.
+			logging.Debug("[RELOAD] bind group cert reload skipped: %v", err)
+			continue
+		}
+		totalRotated += rotated
+	}
+	if totalRotated > 0 {
+		logging.Info("Reload complete: %d backends, %d TLS certs rotated", len(cfg.Backends), totalRotated)
+	} else {
+		logging.Info("Reload complete: %d backends, no cert rotation needed", len(cfg.Backends))
+	}
 }
 
 func (e *Engine) initBackends() {

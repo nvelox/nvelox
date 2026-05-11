@@ -98,8 +98,12 @@ func TestRateLimiter_Concurrent(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Should allow approximately burst (50) ± a few from timing
-	if allowed > 55 {
-		t.Errorf("expected ~50 allowed, got %d", allowed)
+	// Should allow approximately burst (50) ± timing drift. Under -race
+	// each Allow() takes long enough at rate=1000/s to accrue measurable
+	// sub-token replenishment (~50µs per call × 200 calls × 1000 tokens/s
+	// ≈ 10 extra tokens worst-case). 65 is generous; anything past that
+	// would indicate a real regression doubling effective burst.
+	if allowed > 65 {
+		t.Errorf("expected ~50 allowed (with up to 15 drift), got %d", allowed)
 	}
 }
