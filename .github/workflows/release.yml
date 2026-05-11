@@ -20,11 +20,22 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.25'
+      # Pull the tag's annotation message into a file. goreleaser uses
+      # this as the release body — overrides its default auto-changelog,
+      # which is still appended below per .goreleaser.yaml's changelog
+      # settings. Operators write the human summary in
+      #   git tag -a vX.Y.Z -m "..."
+      # and that text appears on the GitHub release page.
+      - name: Extract tag annotation as release notes
+        run: |
+          git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > /tmp/release-notes.md
+          echo "--- release-notes.md preview ---"
+          cat /tmp/release-notes.md
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
           version: latest
-          args: release --clean
+          args: release --clean --release-notes=/tmp/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -29,9 +29,20 @@ checksum:
 snapshot:
   version_template: "{{ .Tag }}-next"
 
+# Release page title and shape. Body content is fed in via the workflow's
+# `--release-notes` flag — see .github/workflows/release.yml. That file
+# pulls the tag's annotation message (`git tag -a vX -m "..."`) into a
+# notes file before goreleaser runs, so operators only need to write the
+# release summary in the tag message itself.
+release:
+  name_template: "{{.ProjectName}} {{.Tag}}"
+
 changelog:
   sort: asc
   filters:
     exclude:
       - '^docs:'
       - '^test:'
+      - '^chore:'
+      - 'Merge pull request'
+      - 'Merge branch'
