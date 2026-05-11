@@ -322,8 +322,8 @@ func (e *Engine) Reload(cfg *config.Config) {
 	logging.Info("Reloading config...")
 
 	e.Config = cfg
-	added, removed, updated := e.reconcileBackends(cfg)
-	sitesSwapped := e.reloadL7Sites(cfg)
+	beAdded, beRemoved, beUpdated := e.reconcileBackends(cfg)
+	sitesSwapped, bgAdded, bgRemoved := e.reloadL7Sites(cfg)
 
 	// Hot-reload TLS certs on every HTTPS bind group. Failures here are
 	// isolated to the site that broke; the rest of the bind group keeps
@@ -340,73 +340,149 @@ func (e *Engine) Reload(cfg *config.Config) {
 		}
 		totalRotated += rotated
 	}
-	logging.Info("Reload complete: backends +%d/-%d/~%d, %d sites swapped, %d TLS certs rotated",
-		added, removed, updated, sitesSwapped, totalRotated)
+	logging.Info("Reload complete: backends +%d/-%d/~%d, bind groups +%d/-%d, %d sites swapped, %d TLS certs rotated",
+		beAdded, beRemoved, beUpdated, bgAdded, bgRemoved, sitesSwapped, totalRotated)
 }
 
-// reloadL7Sites rebuilds the site list of every existing HTTP/HTTPS
-// BindGroup from the new config and atomically swaps it in.
+// reloadL7Sites reconciles the L7 (HTTP/HTTPS) listener set against the
+// new config:
+//   - bind addrs in BOTH old and new: ReplaceSites atomic swap.
+//   - bind addrs only in NEW: start a fresh BindGroup, append to engine.
+//   - bind addrs only in OLD: graceful Stop (10s drain) in background.
 //
-// New bind addresses (not in any existing BindGroup) are NOT handled
-// here — that's F3 (bind-group composition changes). For now we log
-// and skip them.
+// All-or-nothing: pre-flight every NEW addr by attempting to bind a
+// socket. If any port is unavailable we abort the entire L7 reload
+// before mutating any engine state — operators get a clear "reload
+// failed, keeping current state" outcome rather than a half-applied mess.
+// Pre-existing bind groups are left running on failure.
 //
-// Returns the count of bind groups that had their sites swapped.
-func (e *Engine) reloadL7Sites(cfg *config.Config) int {
+// Returns the counts (sites swapped on existing groups, bind groups
+// added, bind groups removed).
+func (e *Engine) reloadL7Sites(cfg *config.Config) (swapped, added, removed int) {
 	expanded, err := ExpandListeners(cfg.Listeners)
 	if err != nil {
 		logging.Error("[RELOAD] listener expansion failed: %v — skipping L7 site swap", err)
-		return 0
+		return 0, 0, 0
 	}
 
-	// Index existing bind groups by addr for O(1) lookup.
 	bgByAddr := make(map[string]*httpproxy.BindGroup, len(e.BindGroups))
 	for _, bg := range e.BindGroups {
 		bgByAddr[bg.Addr()] = bg
 	}
 
-	// Group new L7 listeners by addr.
-	newSitesByAddr := make(map[string][]*httpproxy.HTTPServer)
+	type group struct {
+		protocol string
+		sites    []*httpproxy.HTTPServer
+		l7l      []*ListenerConfig // matching listener configs for the group
+	}
+	newGroups := make(map[string]*group)
 	for _, l := range expanded {
 		if l.Protocol != "http" && l.Protocol != "https" {
 			continue
 		}
-		newSitesByAddr[l.Addr] = append(newSitesByAddr[l.Addr], e.buildL7Site(l))
+		g, ok := newGroups[l.Addr]
+		if !ok {
+			g = &group{protocol: l.Protocol}
+			newGroups[l.Addr] = g
+		}
+		g.sites = append(g.sites, e.buildL7Site(l))
+		g.l7l = append(g.l7l, l)
 	}
 
-	// For each NEW addr, look up its existing bind group and ReplaceSites.
-	// New addresses with no matching bind group are flagged for F3.
-	swapped := 0
-	for addr, sites := range newSitesByAddr {
-		bg, ok := bgByAddr[addr]
-		if !ok {
-			logging.Warn("[RELOAD] new bind address %s requires restart (F3 not yet implemented)", addr)
-			// Close the just-built sites so we don't leak their goroutines.
-			for _, s := range sites {
-				s.Close()
-			}
+	// Pre-flight: every NEW addr must be bindable RIGHT NOW. Without
+	// this an "add a listener on :8080" reload that conflicts with
+	// another process leaves engine state inconsistent. We probe by
+	// opening + immediately closing a TCP listener.
+	var newAddrs []string
+	for addr := range newGroups {
+		if _, kept := bgByAddr[addr]; kept {
 			continue
 		}
-		if err := bg.ReplaceSites(sites); err != nil {
-			logging.Error("[RELOAD] bind group %s: ReplaceSites failed: %v", addr, err)
-			for _, s := range sites {
-				s.Close()
+		newAddrs = append(newAddrs, addr)
+	}
+	for _, addr := range newAddrs {
+		probe, err := net.Listen("tcp", addr)
+		if err != nil {
+			logging.Error("[RELOAD] cannot bind new addr %s (%v) — aborting L7 reload, keeping current state", addr, err)
+			// Close every site we just built — they hold per-site
+			// goroutines we don't want to leak.
+			for _, g := range newGroups {
+				for _, s := range g.sites {
+					s.Close()
+				}
 			}
+			return 0, 0, 0
+		}
+		probe.Close()
+	}
+
+	// Mutations from this point. Pre-flight passed, so add/swap shouldn't fail.
+
+	// 1. ReplaceSites on bind groups present in BOTH old and new.
+	for addr, g := range newGroups {
+		bg, kept := bgByAddr[addr]
+		if !kept {
+			continue
+		}
+		if err := bg.ReplaceSites(g.sites); err != nil {
+			logging.Error("[RELOAD] bind group %s ReplaceSites: %v", addr, err)
 			continue
 		}
 		swapped++
 	}
 
-	// Refresh engine.HTTPServers and engine.Listeners so subsequent reloads
-	// and operators looking at engine state see the up-to-date list.
+	// 2. Start fresh BindGroup for NEW addrs.
+	for _, addr := range newAddrs {
+		g := newGroups[addr]
+		bg := httpproxy.NewBindGroup(addr, g.protocol)
+		for _, s := range g.sites {
+			bg.AddSite(s)
+		}
+		if err := bg.Start(); err != nil {
+			logging.Error("[RELOAD] bind group %s Start: %v", addr, err)
+			for _, s := range g.sites {
+				s.Close()
+			}
+			continue
+		}
+		e.BindGroups = append(e.BindGroups, bg)
+		added++
+		logging.Info("[RELOAD] Added bind group %s with %d site(s)", addr, len(g.sites))
+	}
+
+	// 3. Graceful Stop of bind groups present in OLD but not NEW. Shutdown
+	// drains in-flight requests; we run it in a background goroutine with
+	// a 10s deadline so SIGHUP itself doesn't block on slow clients.
+	survivors := e.BindGroups[:0]
+	for _, bg := range e.BindGroups {
+		if _, kept := newGroups[bg.Addr()]; kept {
+			survivors = append(survivors, bg)
+			continue
+		}
+		addr := bg.Addr()
+		removed++
+		go func(bg *httpproxy.BindGroup, addr string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := bg.Stop(ctx); err != nil {
+				logging.Warn("[RELOAD] bind group %s graceful Stop: %v", addr, err)
+			} else {
+				logging.Info("[RELOAD] Removed bind group %s (drained)", addr)
+			}
+		}(bg, addr)
+	}
+	e.BindGroups = survivors
+
+	// 4. Refresh engine.Listeners and engine.HTTPServers so operators
+	// looking at engine state see the up-to-date list.
 	e.Listeners = expanded
 	e.HTTPServers = e.HTTPServers[:0]
 	for _, bg := range e.BindGroups {
-		for _, s := range newSitesByAddr[bg.Addr()] {
-			e.HTTPServers = append(e.HTTPServers, s)
+		if g, ok := newGroups[bg.Addr()]; ok {
+			e.HTTPServers = append(e.HTTPServers, g.sites...)
 		}
 	}
-	return swapped
+	return swapped, added, removed
 }
 
 func (e *Engine) initBackends() {

@@ -1,6 +1,8 @@
 package core
 
 import (
+	"context"
+	"net"
 	"testing"
 	"time"
 
@@ -366,4 +368,169 @@ func TestReloadL7Sites_NewBindFlagged(t *testing.T) {
 	}
 	// Should not panic; the new bind is logged as F3 work.
 	engine.Reload(newCfg)
+}
+
+// TestReloadL7Sites_AddNewBindGroup: a brand-new bind addr in the new
+// config produces a started BindGroup. Pre-flight bind-availability
+// check passes (we pick a free ephemeral port via net.Listen).
+func TestReloadL7Sites_AddNewBindGroup(t *testing.T) {
+	// Pick two free ports for the engine's lifespan.
+	freeAddr := func() string {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("free port: %v", err)
+		}
+		addr := l.Addr().String()
+		l.Close()
+		return addr
+	}
+	addr1 := freeAddr()
+	addr2 := freeAddr()
+
+	cfg := &config.Config{
+		Backends:  []config.Backend{{Name: "be", Servers: []string{"10.0.0.1:80"}}},
+		Listeners: []config.Listener{{Name: "a", Bind: addr1, Protocol: "http", Backend: "be"}},
+	}
+	expanded, _ := ExpandListeners(cfg.Listeners)
+	engine := NewEngine(cfg)
+	engine.Listeners = expanded
+	engine.initBackends()
+	bg := httpproxy.NewBindGroup(addr1, "http")
+	bg.AddSite(engine.buildL7Site(expanded[0]))
+	if err := bg.Start(); err != nil {
+		t.Fatalf("start initial bg: %v", err)
+	}
+	engine.BindGroups = append(engine.BindGroups, bg)
+	defer bg.Stop(context.Background())
+
+	// New config adds a second bind addr.
+	newCfg := &config.Config{
+		Backends: []config.Backend{{Name: "be", Servers: []string{"10.0.0.1:80"}}},
+		Listeners: []config.Listener{
+			{Name: "a", Bind: addr1, Protocol: "http", Backend: "be"},
+			{Name: "b", Bind: addr2, Protocol: "http", Backend: "be"},
+		},
+	}
+	engine.Reload(newCfg)
+	defer func() {
+		// Clean up any bg the test added.
+		for _, bg := range engine.BindGroups {
+			bg.Stop(context.Background())
+		}
+	}()
+
+	if len(engine.BindGroups) != 2 {
+		t.Errorf("expected 2 bind groups after reload, got %d", len(engine.BindGroups))
+	}
+}
+
+// TestReloadL7Sites_RemoveBindGroup: removing a bind addr from the new
+// config triggers graceful Stop and drops the BindGroup from the engine.
+func TestReloadL7Sites_RemoveBindGroup(t *testing.T) {
+	freeAddr := func() string {
+		l, _ := net.Listen("tcp", "127.0.0.1:0")
+		addr := l.Addr().String()
+		l.Close()
+		return addr
+	}
+	keepAddr := freeAddr()
+	dropAddr := freeAddr()
+
+	cfg := &config.Config{
+		Backends: []config.Backend{{Name: "be", Servers: []string{"10.0.0.1:80"}}},
+		Listeners: []config.Listener{
+			{Name: "keep", Bind: keepAddr, Protocol: "http", Backend: "be"},
+			{Name: "drop", Bind: dropAddr, Protocol: "http", Backend: "be"},
+		},
+	}
+	expanded, _ := ExpandListeners(cfg.Listeners)
+	engine := NewEngine(cfg)
+	engine.Listeners = expanded
+	engine.initBackends()
+	for _, l := range expanded {
+		bg := httpproxy.NewBindGroup(l.Addr, l.Protocol)
+		bg.AddSite(engine.buildL7Site(l))
+		if err := bg.Start(); err != nil {
+			t.Fatalf("start %s: %v", l.Addr, err)
+		}
+		engine.BindGroups = append(engine.BindGroups, bg)
+	}
+
+	newCfg := &config.Config{
+		Backends: []config.Backend{{Name: "be", Servers: []string{"10.0.0.1:80"}}},
+		Listeners: []config.Listener{
+			{Name: "keep", Bind: keepAddr, Protocol: "http", Backend: "be"},
+		},
+	}
+	engine.Reload(newCfg)
+
+	if len(engine.BindGroups) != 1 {
+		t.Errorf("expected 1 bind group after reload, got %d", len(engine.BindGroups))
+	}
+	if engine.BindGroups[0].Addr() != keepAddr {
+		t.Errorf("kept wrong bind group: %s", engine.BindGroups[0].Addr())
+	}
+
+	// Give the background Stop goroutine a moment to drain, then verify
+	// the dropped port is actually free again (anyone can bind it).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		ln, err := net.Listen("tcp", dropAddr)
+		if err == nil {
+			ln.Close()
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Cleanup
+	for _, bg := range engine.BindGroups {
+		bg.Stop(context.Background())
+	}
+}
+
+// TestReloadL7Sites_PreflightAbortsOnPortConflict: if a new bind addr is
+// already taken, the entire L7 reload aborts and existing bind groups
+// keep running. All-or-nothing.
+func TestReloadL7Sites_PreflightAbortsOnPortConflict(t *testing.T) {
+	freeAddr := func() string {
+		l, _ := net.Listen("tcp", "127.0.0.1:0")
+		addr := l.Addr().String()
+		l.Close()
+		return addr
+	}
+	existingAddr := freeAddr()
+	// Hold a port to simulate conflict.
+	conflictLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	conflictAddr := conflictLn.Addr().String()
+	defer conflictLn.Close()
+
+	cfg := &config.Config{
+		Backends:  []config.Backend{{Name: "be", Servers: []string{"10.0.0.1:80"}}},
+		Listeners: []config.Listener{{Name: "a", Bind: existingAddr, Protocol: "http", Backend: "be"}},
+	}
+	expanded, _ := ExpandListeners(cfg.Listeners)
+	engine := NewEngine(cfg)
+	engine.Listeners = expanded
+	engine.initBackends()
+	bg := httpproxy.NewBindGroup(existingAddr, "http")
+	bg.AddSite(engine.buildL7Site(expanded[0]))
+	bg.Start()
+	engine.BindGroups = append(engine.BindGroups, bg)
+	defer bg.Stop(context.Background())
+
+	// New config adds a listener on the held port → pre-flight fails.
+	newCfg := &config.Config{
+		Backends: []config.Backend{{Name: "be", Servers: []string{"10.0.0.1:80"}}},
+		Listeners: []config.Listener{
+			{Name: "a", Bind: existingAddr, Protocol: "http", Backend: "be"},
+			{Name: "b", Bind: conflictAddr, Protocol: "http", Backend: "be"},
+		},
+	}
+	engine.Reload(newCfg)
+
+	// Existing bind group still alive.
+	if len(engine.BindGroups) != 1 {
+		t.Errorf("aborted reload should keep current bind groups (got %d)", len(engine.BindGroups))
+	}
 }
