@@ -79,7 +79,7 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 - **Per-Request Access Logging** — method, path, status, bytes, latency, backend in CLF format
 - **Prometheus Metrics** — `/metrics` endpoint with counters, gauges, histograms
 - **Admin REST API** — runtime stats, drain/enable/disable servers
-- **Hot Reload** — SIGHUP reloads config (backends and health checks)
+- **Hot Reload** — SIGHUP reloads the whole config without dropping in-flight connections: backends (with sticky / CB / LeastConn state preserved on rename), per-listener routes / ACL / headers / error pages, TLS certs (Let's Encrypt rotation), and bind addresses (added or removed with 10s graceful drain). Pre-flight port-availability check ensures all-or-nothing apply.
 - **Bandwidth Throttling** — per-connection read/write rate limiting
 
 ### Extensibility

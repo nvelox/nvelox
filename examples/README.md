@@ -646,6 +646,60 @@ listeners:
 
 ---
 
+## 32 — SIGHUP Hot Reload
+
+Apply config edits to a running nvelox without dropping connections.
+
+```bash
+# Start with the example config (real cert paths required for the :443
+# listener; tweak the file or use generated test certs).
+sudo ./nvelox -config examples/32-hot-reload.yaml &
+
+# Generate steady traffic so you can observe reload doesn't drop it.
+while true; do curl -s -o /dev/null -w "%{http_code} " http://localhost/; sleep 0.2; done &
+
+# Edit examples/32-hot-reload.yaml (add a backend server, change a
+# header, rotate cert paths, add a new listener…), then:
+sudo kill -HUP $(pidof nvelox)
+
+# Watch what changed:
+tail -F /var/log/nvelox/error.log | grep RELOAD
+# Expected: "Reload complete: backends +N/-M/~K, bind groups +N/-M,
+#           K sites swapped, K TLS certs rotated"
+
+# Verify with Prometheus metrics:
+curl -s 127.0.0.1:9100/metrics | grep nvelox_reload
+# nvelox_reload_total{result="ok"} 3
+# nvelox_reload_duration_seconds_sum 0.012
+```
+
+What's covered:
+
+| Change | Behaviour on reload |
+|---|---|
+| Add / remove backend | Reconciled by name. Kept backends preserve balancer + sticky + circuit-breaker state. |
+| Edit backend server list | `balancer.UpdateServers` — no balancer replacement, LeastConn counts preserved. |
+| Edit route / ACL / headers / error pages | Per-site `siteSet` swapped atomically. In-flight requests use old config; new ones use new. |
+| Rotate TLS cert files on disk | Re-loaded via `GetCertificate`. Active TLS connections keep their existing cert. |
+| Add a new `bind:` address | New BindGroup started. Existing groups untouched. |
+| Remove a `bind:` address | Graceful Stop, 10s drain in background. Port becomes free once drained. |
+| Add a new HTTP/3 listener | `Alt-Svc` advertisement turns on for the affected site. |
+| Port conflict on a new bind | Reload aborts pre-flight; existing config keeps running. |
+| Invalid YAML / config | `config.Load` rejects; existing config keeps running. |
+
+Reload is serialized — concurrent SIGHUPs queue rather than racing.
+
+### Cert rotation flow (Let's Encrypt)
+
+```bash
+# 30-day cron, or post-renewal hook:
+certbot renew --post-hook "kill -HUP $(pidof nvelox)"
+```
+
+`certbot renew` writes new files to the same paths in `tls.cert` / `tls.key`. nvelox re-reads them on SIGHUP and serves the new cert on the next TLS handshake. Existing TLS sessions complete on the old cert; clients with cached session tickets resume cleanly.
+
+---
+
 ## Cleanup
 
 ```bash
