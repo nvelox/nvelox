@@ -1,0 +1,48 @@
+# nvelox + PHP-FPM integration test stack.
+#
+# Two services on a private network:
+#   - php-fpm  — runs PHP-FPM 8.3 on :9000 (internal only).
+#   - nvelox   — built from the repo root, exposes :8080 on the host
+#                and forwards .php to php-fpm via FastCGI.
+#
+# Both containers mount ./www at /var/www/html so SCRIPT_FILENAME paths
+# resolve identically: nvelox builds the path, PHP-FPM reads the file.
+
+services:
+  php-fpm:
+    image: php:8.3-fpm-alpine
+    container_name: nvelox-test-phpfpm
+    restart: unless-stopped
+    networks:
+      - nvelox-test
+    expose:
+      - "9000"
+    volumes:
+      - ./www:/var/www/html:ro
+    healthcheck:
+      # cgi-fcgi isn't in the base image; just probe the TCP port.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9000 || exit 1"]
+      interval: 2s
+      timeout: 1s
+      retries: 10
+
+  nvelox:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: nvelox-test-proxy
+    restart: unless-stopped
+    depends_on:
+      php-fpm:
+        condition: service_healthy
+    networks:
+      - nvelox-test
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nvelox.conf:/etc/nvelox/nvelox.conf:ro
+      - ./www:/var/www/html:ro
+
+networks:
+  nvelox-test:
+    driver: bridge

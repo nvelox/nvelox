@@ -253,6 +253,17 @@ func parseByteSize(s string) int64 {
 	return n * multiplier
 }
 
+// isPHPPath reports whether a request path should be handled by FastCGI
+// rather than the static-file handler. Matches the typical PHP-FPM
+// dispatch shape: a path ending in `.php` or containing `.php/` (the
+// latter is the PATH_INFO form, e.g. /index.php/foo/bar). Operators who
+// run a non-PHP FastCGI backend can configure their own regex on the
+// matching route; this helper only kicks in when static+fastcgi coexist
+// on the same route.
+func isPHPPath(p string) bool {
+	return strings.HasSuffix(p, ".php") || strings.Contains(p, ".php/")
+}
+
 // warnIfKeyWorldReadable logs a WARN if a private-key file on disk has
 // group or world permission bits set. Operators in containerized setups
 // sometimes can't change perms, so we log rather than refuse the load.
@@ -464,14 +475,23 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			handler := NewStaticHandler(routeResult.Static)
-			if handler.ServeFile(w, r) {
-				return
-			}
-			// File not found — fall through to backend or 404
-			if backendName == "" {
-				s.serveError(w, http.StatusNotFound)
-				return
+			// If the route ALSO has FastCGI configured AND try_files
+			// resolved to a PHP path (front-controller pattern), skip
+			// the static handler and let FastCGI run the script.
+			// Without this, the static handler would happily serve
+			// index.php as plain text.
+			if routeResult.FastCGI.Pass != "" && isPHPPath(r.URL.Path) {
+				// Fall through to the FastCGI block below.
+			} else {
+				handler := NewStaticHandler(routeResult.Static)
+				if handler.ServeFile(w, r) {
+					return
+				}
+				// File not found — fall through to backend or 404
+				if backendName == "" && routeResult.FastCGI.Pass == "" {
+					s.serveError(w, http.StatusNotFound)
+					return
+				}
 			}
 		}
 
