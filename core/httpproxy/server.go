@@ -495,8 +495,16 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Handle FastCGI (PHP-FPM) forwarding
+		// Handle FastCGI (PHP-FPM) forwarding.
+		//
+		// Set the standard forwarding headers before dispatch so PHP sees
+		// the same X-Forwarded-For / X-Real-IP / X-Forwarded-Proto values
+		// the reverse-proxy path would inject. Without this, scripts that
+		// rely on $_SERVER['HTTP_X_FORWARDED_FOR'] (rate-limiting,
+		// geolocation, audit logs) see "(none)" even though nvelox knows
+		// the real client IP.
 		if routeResult.FastCGI.Pass != "" {
+			s.setForwardedHeaders(r)
 			if routeResult.Expires != "" {
 				SetExpires(w, routeResult.Expires)
 			}
