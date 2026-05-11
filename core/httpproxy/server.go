@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"nvelox/config"
@@ -87,6 +88,7 @@ type HTTPServer struct {
 	backendTransports map[string]*http.Transport
 	backendSchemes    map[string]string // "https" when backend_tls is enabled
 	altSvcHeader    string
+	closeOnce       sync.Once // guards Close() against double-invocation
 }
 
 // ListenerConfig mirrors core.ListenerConfig to avoid circular imports.
@@ -332,6 +334,26 @@ func (s *HTTPServer) Stop(ctx context.Context) error {
 		return s.bindGroup.Stop(ctx)
 	}
 	return nil
+}
+
+// Close stops every per-site background goroutine: response cache cleanup
+// loop and per-IP rate limiter cleanup loop. Called by BindGroup.ReplaceSites
+// when this site is being removed from a bind group on SIGHUP reload.
+//
+// Idempotent (sync.Once) — the underlying Cache.Stop / IPRateLimiter.Stop
+// close their stopCh channels, which would panic on second close.
+//
+// In-flight requests in the site's handlers complete normally; stopping
+// these tickers only disables background pruning, not the handlers.
+func (s *HTTPServer) Close() {
+	s.closeOnce.Do(func() {
+		if s.ResponseCache != nil {
+			s.ResponseCache.Stop()
+		}
+		if s.IPRateLimiter != nil {
+			s.IPRateLimiter.Stop()
+		}
+	})
 }
 
 // ServeHTTP handles incoming HTTP requests with routing, proxying, and header manipulation.

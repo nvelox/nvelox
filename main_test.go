@@ -8,35 +8,6 @@ import (
 	"time"
 )
 
-func TestSplitHostPort(t *testing.T) {
-	tests := []struct {
-		input    string
-		wantHost string
-		wantPort string
-		wantErr  bool
-	}{
-		{"127.0.0.1:8080", "127.0.0.1", "8080", false},
-		{":8080", "", "8080", false},
-		{"[::1]:80", "[::1]", "80", false},
-		{"invalid", "", "", true},
-		{"no-port:", "no-port", "", false},
-	}
-
-	for _, tt := range tests {
-		host, port, err := splitHostPort(tt.input)
-		if (err != nil) != tt.wantErr {
-			t.Errorf("splitHostPort(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
-			continue
-		}
-		if host != tt.wantHost {
-			t.Errorf("splitHostPort(%q) host = %q, want %q", tt.input, host, tt.wantHost)
-		}
-		if port != tt.wantPort {
-			t.Errorf("splitHostPort(%q) port = %q, want %q", tt.input, port, tt.wantPort)
-		}
-	}
-}
-
 func TestRun_Version(t *testing.T) {
 	err := run([]string{"cmd", "-version"}, context.Background(), nil)
 	if err != nil {

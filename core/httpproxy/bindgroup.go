@@ -29,14 +29,26 @@ type BindGroup struct {
 	protocol    string // "http" or "https"
 	httpServer  *http.Server
 	http3Server *http3.Server
-	sites       []*HTTPServer
-	primary     *HTTPServer // for shared TLS / HTTP3 config; first site for now
+	primary     *HTTPServer // for shared TLS / HTTP3 config; first site
 
-	// Multi-cert SNI dispatch state. Lives behind an atomic.Pointer so
-	// ReloadCerts can swap it without disturbing in-flight handshakes —
-	// the GetCertificate callback does a Load() on every ClientHello,
-	// which is lock-free.
+	// Site dispatch state. Lives behind an atomic.Pointer so ReplaceSites
+	// (called by Engine.Reload on listener config changes) can swap the
+	// site list without locking ServeHTTP. Reads via siteSet.Load().
+	sites atomic.Pointer[siteSet]
+
+	// Multi-cert SNI dispatch state. Same atomic-pointer pattern.
+	// ReloadCerts swaps without disturbing in-flight handshakes.
 	tlsState atomic.Pointer[tlsState]
+}
+
+// siteSet is the immutable snapshot of sites the bind group dispatches to.
+// Pre-computed exact / wildcard / default lookup tables so pickSite is one
+// map probe in the common case.
+type siteSet struct {
+	all         []*HTTPServer            // for iteration (cert reload etc.)
+	exact       map[string]*HTTPServer   // lowercased exact server_name → site
+	wildcard    []*HTTPServer            // sites with leftmost-wildcard names
+	defaultSite *HTTPServer              // explicit default_server, else first site
 }
 
 // tlsState is the immutable snapshot of every site's loaded cert for
@@ -48,6 +60,10 @@ type tlsState struct {
 	defaultCert *siteCert
 }
 
+// Addr returns the bind address the group is listening on. Used by
+// Engine.Reload to index its BindGroups slice by bind for site swaps.
+func (g *BindGroup) Addr() string { return g.addr }
+
 // NewBindGroup creates a group bound to addr. Use AddSite to attach one or
 // more *HTTPServer instances before calling Start.
 func NewBindGroup(addr, protocol string) *BindGroup {
@@ -57,33 +73,81 @@ func NewBindGroup(addr, protocol string) *BindGroup {
 	}
 }
 
-// AddSite attaches a Site (an *HTTPServer) to this group. The first site
-// added becomes the "primary" — its TLS / HTTP3 config drives the shared
-// listener until Phase C teaches the group to merge multiple certs.
+// AddSite attaches a Site to this group. Idempotent during initial
+// construction (before Start); the first site becomes the primary and
+// drives the shared TLS/HTTP3 config. After Start, prefer ReplaceSites
+// for any modification — it does the atomic swap correctly.
 func (g *BindGroup) AddSite(s *HTTPServer) {
-	g.sites = append(g.sites, s)
 	if g.primary == nil {
 		g.primary = s
 	}
+	current := g.sites.Load()
+	var all []*HTTPServer
+	if current != nil {
+		all = append([]*HTTPServer{}, current.all...)
+	}
+	all = append(all, s)
+	g.sites.Store(buildSiteSet(all))
 }
 
-// ServeHTTP picks the Site that owns r.Host and delegates. Strategy:
-//   1. Strip port from Host.
-//   2. Try exact match against any site's ServerNames, then leftmost-wildcard.
-//   3. Fall back to the site marked DefaultServer; else the first site.
-//
-// Single-site bind groups skip the lookup entirely — keeps overhead at zero
-// for the common case.
+// siteList returns a snapshot of the currently-published sites. Returns
+// an empty slice if Start hasn't been called (shouldn't happen in
+// practice, but defensive against caller bugs in tests).
+func (g *BindGroup) siteList() []*HTTPServer {
+	ss := g.sites.Load()
+	if ss == nil {
+		return nil
+	}
+	return ss.all
+}
+
+// buildSiteSet pre-computes the exact-name lookup map, the wildcard
+// candidate list, and the default site. Called every time the site list
+// is modified; cheap (one pass).
+func buildSiteSet(all []*HTTPServer) *siteSet {
+	ss := &siteSet{
+		all:   all,
+		exact: make(map[string]*HTTPServer),
+	}
+	for _, s := range all {
+		for _, name := range s.Listener.ServerNames {
+			ln := strings.ToLower(name)
+			if strings.HasPrefix(ln, "*.") {
+				ss.wildcard = append(ss.wildcard, s)
+				break // wildcard candidate; matched by tlsutil.MatchSite
+			} else {
+				ss.exact[ln] = s
+			}
+		}
+		if s.Listener.DefaultServer {
+			ss.defaultSite = s
+		}
+	}
+	// Implicit default: first site if none marked default_server. Preserves
+	// today's single-site behaviour.
+	if ss.defaultSite == nil && len(all) > 0 {
+		ss.defaultSite = all[0]
+	}
+	return ss
+}
+
+// ServeHTTP picks the Site that owns r.Host and delegates. Single-site
+// bind groups skip the lookup entirely (zero overhead for the common case).
 func (g *BindGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if len(g.sites) == 1 {
-		g.sites[0].ServeHTTP(w, r)
+	ss := g.sites.Load()
+	if ss == nil || len(ss.all) == 0 {
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if len(ss.all) == 1 {
+		ss.all[0].ServeHTTP(w, r)
 		return
 	}
 
 	host := r.Host
-	// Strip port if present (Host can be "api.foo.com:8443").
+	// Strip port if present. IPv6 literals are bracketed; SplitHostPort
+	// handles both.
 	if i := strings.LastIndex(host, ":"); i != -1 {
-		// IPv6 literals come bracketed: "[::1]:8443" — only strip after the bracket.
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			host = h
 		} else if !strings.Contains(host[:i], "]") {
@@ -91,32 +155,94 @@ func (g *BindGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	site := g.pickSite(host)
-	site.ServeHTTP(w, r)
+	g.pickSite(ss, host).ServeHTTP(w, r)
 }
 
-// pickSite resolves a hostname to the owning Site. Mirrors pickCert's
-// precedence: exact > wildcard > default > first.
-func (g *BindGroup) pickSite(host string) *HTTPServer {
-	if host != "" && len(g.sites) > 1 {
-		entries := make([]tlsutil.SiteEntry[*HTTPServer], 0, len(g.sites))
-		for _, s := range g.sites {
-			entries = append(entries, tlsutil.SiteEntry[*HTTPServer]{
-				Patterns: s.Listener.ServerNames,
-				Payload:  s,
-			})
-		}
-		if site, ok := tlsutil.MatchSite(host, entries); ok {
+// pickSite resolves a hostname to the owning Site against the supplied
+// snapshot. Precedence: exact > leftmost-wildcard > defaultSite.
+// O(1) exact lookup, O(wildcards) fallback.
+func (g *BindGroup) pickSite(ss *siteSet, host string) *HTTPServer {
+	if host != "" {
+		if site, ok := ss.exact[strings.ToLower(host)]; ok {
 			return site
 		}
-	}
-	// Fallback: explicit default_server, else primary (first site).
-	for _, s := range g.sites {
-		if s.Listener.DefaultServer {
-			return s
+		if len(ss.wildcard) > 0 {
+			entries := make([]tlsutil.SiteEntry[*HTTPServer], 0, len(ss.wildcard))
+			for _, s := range ss.wildcard {
+				entries = append(entries, tlsutil.SiteEntry[*HTTPServer]{
+					Patterns: s.Listener.ServerNames,
+					Payload:  s,
+				})
+			}
+			if site, ok := tlsutil.MatchSite(host, entries); ok {
+				return site
+			}
 		}
 	}
-	return g.primary
+	return ss.defaultSite
+}
+
+// ReplaceSites atomically swaps the bind group's site list. Used by
+// Engine.Reload to apply per-listener config changes (routes, ACL,
+// headers, error pages, etc.) without dropping in-flight connections.
+//
+// In-flight requests that already entered an old site's ServeHTTP
+// captured that pointer and run to completion. New requests see the
+// new siteSet via atomic.Load.
+//
+// Sites that disappear from the new list have Close() called on them
+// to stop their cleanup goroutines (ResponseCache, IPRateLimiter).
+// Note: Close is called immediately — any request currently inside
+// the dropped site still holds references to those collaborators, but
+// neither cache eviction nor IP-rate-limit pruning is critical for an
+// in-flight request to finish, so stopping their tickers is safe.
+//
+// ReplaceSites also rebuilds the TLS cert snapshot, in case site
+// server_names or cert paths changed. Failures during cert load follow
+// the same partial-success policy as ReloadCerts (keep prev cert).
+func (g *BindGroup) ReplaceSites(newSites []*HTTPServer) error {
+	if len(newSites) == 0 {
+		return fmt.Errorf("bind group %s: ReplaceSites called with empty site list", g.addr)
+	}
+	oldSet := g.sites.Load()
+
+	// Index old sites by listener name so we can identify which were
+	// dropped and need Close().
+	oldByName := make(map[string]*HTTPServer)
+	if oldSet != nil {
+		for _, s := range oldSet.all {
+			oldByName[s.Listener.Name] = s
+		}
+	}
+
+	// Publish the new site set BEFORE closing dropped sites — in-flight
+	// requests should see the new set, and dropped sites' Close stops
+	// background tickers but doesn't interrupt running handlers.
+	g.sites.Store(buildSiteSet(newSites))
+
+	// Primary tracks the first site; update so subsequent ReloadCerts
+	// / Stop pick up the right reference for shared-TLS-profile lookups.
+	g.primary = newSites[0]
+
+	// Refresh TLS state. Per-site failures keep previous cert.
+	if g.tlsState.Load() != nil {
+		if _, err := g.ReloadCerts(); err != nil {
+			logging.Warn("[RELOAD] bind group %s: cert refresh after ReplaceSites: %v", g.addr, err)
+		}
+	}
+
+	// Close dropped sites (in old, not in new).
+	newByName := make(map[string]struct{}, len(newSites))
+	for _, s := range newSites {
+		newByName[s.Listener.Name] = struct{}{}
+	}
+	for name, old := range oldByName {
+		if _, kept := newByName[name]; kept {
+			continue
+		}
+		old.Close()
+	}
+	return nil
 }
 
 // Start opens the listening socket and builds a TLS config that supports
@@ -154,7 +280,7 @@ func (g *BindGroup) Start() error {
 		// the goroutine-create happens-before relationship covers the
 		// field's first read in HTTPServer.ServeHTTP (race-detector clean).
 		var anyH3 bool
-		for _, s := range g.sites {
+		for _, s := range g.siteList() {
 			if s.Listener.HTTP3 {
 				s.altSvcHeader = fmt.Sprintf(`h3=":%d"; ma=86400`, s.Listener.Port)
 				anyH3 = true
@@ -243,12 +369,13 @@ func (g *BindGroup) buildTLSConfig() (*tls.Config, error) {
 // startup we refuse to listen. ReloadCerts handles partial failure
 // differently (keeps the prior cert for that site).
 func (g *BindGroup) loadCertState() (*tlsState, error) {
-	if len(g.sites) == 0 {
+	sites := g.siteList()
+	if len(sites) == 0 {
 		return nil, fmt.Errorf("bind group %s: no sites", g.addr)
 	}
-	certs := make([]siteCert, 0, len(g.sites))
+	certs := make([]siteCert, 0, len(sites))
 	var defaultCert *siteCert
-	for _, s := range g.sites {
+	for _, s := range sites {
 		if s.Listener.TLS == nil || s.Listener.TLS.Cert == "" {
 			continue
 		}
@@ -300,10 +427,11 @@ func (g *BindGroup) ReloadCerts() (int, error) {
 		}
 	}
 
-	certs := make([]siteCert, 0, len(g.sites))
+	sites := g.siteList()
+	certs := make([]siteCert, 0, len(sites))
 	var defaultCert *siteCert
 	rotated := 0
-	for _, s := range g.sites {
+	for _, s := range sites {
 		if s.Listener.TLS == nil || s.Listener.TLS.Cert == "" {
 			continue
 		}

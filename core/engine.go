@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -157,46 +158,7 @@ func (e *Engine) Start(ctx context.Context) error {
 		if l.Protocol != "http" && l.Protocol != "https" {
 			continue
 		}
-		var rl interface{ Allow() bool }
-		if limiter, ok := e.RateLimiters[l.Name]; ok {
-			rl = limiter
-		}
-		httpL := &httpproxy.ListenerConfig{
-			Name:           l.Name,
-			Addr:           l.Addr,
-			Protocol:       l.Protocol,
-			Backend:        l.Backend,
-			Port:           l.Port,
-			TLS:            l.TLS,
-			HTTP3:          l.HTTP3,
-			Routes:         l.Routes,
-			Headers:        l.Headers,
-			IPAllowlist:    l.IPAllowlist,
-			IPDenylist:     l.IPDenylist,
-			MaxBodySize:    l.MaxBodySize,
-			IPRateLimit:    l.IPRateLimit,
-			ACL:            l.ACL,
-			TrustedProxies: l.TrustedProxies,
-			ServerNames:    l.ServerNames,
-			DefaultServer:  l.DefaultServer,
-			Compression:    l.Compression,
-			ErrorPages:     l.ErrorPages,
-			Buffering:      l.Buffering,
-			Cache:          l.Cache,
-		}
-		connLimiters := make(map[string]httpproxy.ConnLimiterI)
-		for k, v := range e.ConnLimiters {
-			connLimiters[k] = v
-		}
-		passiveHealth := make(map[string]httpproxy.PassiveHealthI)
-		for k, v := range e.PassiveHealth {
-			passiveHealth[k] = v
-		}
-		cbs := make(map[string]httpproxy.CircuitBreakerI)
-		for k, v := range e.CircuitBreakers {
-			cbs[k] = v
-		}
-		site := httpproxy.NewHTTPServer(httpL, e.Balancers, e.Backends, rl, connLimiters, passiveHealth, e.StickyStores, cbs)
+		site := e.buildL7Site(l)
 		e.HTTPServers = append(e.HTTPServers, site)
 
 		if _, seen := bindGroups[l.Addr]; !seen {
@@ -347,15 +309,21 @@ func (e *Engine) Start(ctx context.Context) error {
 //     balancer state, sticky stores, circuit breakers, and DNS resolvers
 //     across renames-of-server-list-only. Goroutines for removed
 //     backends are stopped.
+//   - Per-site config swap on every existing HTTPS/HTTP bind group:
+//     routes / ACL / headers / error pages / compression / cache all
+//     hot-swapped via atomic.Pointer. In-flight requests keep their
+//     old site reference; new requests see the new config.
 //   - TLS certs hot-swapped on every BindGroup via atomic.Pointer
 //     (operators can rotate Let's Encrypt certs without restart).
 //
-// Listener add/remove/route-edit still requires restart (F2/F3 work).
+// Listener add/remove (new bind addresses) is F3 work — still requires
+// restart for those.
 func (e *Engine) Reload(cfg *config.Config) {
 	logging.Info("Reloading config...")
 
 	e.Config = cfg
 	added, removed, updated := e.reconcileBackends(cfg)
+	sitesSwapped := e.reloadL7Sites(cfg)
 
 	// Hot-reload TLS certs on every HTTPS bind group. Failures here are
 	// isolated to the site that broke; the rest of the bind group keeps
@@ -372,14 +340,201 @@ func (e *Engine) Reload(cfg *config.Config) {
 		}
 		totalRotated += rotated
 	}
-	logging.Info("Reload complete: backends +%d/-%d/~%d, %d TLS certs rotated",
-		added, removed, updated, totalRotated)
+	logging.Info("Reload complete: backends +%d/-%d/~%d, %d sites swapped, %d TLS certs rotated",
+		added, removed, updated, sitesSwapped, totalRotated)
+}
+
+// reloadL7Sites rebuilds the site list of every existing HTTP/HTTPS
+// BindGroup from the new config and atomically swaps it in.
+//
+// New bind addresses (not in any existing BindGroup) are NOT handled
+// here — that's F3 (bind-group composition changes). For now we log
+// and skip them.
+//
+// Returns the count of bind groups that had their sites swapped.
+func (e *Engine) reloadL7Sites(cfg *config.Config) int {
+	expanded, err := ExpandListeners(cfg.Listeners)
+	if err != nil {
+		logging.Error("[RELOAD] listener expansion failed: %v — skipping L7 site swap", err)
+		return 0
+	}
+
+	// Index existing bind groups by addr for O(1) lookup.
+	bgByAddr := make(map[string]*httpproxy.BindGroup, len(e.BindGroups))
+	for _, bg := range e.BindGroups {
+		bgByAddr[bg.Addr()] = bg
+	}
+
+	// Group new L7 listeners by addr.
+	newSitesByAddr := make(map[string][]*httpproxy.HTTPServer)
+	for _, l := range expanded {
+		if l.Protocol != "http" && l.Protocol != "https" {
+			continue
+		}
+		newSitesByAddr[l.Addr] = append(newSitesByAddr[l.Addr], e.buildL7Site(l))
+	}
+
+	// For each NEW addr, look up its existing bind group and ReplaceSites.
+	// New addresses with no matching bind group are flagged for F3.
+	swapped := 0
+	for addr, sites := range newSitesByAddr {
+		bg, ok := bgByAddr[addr]
+		if !ok {
+			logging.Warn("[RELOAD] new bind address %s requires restart (F3 not yet implemented)", addr)
+			// Close the just-built sites so we don't leak their goroutines.
+			for _, s := range sites {
+				s.Close()
+			}
+			continue
+		}
+		if err := bg.ReplaceSites(sites); err != nil {
+			logging.Error("[RELOAD] bind group %s: ReplaceSites failed: %v", addr, err)
+			for _, s := range sites {
+				s.Close()
+			}
+			continue
+		}
+		swapped++
+	}
+
+	// Refresh engine.HTTPServers and engine.Listeners so subsequent reloads
+	// and operators looking at engine state see the up-to-date list.
+	e.Listeners = expanded
+	e.HTTPServers = e.HTTPServers[:0]
+	for _, bg := range e.BindGroups {
+		for _, s := range newSitesByAddr[bg.Addr()] {
+			e.HTTPServers = append(e.HTTPServers, s)
+		}
+	}
+	return swapped
 }
 
 func (e *Engine) initBackends() {
 	for i := range e.Config.Backends {
 		e.initBackend(&e.Config.Backends[i])
 	}
+}
+
+// ExpandListeners takes the raw []config.Listener (as loaded from YAML)
+// and produces the engine-side []*ListenerConfig with port ranges
+// expanded into individual single-port entries.
+//
+// Used at startup by main.go and at SIGHUP reload by Engine.Reload so
+// the two paths can't drift. A bind like ":2000-2025" produces 26
+// listeners with Port set, each carrying the same per-listener config.
+func ExpandListeners(listeners []config.Listener) ([]*ListenerConfig, error) {
+	expanded := make([]*ListenerConfig, 0, len(listeners))
+	for _, l := range listeners {
+		host, portStr, err := net.SplitHostPort(l.Bind)
+		if err != nil {
+			return nil, fmt.Errorf("listener %s: invalid bind %q: %v", l.Name, l.Bind, err)
+		}
+		var tlsCfg *config.TLSConfig
+		if l.TLS.Cert != "" {
+			tlsCfgCopy := l.TLS
+			tlsCfg = &tlsCfgCopy
+		}
+
+		mk := func(name, addr string, port int) *ListenerConfig {
+			return &ListenerConfig{
+				Name:           name,
+				Addr:           addr,
+				Protocol:       l.Protocol,
+				ZeroCopy:       l.ZeroCopy,
+				Backend:        l.Backend,
+				RateLimit:      l.RateLimit,
+				Timeouts:       l.Timeouts,
+				TLS:            tlsCfg,
+				HTTP3:          l.HTTP3,
+				Routes:         l.Routes,
+				Headers:        l.Headers,
+				IPAllowlist:    l.IPAllowlist,
+				IPDenylist:     l.IPDenylist,
+				MaxBodySize:    l.MaxBodySize,
+				IPRateLimit:    l.IPRateLimit,
+				ACL:            l.ACL,
+				TrustedProxies: l.TrustedProxies,
+				ServerNames:    l.ServerNames,
+				DefaultServer:  l.DefaultServer,
+				Compression:    l.Compression,
+				ErrorPages:     l.ErrorPages,
+				Buffering:      l.Buffering,
+				Cache:          l.Cache,
+				Port:           port,
+			}
+		}
+
+		if strings.Contains(portStr, "-") {
+			parts := strings.Split(portStr, "-")
+			start, err1 := strconv.Atoi(parts[0])
+			end, err2 := strconv.Atoi(parts[1])
+			if err1 != nil || err2 != nil {
+				return nil, fmt.Errorf("listener %s: invalid port range %q", l.Name, portStr)
+			}
+			for p := start; p <= end; p++ {
+				expanded = append(expanded,
+					mk(fmt.Sprintf("%s-%d", l.Name, p),
+						fmt.Sprintf("%s:%d", host, p), p))
+			}
+		} else {
+			p, err := strconv.Atoi(portStr)
+			if err != nil {
+				return nil, fmt.Errorf("listener %s: invalid port %q: %v", l.Name, portStr, err)
+			}
+			expanded = append(expanded, mk(l.Name, l.Bind, p))
+		}
+	}
+	return expanded, nil
+}
+
+// buildL7Site constructs a fresh httpproxy.HTTPServer (Site) from a
+// core.ListenerConfig. Used at startup by Engine.Start and at SIGHUP
+// reload by Engine.reloadL7Sites to swap per-site config without
+// disturbing in-flight connections.
+//
+// Always builds against the engine's CURRENT balancers/backends maps —
+// so a reload that adds/changes backends sees the new state.
+func (e *Engine) buildL7Site(l *ListenerConfig) *httpproxy.HTTPServer {
+	var rl interface{ Allow() bool }
+	if limiter, ok := e.RateLimiters[l.Name]; ok {
+		rl = limiter
+	}
+	httpL := &httpproxy.ListenerConfig{
+		Name:           l.Name,
+		Addr:           l.Addr,
+		Protocol:       l.Protocol,
+		Backend:        l.Backend,
+		Port:           l.Port,
+		TLS:            l.TLS,
+		HTTP3:          l.HTTP3,
+		Routes:         l.Routes,
+		Headers:        l.Headers,
+		IPAllowlist:    l.IPAllowlist,
+		IPDenylist:     l.IPDenylist,
+		MaxBodySize:    l.MaxBodySize,
+		IPRateLimit:    l.IPRateLimit,
+		ACL:            l.ACL,
+		TrustedProxies: l.TrustedProxies,
+		ServerNames:    l.ServerNames,
+		DefaultServer:  l.DefaultServer,
+		Compression:    l.Compression,
+		ErrorPages:     l.ErrorPages,
+		Buffering:      l.Buffering,
+		Cache:          l.Cache,
+	}
+	connLimiters := make(map[string]httpproxy.ConnLimiterI)
+	for k, v := range e.ConnLimiters {
+		connLimiters[k] = v
+	}
+	passiveHealth := make(map[string]httpproxy.PassiveHealthI)
+	for k, v := range e.PassiveHealth {
+		passiveHealth[k] = v
+	}
+	cbs := make(map[string]httpproxy.CircuitBreakerI)
+	for k, v := range e.CircuitBreakers {
+		cbs[k] = v
+	}
+	return httpproxy.NewHTTPServer(httpL, e.Balancers, e.Backends, rl, connLimiters, passiveHealth, e.StickyStores, cbs)
 }
 
 // initBackend wires one backend's balancer, conn limiter, passive health,
