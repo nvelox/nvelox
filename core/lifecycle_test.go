@@ -123,3 +123,151 @@ func TestTimeoutConfig_InvalidFallback(t *testing.T) {
 		t.Errorf("expected fallback 10s for invalid connect, got %v", tc.ParseConnect())
 	}
 }
+
+// TestReconcileBackends_Kept verifies that reloading with the same backend
+// preserves the live balancer (state intact), and that an unchanged server
+// list does not trigger a needless UpdateServers.
+func TestReconcileBackends_Kept(t *testing.T) {
+	cfg := &config.Config{
+		Backends: []config.Backend{
+			{Name: "be", Balance: "leastconn", Servers: []string{"10.0.0.1:80", "10.0.0.2:80"}},
+		},
+	}
+	engine := NewEngine(cfg)
+	engine.initBackends()
+	bal := engine.Balancers["be"]
+
+	// Simulate live state on the balancer — LeastConn keeps per-server
+	// connection counts. We want these preserved across reload.
+	bal.OnConnect("10.0.0.1:80")
+	bal.OnConnect("10.0.0.1:80")
+
+	// Reload with identical backend → same balancer instance, same state.
+	added, removed, updated := engine.reconcileBackends(cfg)
+	if added != 0 || removed != 0 || updated != 0 {
+		t.Errorf("identical reload: want (0,0,0), got (%d,%d,%d)", added, removed, updated)
+	}
+	if engine.Balancers["be"] != bal {
+		t.Error("kept backend should preserve the same *balancer instance")
+	}
+}
+
+// TestReconcileBackends_ServerListChanged: same backend name, different
+// server list → UpdateServers called, balancer instance preserved.
+func TestReconcileBackends_ServerListChanged(t *testing.T) {
+	cfg := &config.Config{
+		Backends: []config.Backend{
+			{Name: "be", Balance: "roundrobin", Servers: []string{"10.0.0.1:80"}},
+		},
+	}
+	engine := NewEngine(cfg)
+	engine.initBackends()
+	bal := engine.Balancers["be"]
+
+	newCfg := &config.Config{
+		Backends: []config.Backend{
+			{Name: "be", Balance: "roundrobin", Servers: []string{"10.0.0.1:80", "10.0.0.2:80", "10.0.0.3:80"}},
+		},
+	}
+	_, _, updated := engine.reconcileBackends(newCfg)
+	if updated != 1 {
+		t.Errorf("expected 1 updated, got %d", updated)
+	}
+	if engine.Balancers["be"] != bal {
+		t.Error("server-list change should NOT replace the balancer instance")
+	}
+	// Servers got propagated to the balancer.
+	if _, err := bal.Next(); err != nil {
+		t.Errorf("balancer broken after UpdateServers: %v", err)
+	}
+}
+
+// TestReconcileBackends_Removed: backend gone from new config → all its
+// goroutines stopped, all maps cleaned. No goroutine leak.
+func TestReconcileBackends_Removed(t *testing.T) {
+	cfg := &config.Config{
+		Backends: []config.Backend{
+			{Name: "be", Balance: "roundrobin", Servers: []string{"10.0.0.1:80"},
+				StickySession: config.StickyConfig{Type: "cookie", TTL: "1m"}},
+		},
+	}
+	engine := NewEngine(cfg)
+	engine.initBackends()
+
+	// Sticky store has a cleanup goroutine running. Removing the backend
+	// must Stop it to avoid a leak.
+	store := engine.StickyStores["be"]
+	if store == nil {
+		t.Fatal("sticky store not initialized")
+	}
+
+	emptyCfg := &config.Config{Backends: nil}
+	_, removed, _ := engine.reconcileBackends(emptyCfg)
+	if removed != 1 {
+		t.Errorf("expected 1 removed, got %d", removed)
+	}
+
+	if _, ok := engine.Balancers["be"]; ok {
+		t.Error("balancer not removed")
+	}
+	if _, ok := engine.StickyStores["be"]; ok {
+		t.Error("sticky store not removed")
+	}
+	if _, ok := engine.Backends["be"]; ok {
+		t.Error("backend cfg ref not removed")
+	}
+}
+
+// TestReconcileBackends_Added: brand-new backend in new config → fully
+// initialized (balancer + sticky + etc.).
+func TestReconcileBackends_Added(t *testing.T) {
+	engine := NewEngine(&config.Config{})
+	engine.initBackends()
+
+	newCfg := &config.Config{
+		Backends: []config.Backend{
+			{Name: "be", Balance: "roundrobin", Servers: []string{"10.0.0.1:80"}},
+		},
+	}
+	added, _, _ := engine.reconcileBackends(newCfg)
+	if added != 1 {
+		t.Errorf("expected 1 added, got %d", added)
+	}
+	if _, ok := engine.Balancers["be"]; !ok {
+		t.Error("balancer not initialized for added backend")
+	}
+}
+
+// TestReconcileBackends_StickyPreservedAcrossReload: a sticky store keyed
+// by a backend name that survives reload must keep the same Store instance,
+// so client cookies issued before the reload still resolve to the same
+// upstream server afterward.
+func TestReconcileBackends_StickyPreservedAcrossReload(t *testing.T) {
+	cfg := &config.Config{
+		Backends: []config.Backend{
+			{Name: "be", Balance: "roundrobin", Servers: []string{"10.0.0.1:80"},
+				StickySession: config.StickyConfig{Type: "cookie", TTL: "1h"}},
+		},
+	}
+	engine := NewEngine(cfg)
+	engine.initBackends()
+	store := engine.StickyStores["be"]
+	// Set a known cookie → server mapping.
+	store.Set("cookie-A", "10.0.0.1:80")
+
+	// Reload with a server-list change but same backend name.
+	newCfg := &config.Config{
+		Backends: []config.Backend{
+			{Name: "be", Balance: "roundrobin", Servers: []string{"10.0.0.1:80", "10.0.0.2:80"},
+				StickySession: config.StickyConfig{Type: "cookie", TTL: "1h"}},
+		},
+	}
+	engine.reconcileBackends(newCfg)
+
+	if engine.StickyStores["be"] != store {
+		t.Error("sticky store instance must survive reload; cookies would otherwise be invalidated")
+	}
+	if got := store.Get("cookie-A"); got != "10.0.0.1:80" {
+		t.Errorf("sticky lookup after reload: got %q, want 10.0.0.1:80", got)
+	}
+}

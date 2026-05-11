@@ -42,7 +42,7 @@ type Engine struct {
 	StickyStores    map[string]*sticky.Store          // keyed by backend name
 	CircuitBreakers map[string]*circuitbreaker.Breaker // keyed by backend name
 	Metrics         *metrics.Registry
-	DNSResolvers    []*discovery.DNSResolver
+	DNSResolvers    map[string]*discovery.DNSResolver // keyed by backend name
 	AdminServer     *admin.Server
 	metricsServer   *http.Server
 	UDPPool         *UDPPool                          // UDP session affinity pool
@@ -94,6 +94,7 @@ func NewEngine(cfg *config.Config) *Engine {
 		PassiveHealth:   make(map[string]*PassiveHealthTracker),
 		StickyStores:    make(map[string]*sticky.Store),
 		CircuitBreakers: make(map[string]*circuitbreaker.Breaker),
+		DNSResolvers:    make(map[string]*discovery.DNSResolver),
 		Metrics:         metrics.Default,
 	}
 	return e
@@ -341,24 +342,20 @@ func (e *Engine) Start(ctx context.Context) error {
 	return nil
 }
 
-// Reload applies a new config to a running engine. Today it handles:
-//   - Backends (balancer + health checker) rebuilt from scratch.
+// Reload applies a new config to a running engine. Handles:
+//   - Backend reconciliation by name (kept / added / removed), preserving
+//     balancer state, sticky stores, circuit breakers, and DNS resolvers
+//     across renames-of-server-list-only. Goroutines for removed
+//     backends are stopped.
 //   - TLS certs hot-swapped on every BindGroup via atomic.Pointer
 //     (operators can rotate Let's Encrypt certs without restart).
 //
 // Listener add/remove/route-edit still requires restart (F2/F3 work).
 func (e *Engine) Reload(cfg *config.Config) {
-	logging.Info("Reloading backends...")
+	logging.Info("Reloading config...")
 
-	// Stop existing health checkers
-	for name, checker := range e.Checkers {
-		checker.Stop()
-		delete(e.Checkers, name)
-	}
-
-	// Update config and re-initialize backends
 	e.Config = cfg
-	e.initBackends()
+	added, removed, updated := e.reconcileBackends(cfg)
 
 	// Hot-reload TLS certs on every HTTPS bind group. Failures here are
 	// isolated to the site that broke; the rest of the bind group keeps
@@ -375,84 +372,180 @@ func (e *Engine) Reload(cfg *config.Config) {
 		}
 		totalRotated += rotated
 	}
-	if totalRotated > 0 {
-		logging.Info("Reload complete: %d backends, %d TLS certs rotated", len(cfg.Backends), totalRotated)
-	} else {
-		logging.Info("Reload complete: %d backends, no cert rotation needed", len(cfg.Backends))
-	}
+	logging.Info("Reload complete: backends +%d/-%d/~%d, %d TLS certs rotated",
+		added, removed, updated, totalRotated)
 }
 
 func (e *Engine) initBackends() {
 	for i := range e.Config.Backends {
-		be := &e.Config.Backends[i]
-		balancer := lb.NewBalancer(be.Balance, be.Servers)
-		e.Balancers[be.Name] = balancer
-		e.Backends[be.Name] = be
-		logging.Info("Initialized backend %s with %s balancing", be.Name, be.Balance)
+		e.initBackend(&e.Config.Backends[i])
+	}
+}
 
-		// Connection limiter
-		if be.MaxConnections > 0 {
-			e.ConnLimiters[be.Name] = NewConnLimiter(be.MaxConnections)
-			logging.Info("Connection limiter for %s: max %d", be.Name, be.MaxConnections)
-		}
+// initBackend wires one backend's balancer, conn limiter, passive health,
+// sticky store, circuit breaker, DNS resolver, and active health checker.
+// Used by initBackends at startup and by reconcileBackends for added
+// backends on SIGHUP reload.
+func (e *Engine) initBackend(be *config.Backend) {
+	balancer := lb.NewBalancer(be.Balance, be.Servers)
+	e.Balancers[be.Name] = balancer
+	e.Backends[be.Name] = be
+	logging.Info("Initialized backend %s with %s balancing", be.Name, be.Balance)
 
-		// Passive health checks
-		if be.HealthCheck.Passive.MaxFails > 0 {
-			e.PassiveHealth[be.Name] = NewPassiveHealthTracker(be.Name, be.HealthCheck.Passive.MaxFails, balancer)
-			logging.Info("Passive health for %s: max_fails=%d", be.Name, be.HealthCheck.Passive.MaxFails)
-		}
+	if be.MaxConnections > 0 {
+		e.ConnLimiters[be.Name] = NewConnLimiter(be.MaxConnections)
+		logging.Info("Connection limiter for %s: max %d", be.Name, be.MaxConnections)
+	}
 
-		// Sticky sessions
-		if be.StickySession.Type != "" {
-			ttl := 1 * time.Hour
-			if be.StickySession.TTL != "" {
-				if d, err := time.ParseDuration(be.StickySession.TTL); err == nil {
-					ttl = d
-				}
-			}
-			e.StickyStores[be.Name] = sticky.NewStore(ttl)
-			logging.Info("Sticky session for %s: type=%s, ttl=%v", be.Name, be.StickySession.Type, ttl)
-		}
+	if be.HealthCheck.Passive.MaxFails > 0 {
+		e.PassiveHealth[be.Name] = NewPassiveHealthTracker(be.Name, be.HealthCheck.Passive.MaxFails, balancer)
+		logging.Info("Passive health for %s: max_fails=%d", be.Name, be.HealthCheck.Passive.MaxFails)
+	}
 
-		// Circuit breaker
-		if be.CircuitBreaker.Enabled {
-			cbTimeout := 30 * time.Second
-			if be.CircuitBreaker.Timeout != "" {
-				if d, err := time.ParseDuration(be.CircuitBreaker.Timeout); err == nil {
-					cbTimeout = d
-				}
-			}
-			e.CircuitBreakers[be.Name] = circuitbreaker.New(
-				be.CircuitBreaker.Threshold,
-				cbTimeout,
-				be.CircuitBreaker.HalfOpenMax,
-			)
-			logging.Info("Circuit breaker for %s: threshold=%d, timeout=%v", be.Name, be.CircuitBreaker.Threshold, cbTimeout)
-		}
-
-		// DNS-based service discovery
-		if be.ResolveInterval != "" {
-			interval, err := time.ParseDuration(be.ResolveInterval)
-			if err == nil && interval > 0 {
-				resolver := discovery.NewDNSResolver(be.Name, be.Servers, interval, be.AllowPrivateIPs, func(servers []string) {
-					balancer.UpdateServers(servers)
-				})
-				resolver.Start()
-				e.DNSResolvers = append(e.DNSResolvers, resolver)
+	if be.StickySession.Type != "" {
+		ttl := 1 * time.Hour
+		if be.StickySession.TTL != "" {
+			if d, err := time.ParseDuration(be.StickySession.TTL); err == nil {
+				ttl = d
 			}
 		}
+		e.StickyStores[be.Name] = sticky.NewStore(ttl)
+		logging.Info("Sticky session for %s: type=%s, ttl=%v", be.Name, be.StickySession.Type, ttl)
+	}
 
-		// Active health checks
-		if be.HealthCheck.Active.Interval != "" {
-			checker := health.NewChecker(be.HealthCheck, be)
-			checker.OnStatusChange = func(server string, healthy bool) {
-				log.Printf("Health status change for backend %s, server %s: healthy=%t", be.Name, server, healthy)
-				balancer.UpdateStatus(server, healthy)
+	if be.CircuitBreaker.Enabled {
+		cbTimeout := 30 * time.Second
+		if be.CircuitBreaker.Timeout != "" {
+			if d, err := time.ParseDuration(be.CircuitBreaker.Timeout); err == nil {
+				cbTimeout = d
 			}
-			e.Checkers[be.Name] = checker
-			checker.Start()
+		}
+		e.CircuitBreakers[be.Name] = circuitbreaker.New(
+			be.CircuitBreaker.Threshold,
+			cbTimeout,
+			be.CircuitBreaker.HalfOpenMax,
+		)
+		logging.Info("Circuit breaker for %s: threshold=%d, timeout=%v", be.Name, be.CircuitBreaker.Threshold, cbTimeout)
+	}
+
+	if be.ResolveInterval != "" {
+		interval, err := time.ParseDuration(be.ResolveInterval)
+		if err == nil && interval > 0 {
+			resolver := discovery.NewDNSResolver(be.Name, be.Servers, interval, be.AllowPrivateIPs, func(servers []string) {
+				balancer.UpdateServers(servers)
+			})
+			resolver.Start()
+			e.DNSResolvers[be.Name] = resolver
 		}
 	}
+
+	if be.HealthCheck.Active.Interval != "" {
+		checker := health.NewChecker(be.HealthCheck, be)
+		checker.OnStatusChange = func(server string, healthy bool) {
+			log.Printf("Health status change for backend %s, server %s: healthy=%t", be.Name, server, healthy)
+			balancer.UpdateStatus(server, healthy)
+		}
+		e.Checkers[be.Name] = checker
+		checker.Start()
+	}
+}
+
+// teardownBackend stops every goroutine and releases every resource
+// associated with a backend name. Used by reconcileBackends when a
+// backend is removed from the config on reload.
+//
+// In-flight requests that captured the old balancer via closure
+// (httpproxy.ReverseProxy.Director) continue to run against it — Go's
+// GC keeps it alive until those requests complete. Memory is reclaimed
+// naturally; no leak.
+func (e *Engine) teardownBackend(name string) {
+	if c, ok := e.Checkers[name]; ok {
+		c.Stop()
+		delete(e.Checkers, name)
+	}
+	if r, ok := e.DNSResolvers[name]; ok {
+		r.Stop()
+		delete(e.DNSResolvers, name)
+	}
+	if s, ok := e.StickyStores[name]; ok {
+		s.Stop()
+		delete(e.StickyStores, name)
+	}
+	delete(e.Balancers, name)
+	delete(e.Backends, name)
+	delete(e.ConnLimiters, name)
+	delete(e.PassiveHealth, name)
+	delete(e.CircuitBreakers, name)
+}
+
+// reconcileBackends diffs the running config against newCfg and applies
+// the minimum change set:
+//
+//   - Backends still present (KEPT): preserve balancer (so LeastConn
+//     keeps its connection counts), sticky store (so client cookies
+//     stay valid), circuit breaker state. UpdateServers() if the
+//     server list changed.
+//   - New backends (ADDED): init from scratch via initBackend.
+//   - Backends gone from new config (REMOVED): teardownBackend stops
+//     all goroutines (health checker, DNS resolver, sticky cleanup)
+//     and drops the maps. No goroutine leaks.
+//
+// Returns counts (added, removed, updated) for logging.
+func (e *Engine) reconcileBackends(newCfg *config.Config) (added, removed, updated int) {
+	newByName := make(map[string]*config.Backend, len(newCfg.Backends))
+	for i := range newCfg.Backends {
+		newByName[newCfg.Backends[i].Name] = &newCfg.Backends[i]
+	}
+
+	// Phase 1: tear down REMOVED backends. Collect names first so we
+	// don't mutate maps while iterating.
+	toRemove := make([]string, 0)
+	for name := range e.Balancers {
+		if _, kept := newByName[name]; !kept {
+			toRemove = append(toRemove, name)
+		}
+	}
+	for _, name := range toRemove {
+		e.teardownBackend(name)
+		removed++
+		logging.Info("[RELOAD] Removed backend: %s", name)
+	}
+
+	// Phase 2: update KEPT backends; add NEW ones.
+	for name, be := range newByName {
+		if bal, kept := e.Balancers[name]; kept {
+			// Refresh the cached *config.Backend pointer so per-request reads
+			// (Backend.Retry, Backend.Timeouts.*, etc.) see the new values.
+			old := e.Backends[name]
+			e.Backends[name] = be
+			if !sliceEqual(old.Servers, be.Servers) {
+				bal.UpdateServers(be.Servers)
+				updated++
+				logging.Info("[RELOAD] Updated backend %s server list (%d → %d servers)",
+					name, len(old.Servers), len(be.Servers))
+			}
+		} else {
+			e.initBackend(be)
+			added++
+			logging.Info("[RELOAD] Added backend: %s", name)
+		}
+	}
+	return added, removed, updated
+}
+
+// sliceEqual reports whether two string slices have identical contents
+// in the same order. Used to detect backend server-list changes during
+// reconcile.
+func sliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (e *Engine) getAddrs(proto string) []string {
