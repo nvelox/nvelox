@@ -67,7 +67,7 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 - **Passive Health Checks** — mark down after N consecutive failures
 - **Retries / Failover** — retry on connect failure, 502, 503; skip failed servers
 - **Circuit Breaker** — closed/open/half-open state machine per backend
-- **Configurable Timeouts** — connect/read/write/idle per listener and backend
+- **Configurable Timeouts** — connect/read_header/read/write/idle per listener and backend; read/write are applied per-request after Host-based routing, so sites sharing a bind port can have different budgets
 - **Graceful Drain** — finish in-flight connections on shutdown with configurable deadline
 
 ### Response Processing

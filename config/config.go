@@ -279,11 +279,20 @@ type SNIRoute struct {
 }
 
 // TimeoutConfig defines configurable timeouts for listeners and backends.
+//
+// On HTTP listeners, ReadHeader bounds the time spent parsing request headers
+// (slowloris guard) and is enforced at the http.Server level. Read and Write
+// are applied per-request via http.ResponseController.SetReadDeadline /
+// SetWriteDeadline once the routing site is known, so two sites sharing the
+// same bind port can have different Read/Write budgets. ReadHeader is shared
+// across sites on the same bind port (one http.Server) — the engine uses the
+// max configured value across sites, falling back to a sensible default.
 type TimeoutConfig struct {
-	Connect string `yaml:"connect,omitempty"` // dial timeout (default "10s")
-	Read    string `yaml:"read,omitempty"`    // read timeout
-	Write   string `yaml:"write,omitempty"`   // write timeout
-	Idle    string `yaml:"idle,omitempty"`    // idle connection timeout
+	Connect    string `yaml:"connect,omitempty"`     // dial timeout (default "10s")
+	ReadHeader string `yaml:"read_header,omitempty"` // request header read timeout (HTTP listeners)
+	Read       string `yaml:"read,omitempty"`        // read timeout (whole request incl. body)
+	Write      string `yaml:"write,omitempty"`       // write timeout (whole response)
+	Idle       string `yaml:"idle,omitempty"`        // idle connection timeout
 }
 
 // ParseConnect returns the connect timeout duration, defaulting to 10s.
@@ -295,6 +304,16 @@ func (t TimeoutConfig) ParseConnect() time.Duration {
 	if err != nil {
 		return 10 * time.Second
 	}
+	return d
+}
+
+// ParseReadHeader returns the read-header timeout duration, or 0 (no timeout)
+// if not set. An explicit "0" disables the timeout.
+func (t TimeoutConfig) ParseReadHeader() time.Duration {
+	if t.ReadHeader == "" {
+		return 0
+	}
+	d, _ := time.ParseDuration(t.ReadHeader)
 	return d
 }
 
@@ -323,6 +342,32 @@ func (t TimeoutConfig) ParseIdle() time.Duration {
 	}
 	d, _ := time.ParseDuration(t.Idle)
 	return d
+}
+
+// ResolveRead returns the configured read timeout, or the supplied default
+// when the field is unset. An explicit "0" yields 0 (unlimited), letting
+// operators opt out of any per-request read deadline.
+func (t TimeoutConfig) ResolveRead(def time.Duration) time.Duration {
+	if t.Read == "" {
+		return def
+	}
+	return t.ParseRead()
+}
+
+// ResolveWrite mirrors ResolveRead for the write timeout.
+func (t TimeoutConfig) ResolveWrite(def time.Duration) time.Duration {
+	if t.Write == "" {
+		return def
+	}
+	return t.ParseWrite()
+}
+
+// ResolveReadHeader mirrors ResolveRead for the read-header timeout.
+func (t TimeoutConfig) ResolveReadHeader(def time.Duration) time.Duration {
+	if t.ReadHeader == "" {
+		return def
+	}
+	return t.ParseReadHeader()
 }
 
 // HeadersConfig defines request/response header manipulation.

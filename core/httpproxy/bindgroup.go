@@ -131,8 +131,21 @@ func buildSiteSet(all []*HTTPServer) *siteSet {
 	return ss
 }
 
+// Defaults preserved when a listener doesn't configure timeouts. Mirrors
+// the original hard-coded http.Server values so unconfigured listeners
+// keep their pre-per-listener-timeouts behavior.
+const (
+	defaultReadHeaderTimeout = 10 * time.Second
+	defaultReadTimeout       = 60 * time.Second
+	defaultWriteTimeout      = 60 * time.Second
+	defaultIdleTimeout       = 120 * time.Second
+)
+
 // ServeHTTP picks the Site that owns r.Host and delegates. Single-site
 // bind groups skip the lookup entirely (zero overhead for the common case).
+// Per-listener Read/Write timeouts are applied here, after the site is
+// known, via http.ResponseController so two sites sharing the same bind
+// port can carry different request budgets.
 func (g *BindGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ss := g.sites.Load()
 	if ss == nil || len(ss.all) == 0 {
@@ -140,6 +153,7 @@ func (g *BindGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(ss.all) == 1 {
+		applySiteDeadlines(w, ss.all[0])
 		ss.all[0].ServeHTTP(w, r)
 		return
 	}
@@ -155,7 +169,66 @@ func (g *BindGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	g.pickSite(ss, host).ServeHTTP(w, r)
+	site := g.pickSite(ss, host)
+	applySiteDeadlines(w, site)
+	site.ServeHTTP(w, r)
+}
+
+// applySiteDeadlines sets per-request read/write deadlines based on the
+// matched site's listener.timeouts. A configured "0" yields no deadline
+// (unlimited); an unconfigured field gets the bindgroup default (60s).
+// Errors from SetReadDeadline / SetWriteDeadline are intentionally
+// ignored — they indicate a wrapped ResponseWriter that doesn't surface
+// the underlying connection (e.g., a test fake), and the request will
+// still complete; we just won't enforce a per-request deadline in that
+// case.
+func applySiteDeadlines(w http.ResponseWriter, site *HTTPServer) {
+	if site == nil {
+		return
+	}
+	rc := http.NewResponseController(w)
+	readTO := site.Listener.Timeouts.ResolveRead(defaultReadTimeout)
+	writeTO := site.Listener.Timeouts.ResolveWrite(defaultWriteTimeout)
+	now := time.Now()
+	if readTO > 0 {
+		_ = rc.SetReadDeadline(now.Add(readTO))
+	} else {
+		_ = rc.SetReadDeadline(time.Time{}) // explicit "unlimited"
+	}
+	if writeTO > 0 {
+		_ = rc.SetWriteDeadline(now.Add(writeTO))
+	} else {
+		_ = rc.SetWriteDeadline(time.Time{})
+	}
+}
+
+// resolveHeaderAndIdleTimeouts derives the http.Server-level timeouts that
+// must be shared across all sites on this bind. Read-header is the slowloris
+// guard for header parsing — one http.Server has a single ReadHeaderTimeout
+// slot, so we take the max across sites (any site that needs more leeway
+// pulls the bind up); listeners that don't configure it inherit the 10s
+// default. Idle is the same shape. Both honour explicit "0" → unlimited.
+func (g *BindGroup) resolveHeaderAndIdleTimeouts() (readHeader, idle time.Duration) {
+	readHeader = defaultReadHeaderTimeout
+	idle = defaultIdleTimeout
+	anyHeader, anyIdle := false, false
+	for _, s := range g.siteList() {
+		if s.Listener.Timeouts.ReadHeader != "" {
+			d := s.Listener.Timeouts.ParseReadHeader()
+			if !anyHeader || d == 0 || (readHeader != 0 && d > readHeader) {
+				readHeader = d
+				anyHeader = true
+			}
+		}
+		if s.Listener.Timeouts.Idle != "" {
+			d := s.Listener.Timeouts.ParseIdle()
+			if !anyIdle || d == 0 || (idle != 0 && d > idle) {
+				idle = d
+				anyIdle = true
+			}
+		}
+	}
+	return readHeader, idle
 }
 
 // pickSite resolves a hostname to the owning Site against the supplied
@@ -252,12 +325,18 @@ func (g *BindGroup) Start() error {
 		return fmt.Errorf("bind group %s has no sites", g.addr)
 	}
 
+	// http.Server has only one slot for ReadHeaderTimeout / IdleTimeout per
+	// bind, so those are derived from the site set (max across sites, with
+	// defaults). ReadTimeout / WriteTimeout are deliberately 0 here: Read
+	// and Write are applied per-request from the matched site's listener
+	// timeouts via http.ResponseController in ServeHTTP. ReadHeaderTimeout
+	// remains the slowloris guard for the pre-routing header-parse phase.
+	readHeaderTO, idleTO := g.resolveHeaderAndIdleTimeouts()
 	g.httpServer = &http.Server{
-		Addr:         g.addr,
-		Handler:      g,
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:              g.addr,
+		Handler:           g,
+		ReadHeaderTimeout: readHeaderTO,
+		IdleTimeout:       idleTO,
 	}
 
 	primary := g.primary

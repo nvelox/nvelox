@@ -97,9 +97,20 @@ listeners:
     #   are trusted and appended; everyone else gets their forged
     #   headers replaced with the authoritative peer IP.
 
-    # Timeouts
+    # Timeouts (HTTP/HTTPS listeners). All values accept Go duration
+    # strings ("30s", "5m", "1h"). An explicit "0" means unlimited.
+    #
+    #   read_header — slowloris guard for header parsing. Shared across
+    #                 sites on the same bind port; the engine takes the
+    #                 max configured value (or 10s default).
+    #   read        — whole-request budget (headers + body). Applied
+    #                 per-request after Host-based routing, so two sites
+    #                 sharing a bind can use different values. 60s default.
+    #   write       — whole-response budget. Per-request like read. 60s.
+    #   idle        — keep-alive idle between requests on a connection.
+    #                 Shared across sites; max wins. 120s default.
     timeouts:
-      connect: "5s"
+      read_header: "10s"
       read: "30s"
       write: "30s"
       idle: "120s"

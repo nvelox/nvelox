@@ -253,3 +253,75 @@ func TestBindGroup_ReloadCerts_BeforeStart(t *testing.T) {
 		t.Error("ReloadCerts on an unstarted bind group must error")
 	}
 }
+
+// siteWithTimeouts builds a minimal HTTPServer carrying the listener
+// timeouts we need to assert resolveHeaderAndIdleTimeouts behaviour.
+// Only Listener.Timeouts is read by that function; everything else stays nil.
+func siteWithTimeouts(name string, t config.TimeoutConfig) *HTTPServer {
+	return &HTTPServer{
+		Listener: &ListenerConfig{
+			Name:     name,
+			Timeouts: t,
+		},
+	}
+}
+
+// TestBindGroup_HeaderIdleTimeouts_Defaults: with no site setting timeouts,
+// the bindgroup falls back to (10s, 120s).
+func TestBindGroup_HeaderIdleTimeouts_Defaults(t *testing.T) {
+	g := NewBindGroup(":80", "http")
+	g.AddSite(siteWithTimeouts("a", config.TimeoutConfig{}))
+	g.AddSite(siteWithTimeouts("b", config.TimeoutConfig{}))
+	rh, idle := g.resolveHeaderAndIdleTimeouts()
+	if rh != defaultReadHeaderTimeout {
+		t.Errorf("unset → default read_header: got %v, want %v", rh, defaultReadHeaderTimeout)
+	}
+	if idle != defaultIdleTimeout {
+		t.Errorf("unset → default idle: got %v, want %v", idle, defaultIdleTimeout)
+	}
+}
+
+// TestBindGroup_HeaderIdleTimeouts_MaxAcrossSites: per-port http.Server has
+// one slot for these, so any site that needs more leeway pulls the bind up.
+func TestBindGroup_HeaderIdleTimeouts_MaxAcrossSites(t *testing.T) {
+	g := NewBindGroup(":80", "http")
+	g.AddSite(siteWithTimeouts("strict", config.TimeoutConfig{ReadHeader: "5s", Idle: "30s"}))
+	g.AddSite(siteWithTimeouts("loose", config.TimeoutConfig{ReadHeader: "20s", Idle: "5m"}))
+	rh, idle := g.resolveHeaderAndIdleTimeouts()
+	if rh != 20*time.Second {
+		t.Errorf("max read_header: got %v, want 20s", rh)
+	}
+	if idle != 5*time.Minute {
+		t.Errorf("max idle: got %v, want 5m", idle)
+	}
+}
+
+// TestBindGroup_HeaderIdleTimeouts_ExplicitZeroWins: an explicit "0" on any
+// site means "unlimited", and that has to win over a configured non-zero on
+// another site — otherwise an operator can't opt out of these timeouts on
+// shared bind ports.
+func TestBindGroup_HeaderIdleTimeouts_ExplicitZeroWins(t *testing.T) {
+	g := NewBindGroup(":80", "http")
+	g.AddSite(siteWithTimeouts("strict", config.TimeoutConfig{ReadHeader: "5s", Idle: "30s"}))
+	g.AddSite(siteWithTimeouts("unlimited", config.TimeoutConfig{ReadHeader: "0", Idle: "0"}))
+	rh, idle := g.resolveHeaderAndIdleTimeouts()
+	if rh != 0 {
+		t.Errorf("explicit 0 read_header must win: got %v", rh)
+	}
+	if idle != 0 {
+		t.Errorf("explicit 0 idle must win: got %v", idle)
+	}
+}
+
+// TestBindGroup_HeaderIdleTimeouts_PartialConfig: one site configures, the
+// other inherits — the configured value should be used (with the default
+// not silently overriding).
+func TestBindGroup_HeaderIdleTimeouts_PartialConfig(t *testing.T) {
+	g := NewBindGroup(":80", "http")
+	g.AddSite(siteWithTimeouts("unset", config.TimeoutConfig{}))
+	g.AddSite(siteWithTimeouts("loose", config.TimeoutConfig{ReadHeader: "20s"}))
+	rh, _ := g.resolveHeaderAndIdleTimeouts()
+	if rh != 20*time.Second {
+		t.Errorf("configured value should win over unset peer: got %v, want 20s", rh)
+	}
+}

@@ -116,6 +116,12 @@ type ListenerConfig struct {
 	// answers to, and whether it's the catch-all default for unknown SNI/Host.
 	ServerNames    []string
 	DefaultServer  bool
+	// Per-listener timeouts. ReadHeader / Idle are shared across sites on the
+	// same bind port (the http.Server has one slot each); the engine derives
+	// the per-port value as the max across sites. Read / Write are applied
+	// per-request in BindGroup.ServeHTTP via http.ResponseController and so
+	// can differ between sites sharing the same bind.
+	Timeouts config.TimeoutConfig
 }
 
 // NewHTTPServer creates an HTTP server for the given listener.
