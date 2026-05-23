@@ -127,6 +127,57 @@ func TestTimeoutConfig_InvalidFallback(t *testing.T) {
 	}
 }
 
+// Per-listener Read/Write deadlines need to distinguish "unset" (apply
+// bindgroup default) from "explicit 0" (no deadline / unlimited). The
+// Resolve* helpers encapsulate that, used by BindGroup.applySiteDeadlines.
+func TestTimeoutConfig_ResolveDefaults(t *testing.T) {
+	tc := config.TimeoutConfig{}
+	if got := tc.ResolveRead(60 * time.Second); got != 60*time.Second {
+		t.Errorf("unset read → default: got %v, want 60s", got)
+	}
+	if got := tc.ResolveWrite(60 * time.Second); got != 60*time.Second {
+		t.Errorf("unset write → default: got %v, want 60s", got)
+	}
+	if got := tc.ResolveReadHeader(10 * time.Second); got != 10*time.Second {
+		t.Errorf("unset read_header → default: got %v, want 10s", got)
+	}
+}
+
+func TestTimeoutConfig_ResolveExplicitZero(t *testing.T) {
+	tc := config.TimeoutConfig{Read: "0", Write: "0", ReadHeader: "0"}
+	if got := tc.ResolveRead(60 * time.Second); got != 0 {
+		t.Errorf("explicit 0 read → 0 (unlimited): got %v", got)
+	}
+	if got := tc.ResolveWrite(60 * time.Second); got != 0 {
+		t.Errorf("explicit 0 write → 0 (unlimited): got %v", got)
+	}
+	if got := tc.ResolveReadHeader(10 * time.Second); got != 0 {
+		t.Errorf("explicit 0 read_header → 0 (unlimited): got %v", got)
+	}
+}
+
+func TestTimeoutConfig_ResolveConfigured(t *testing.T) {
+	tc := config.TimeoutConfig{Read: "30m", Write: "5m", ReadHeader: "20s"}
+	if got := tc.ResolveRead(60 * time.Second); got != 30*time.Minute {
+		t.Errorf("configured read: got %v, want 30m", got)
+	}
+	if got := tc.ResolveWrite(60 * time.Second); got != 5*time.Minute {
+		t.Errorf("configured write: got %v, want 5m", got)
+	}
+	if got := tc.ResolveReadHeader(10 * time.Second); got != 20*time.Second {
+		t.Errorf("configured read_header: got %v, want 20s", got)
+	}
+}
+
+func TestTimeoutConfig_ReadHeader_ParseAndDefault(t *testing.T) {
+	if got := (config.TimeoutConfig{}).ParseReadHeader(); got != 0 {
+		t.Errorf("unset ParseReadHeader → 0: got %v", got)
+	}
+	if got := (config.TimeoutConfig{ReadHeader: "15s"}).ParseReadHeader(); got != 15*time.Second {
+		t.Errorf("ParseReadHeader('15s'): got %v, want 15s", got)
+	}
+}
+
 // TestReconcileBackends_Kept verifies that reloading with the same backend
 // preserves the live balancer (state intact), and that an unchanged server
 // list does not trigger a needless UpdateServers.

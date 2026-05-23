@@ -42,9 +42,6 @@ RUN mkdir -p /etc/nvelox/config.d && \
 # Use nvelox user (Security Best Practice)
 USER nvelox
 
-# Expose ports (Documentary)
-EXPOSE 80 443 8080
-
 # Entrypoint
 ENTRYPOINT ["/usr/local/bin/nvelox"]
 CMD ["-config", "/etc/nvelox/nvelox.conf"]

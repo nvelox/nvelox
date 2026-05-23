@@ -648,6 +648,7 @@ func (e *Engine) buildL7Site(l *ListenerConfig) *httpproxy.HTTPServer {
 		ErrorPages:     l.ErrorPages,
 		Buffering:      l.Buffering,
 		Cache:          l.Cache,
+		Timeouts:       l.Timeouts,
 	}
 	connLimiters := make(map[string]httpproxy.ConnLimiterI)
 	for k, v := range e.ConnLimiters {

@@ -1,0 +1,10 @@
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates tzdata
+RUN addgroup -S nvelox && adduser -S nvelox -G nvelox
+COPY nvelox /usr/local/bin/nvelox
+COPY nvelox.example.yaml /etc/nvelox/nvelox.conf
+RUN mkdir -p /etc/nvelox/config.d /var/log/nvelox \
+    && chown -R nvelox:nvelox /etc/nvelox /var/log/nvelox
+USER nvelox
+ENTRYPOINT ["/usr/local/bin/nvelox"]
+CMD ["-config", "/etc/nvelox/nvelox.conf"]

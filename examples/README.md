@@ -366,9 +366,22 @@ curl -X POST "http://127.0.0.1:9091/api/v1/backends/pool/enable?server=127.0.0.1
 go run examples/http_backend.go :8081 "backend"
 ./nvelox -config examples/23-timeouts.yaml
 
+# :9000 — defaults (10s read_header / 60s read / 60s write / 120s idle)
 curl http://127.0.0.1:9000/
-# Expected: 200 (normal response within timeout)
+
+# :9001 — tight budgets, ideal for normal HTTP traffic
+curl http://127.0.0.1:9001/
+
+# :9002 — long-upload listener with read/write: 30m, suited for things
+# like Docker registry blob PUT/PATCH that stream large bodies.
+curl -X POST --data-binary @big.tgz http://127.0.0.1:9002/
 ```
+
+Per-listener `read` and `write` are applied after the matched site is
+known, so two sites on the same bind port can have different budgets.
+`read_header` and `idle` live on the shared `http.Server` per bind, so
+the engine uses the max configured value across sites. An explicit `"0"`
+disables a timeout (unlimited).
 
 ## 24 — Response Caching
 

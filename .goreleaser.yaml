@@ -16,6 +16,47 @@ builds:
       # "nvelox v1.0.0" while a `go build` reports "nvelox dev".
       - -s -w -X main.Version={{.Tag}}
 
+dockers:
+  - image_templates:
+      - ghcr.io/nvelox/nvelox:{{ .Tag }}-amd64
+      - ghcr.io/nvelox/nvelox:{{ .Major }}.{{ .Minor }}-amd64
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    build_flag_templates:
+      - --platform=linux/amd64
+      - --label=org.opencontainers.image.title={{ .ProjectName }}
+      - --label=org.opencontainers.image.version={{ .Tag }}
+      - --label=org.opencontainers.image.revision={{ .FullCommit }}
+    extra_files:
+      - nvelox.example.yaml
+  - image_templates:
+      - ghcr.io/nvelox/nvelox:{{ .Tag }}-arm64
+      - ghcr.io/nvelox/nvelox:{{ .Major }}.{{ .Minor }}-arm64
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    build_flag_templates:
+      - --platform=linux/arm64
+      - --label=org.opencontainers.image.title={{ .ProjectName }}
+      - --label=org.opencontainers.image.version={{ .Tag }}
+      - --label=org.opencontainers.image.revision={{ .FullCommit }}
+    extra_files:
+      - nvelox.example.yaml
+    goarch: arm64
+
+docker_manifests:
+  - name_template: ghcr.io/nvelox/nvelox:{{ .Tag }}
+    image_templates:
+      - ghcr.io/nvelox/nvelox:{{ .Tag }}-amd64
+      - ghcr.io/nvelox/nvelox:{{ .Tag }}-arm64
+  - name_template: ghcr.io/nvelox/nvelox:{{ .Major }}.{{ .Minor }}
+    image_templates:
+      - ghcr.io/nvelox/nvelox:{{ .Major }}.{{ .Minor }}-amd64
+      - ghcr.io/nvelox/nvelox:{{ .Major }}.{{ .Minor }}-arm64
+  - name_template: ghcr.io/nvelox/nvelox:latest
+    image_templates:
+      - ghcr.io/nvelox/nvelox:{{ .Tag }}-amd64
+      - ghcr.io/nvelox/nvelox:{{ .Tag }}-arm64
+
 archives:
   - format: tar.gz
     # this name template makes the directory within the archive the name of the binary

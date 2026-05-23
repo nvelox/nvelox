@@ -1,18 +1,60 @@
 ## 23 — Configurable Timeouts
-## Custom connect/read/write/idle timeouts on listener and backend.
+## Per-listener and per-backend timeouts.
+##
+## Listener fields (HTTP / HTTPS only — TCP/UDP listeners are byte-pumps
+## and have no per-request timeout):
+##   read_header — slowloris guard for header parsing. Shared across all
+##                 sites on the same bind port (one http.Server); the
+##                 engine uses the max configured across sites, default 10s.
+##   read        — whole-request budget (incl. body). Applied PER-REQUEST
+##                 via http.ResponseController once the matched site is
+##                 known, so two sites sharing one bind port can have
+##                 different read budgets. Default 60s when unset.
+##   write       — whole-response budget. Same per-request shape as read.
+##                 Default 60s when unset.
+##   idle        — between-request idle on a kept-alive connection.
+##                 Shared across sites on the bind port (max wins). Default 120s.
+##
+## "0" means unlimited (an explicit opt-out). Useful for long-running
+## endpoints such as Docker registry blob uploads or WebSocket-style streams.
 version: "2"
 logging:
   level: "debug"
 listeners:
-  - name: "timed"
+  # Most HTTP listeners want the defaults — leave timeouts unset and you
+  # get 10s read_header / 60s read / 60s write / 120s idle.
+  - name: "default-http"
     bind: ":9000"
     protocol: "http"
     backend: "backend"
+
+  # Tight budgets — strict slowloris guard, short body limit. Override
+  # only what differs from defaults.
+  - name: "strict-http"
+    bind: ":9001"
+    protocol: "http"
+    backend: "backend"
     timeouts:
-      connect: "3s"
-      read: "30s"
-      write: "30s"
-      idle: "120s"
+      read_header: "5s"
+      read:        "10s"
+      write:       "10s"
+
+  # Long-lived uploads (e.g. Docker registry blob PUT/PATCH) — give the
+  # body 30 minutes. read_header stays strict; only the body needs leeway.
+  # When this listener shares :9001 with strict-http (different example —
+  # not literally on the same bind here), the bindgroup uses the max of
+  # the two read_header values (5s); the per-request read budget is set
+  # independently for each matched site, so registry's 30m doesn't
+  # weaken strict-http's 10s.
+  - name: "long-upload"
+    bind: ":9002"
+    protocol: "http"
+    backend: "backend"
+    timeouts:
+      read_header: "10s"
+      read:        "30m"
+      write:       "30m"
+
 backends:
   - name: "backend"
     balance: "roundrobin"
@@ -20,4 +62,4 @@ backends:
       - "127.0.0.1:8081"
     timeouts:
       connect: "2s"
-      read: "10s"
+      read:    "10s"
