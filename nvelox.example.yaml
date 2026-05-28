@@ -268,6 +268,11 @@ backends:
   - name: "web-cluster"
     balance: "roundrobin"  # roundrobin, leastconn, random
     max_connections: 200
+    # send_proxy_v2 prepends a PROXY protocol v2 header so the backend
+    # sees the real client address.
+    #   - TCP backends: header sent once per connection (STREAM variant).
+    #   - UDP backends: header prepended to each datagram (DGRAM variant)
+    #     so QUIC/HTTP3 backends can recover the client IP per packet.
     send_proxy_v2: false
 
     # Timeouts (override listener defaults)

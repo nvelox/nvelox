@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"sync"
@@ -9,6 +10,7 @@ import (
 	"nvelox/config"
 	"nvelox/core/logging"
 	"nvelox/lb"
+	"nvelox/proxy"
 
 	"github.com/lesismal/nbio"
 	"github.com/pires/go-proxyproto"
@@ -44,7 +46,11 @@ type ConnContext struct {
 	Buffer        []byte      // Buffer for data received before backend is connected
 	BackendServer string      // Original value from balancer.Next() (matches conns map key)
 	BalancerRef   lb.Balancer // Reference for OnDisconnect in OnClose
-	Mu            sync.Mutex
+	// ProxyHeader, when non-nil, is prepended to each datagram written to
+	// PeerConn. Built once per session in connectBackendUDP when the
+	// backend has send_proxy_v2: true.
+	ProxyHeader []byte
+	Mu          sync.Mutex
 }
 
 func (h *ProxyEventHandler) setCtx(c *nbio.Conn, ctx *ConnContext) {
@@ -145,8 +151,9 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 	ctx.Mu.Lock()
 	if ctx.PeerConn != nil {
 		peer := ctx.PeerConn
+		hdr := ctx.ProxyHeader
 		ctx.Mu.Unlock()
-		_, err := peer.Write(data)
+		_, err := writeWithProxy(peer, hdr, data)
 		if err != nil {
 			logging.Error("[DATA] Write failed: %v", err)
 		}
@@ -197,7 +204,7 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 	}
 
 	if l.Protocol == "udp" {
-		h.connectBackendUDP(clientConn, dialTarget)
+		h.connectBackendUDP(clientConn, dialTarget, backend)
 	} else {
 		h.connectBackendTCP(clientConn, dialTarget, backend, balancer, target, l)
 	}
@@ -283,8 +290,26 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 	}()
 }
 
-func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target string) {
+func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target string, backend *config.Backend) {
 	clientCtx := h.getCtx(clientConn)
+
+	// Build PROXY v2 datagram prefix once per session if the backend has
+	// send_proxy_v2: true. src = real external client; dst = the UDP
+	// backend target. The same header is reused on every datagram from
+	// this client because both endpoints are stable for the session.
+	var proxyHdr []byte
+	if backend != nil && backend.SendProxyV2 {
+		if raddr, err := net.ResolveUDPAddr("udp", target); err == nil {
+			var buf bytes.Buffer
+			if err := proxy.WriteProxyHeaderV2(&buf, clientConn.RemoteAddr(), raddr); err == nil {
+				proxyHdr = buf.Bytes()
+			} else {
+				logging.Warn("[UDP] PROXY v2 header build failed: %v", err)
+			}
+		} else {
+			logging.Warn("[UDP] resolve target %s for PROXY header: %v", target, err)
+		}
+	}
 
 	// Check UDP pool for existing session (session affinity)
 	poolKey := fmt.Sprintf("%s|%s", clientConn.RemoteAddr().String(), clientCtx.BackendServer)
@@ -292,11 +317,12 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 		// Reuse existing backend connection
 		clientCtx.Mu.Lock()
 		clientCtx.PeerConn = session.BackendConn
+		clientCtx.ProxyHeader = proxyHdr
 		if clientCtx.BalancerRef != nil {
 			clientCtx.BalancerRef.OnConnect(clientCtx.BackendServer)
 		}
 		if len(clientCtx.Buffer) > 0 {
-			session.BackendConn.Write(clientCtx.Buffer)
+			writeWithProxy(session.BackendConn, proxyHdr, clientCtx.Buffer)
 			clientCtx.Buffer = nil
 		}
 		clientCtx.Mu.Unlock()
@@ -330,6 +356,7 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 		// Link client to backend
 		clientCtx.Mu.Lock()
 		clientCtx.PeerConn = backendConn
+		clientCtx.ProxyHeader = proxyHdr
 
 		// Notify balancer of new connection (for LeastConn tracking)
 		if clientCtx.BalancerRef != nil {
@@ -338,7 +365,7 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 
 		// Flush any buffered data
 		if len(clientCtx.Buffer) > 0 {
-			_, writeErr := backendConn.Write(clientCtx.Buffer)
+			_, writeErr := writeWithProxy(backendConn, proxyHdr, clientCtx.Buffer)
 			if writeErr != nil {
 				logging.Error("Failed to flush UDP buffer: %v", writeErr)
 				clientCtx.Mu.Unlock()
@@ -422,4 +449,17 @@ func portOf(addr net.Addr) int {
 		return a.Port
 	}
 	return 0
+}
+
+// writeWithProxy writes data to peer, optionally prepending a PROXY v2
+// header. When hdr is empty this is a plain peer.Write(data) — the hot
+// path for backends without send_proxy_v2.
+func writeWithProxy(peer net.Conn, hdr, data []byte) (int, error) {
+	if len(hdr) == 0 {
+		return peer.Write(data)
+	}
+	out := make([]byte, len(hdr)+len(data))
+	copy(out, hdr)
+	copy(out[len(hdr):], data)
+	return peer.Write(out)
 }
