@@ -226,9 +226,46 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 			return
 		}
 
-		// Send PROXY protocol v2 header if enabled on backend
+		clientCtx := h.getCtx(clientConn)
+		if clientCtx == nil {
+			// Client already closed during backend dial
+			backendConn.Close()
+			return
+		}
+
+		// Determine the real client. When this listener trusts an inbound
+		// PROXY-v2 header from this peer (a peer-region relay), wait briefly for
+		// the header to land in the pre-backend buffer, parse it, and strip the
+		// consumed bytes so they aren't forwarded as payload. Untrusted peers
+		// skip this entirely (no spoofing). PeerConn is still nil here, so OnData
+		// keeps buffering — we set it only after the header is resolved.
+		src := clientConn.RemoteAddr()
+		if l.proxyTrust.trusts(clientConn.RemoteAddr()) {
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				clientCtx.Mu.Lock()
+				done, parsedSrc, consumed := tryParseInboundProxyV2(clientCtx.Buffer)
+				if done {
+					if parsedSrc != nil {
+						src = parsedSrc
+					}
+					if consumed > 0 {
+						clientCtx.Buffer = clientCtx.Buffer[consumed:]
+					}
+					clientCtx.Mu.Unlock()
+					break
+				}
+				clientCtx.Mu.Unlock()
+				if time.Now().After(deadline) {
+					break // header never completed; fall back to peer addr, buffer intact
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+
+		// Send PROXY protocol v2 header to the backend if enabled.
 		if backend != nil && backend.SendProxyV2 {
-			header := proxyproto.HeaderProxyFromAddrs(2, clientConn.RemoteAddr(), backendConn.LocalAddr())
+			header := proxyproto.HeaderProxyFromAddrs(2, src, backendConn.LocalAddr())
 			if _, err := header.WriteTo(backendConn); err != nil {
 				logging.Error("Failed to write PROXY v2 header: %v", err)
 				backendConn.Close()
@@ -238,12 +275,6 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 		}
 
 		// Link client to backend
-		clientCtx := h.getCtx(clientConn)
-		if clientCtx == nil {
-			// Client already closed during backend dial
-			backendConn.Close()
-			return
-		}
 		clientCtx.Mu.Lock()
 		clientCtx.PeerConn = backendConn
 

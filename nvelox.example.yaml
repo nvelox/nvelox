@@ -96,6 +96,16 @@ listeners:
     #   When set, X-Forwarded-For / X-Real-IP from peers in these CIDRs
     #   are trusted and appended; everyone else gets their forged
     #   headers replaced with the authoritative peer IP.
+    # accept_proxy_from: ["10.50.0.0/16"]
+    #   L4 inbound PROXY-protocol-v2 trust (tcp / https-passthrough listeners).
+    #   For connections from these CIDRs, nvelox parses the inbound PROXY-v2
+    #   header and uses its source as the real client (then forwards it via
+    #   send_proxy_v2 to the backend). Peers OUTSIDE the list have any inbound
+    #   PROXY header IGNORED — the real TCP peer is used — so a direct client
+    #   cannot spoof its source. Non-PROXY clients (browsers) pass through
+    #   unchanged. Empty (default) = trust nobody. Use this on a region's edge
+    #   to accept the PROXY-v2 header that a PEER region's tunnel-server relay
+    #   prepends, preserving the real client IP across a cross-region hop.
 
     # Timeouts (HTTP/HTTPS listeners). All values accept Go duration
     # strings ("30s", "5m", "1h"). An explicit "0" means unlimited.

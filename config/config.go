@@ -35,9 +35,9 @@ type MetricsConfig struct {
 
 // AdminConfig defines the admin REST API endpoint.
 type AdminConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	Bind     string `yaml:"bind"`      // e.g., "127.0.0.1:9091"
-	APIKey   string `yaml:"api_key"`   // Required for all requests (via X-API-Key header)
+	Enabled bool   `yaml:"enabled"`
+	Bind    string `yaml:"bind"`    // e.g., "127.0.0.1:9091"
+	APIKey  string `yaml:"api_key"` // Required for all requests (via X-API-Key header)
 }
 
 // TracingConfig defines OpenTelemetry tracing settings.
@@ -98,11 +98,11 @@ type Listener struct {
 	// ServerNames are SNI / Host names this listener answers to. Wildcards
 	// allowed in the leftmost label only ("*.foo.com"). Empty + single
 	// listener on the bind = match-everything (back-compat).
-	ServerNames   []string `yaml:"server_names,omitempty"`
+	ServerNames []string `yaml:"server_names,omitempty"`
 	// DefaultServer marks this listener as the catch-all for its bind
 	// group when SNI / Host doesn't match any other site's ServerNames.
 	// At most one DefaultServer per bind group.
-	DefaultServer bool     `yaml:"default_server,omitempty"`
+	DefaultServer bool `yaml:"default_server,omitempty"`
 
 	// Rate limiting
 	RateLimit RateLimitConfig `yaml:"rate_limit,omitempty"`
@@ -117,8 +117,8 @@ type Listener struct {
 	SNIRoutes []SNIRoute `yaml:"sni_routes,omitempty"`
 
 	// Security
-	IPAllowlist []string          `yaml:"ip_allowlist,omitempty"` // CIDR allow list
-	IPDenylist  []string          `yaml:"ip_denylist,omitempty"`  // CIDR deny list
+	IPAllowlist []string          `yaml:"ip_allowlist,omitempty"`  // CIDR allow list
+	IPDenylist  []string          `yaml:"ip_denylist,omitempty"`   // CIDR deny list
 	MaxBodySize string            `yaml:"max_body_size,omitempty"` // e.g., "10MB"
 	IPRateLimit IPRateLimitConfig `yaml:"ip_rate_limit,omitempty"`
 	ACL         []ACLRule         `yaml:"acl,omitempty"`
@@ -130,6 +130,17 @@ type Listener struct {
 	// If empty, no peer is trusted → XFF is always replaced with the peer IP.
 	TrustedProxies []string `yaml:"trusted_proxies,omitempty"`
 
+	// AcceptProxyFrom: CIDRs whose INBOUND PROXY-protocol-v2 header is trusted
+	// and used as the real client address at L4 (tcp / https-passthrough
+	// listeners). Connections from peers OUTSIDE this list have any inbound
+	// PROXY header IGNORED — the real TCP/UDP peer is used — so a direct client
+	// can never spoof its source. Empty (default) = trust nobody = inbound PROXY
+	// headers are never honored (behaviour unchanged). Distinct from
+	// trusted_proxies (L7 XFF/X-Real-IP trust). Used by cross-region proxying:
+	// a peer region's relay prepends a PROXY-v2 header with the real client, and
+	// this list lets the owner region's nvelox accept + forward it to the backend.
+	AcceptProxyFrom []string `yaml:"accept_proxy_from,omitempty"`
+
 	// L7 fields
 	HTTP3       bool              `yaml:"http3,omitempty"`
 	Routes      []RouteConfig     `yaml:"routes,omitempty"`
@@ -139,8 +150,8 @@ type Listener struct {
 	Root        string            `yaml:"root,omitempty"`        // Document root for static files
 	Buffering   BufferingConfig   `yaml:"buffering,omitempty"`
 	Cache       CacheConfig       `yaml:"cache,omitempty"`
-	GRPC        bool              `yaml:"grpc,omitempty"`        // Enable gRPC-aware proxying
-	Throttle    ThrottleConfig    `yaml:"throttle,omitempty"`    // Bandwidth throttling
+	GRPC        bool              `yaml:"grpc,omitempty"`     // Enable gRPC-aware proxying
+	Throttle    ThrottleConfig    `yaml:"throttle,omitempty"` // Bandwidth throttling
 }
 
 // BufferingConfig defines request/response buffer sizes.
@@ -191,12 +202,12 @@ type RateLimitConfig struct {
 
 // TLSConfig defines TLS certificate configuration.
 type TLSConfig struct {
-	Cert          string `yaml:"cert"`
-	Key           string `yaml:"key"`
-	AutoCert      bool   `yaml:"auto_cert"`
-	OCSPStapling  bool   `yaml:"ocsp_stapling,omitempty"`  // Enable OCSP stapling
-	ClientAuth    string `yaml:"client_auth,omitempty"`     // "require", "request", "none"
-	ClientCA      string `yaml:"client_ca,omitempty"`       // CA cert for client verification
+	Cert         string `yaml:"cert"`
+	Key          string `yaml:"key"`
+	AutoCert     bool   `yaml:"auto_cert"`
+	OCSPStapling bool   `yaml:"ocsp_stapling,omitempty"` // Enable OCSP stapling
+	ClientAuth   string `yaml:"client_auth,omitempty"`   // "require", "request", "none"
+	ClientCA     string `yaml:"client_ca,omitempty"`     // CA cert for client verification
 
 	// MinVersion is the lowest TLS protocol version this listener accepts.
 	// Values: "1.2", "1.3". Empty defaults to "1.2".
@@ -219,7 +230,7 @@ type RouteConfig struct {
 	Rewrite  RewriteConfig  `yaml:"rewrite,omitempty"`
 	Redirect RedirectConfig `yaml:"redirect,omitempty"`
 	Scripts  ScriptsConfig  `yaml:"scripts,omitempty"`
-	Static   StaticConfig   `yaml:"static,omitempty"`   // Serve static files
+	Static   StaticConfig   `yaml:"static,omitempty"`    // Serve static files
 	TryFiles TryFilesConfig `yaml:"try_files,omitempty"` // try_files logic
 	Expires  string         `yaml:"expires,omitempty"`   // Cache-Control: "1y", "30d", "1h", "-1" (no cache)
 	FastCGI  FastCGIConfig  `yaml:"fastcgi,omitempty"`   // Forward to FastCGI (PHP-FPM)
@@ -227,25 +238,25 @@ type RouteConfig struct {
 
 // FastCGIConfig defines FastCGI upstream (e.g., PHP-FPM) settings.
 type FastCGIConfig struct {
-	Pass         string            `yaml:"pass"`                    // FastCGI address (e.g., "127.0.0.1:9000" or "unix:/var/run/php-fpm.sock")
-	DocumentRoot string            `yaml:"document_root,omitempty"` // DOCUMENT_ROOT for SCRIPT_FILENAME
-	ScriptName   string            `yaml:"script_name,omitempty"`   // Override SCRIPT_NAME (default: from URL path)
-	SplitPathInfo string           `yaml:"split_path_info,omitempty"` // Regex to split PATH_INFO (like fastcgi_split_path_info)
-	Params       map[string]string `yaml:"params,omitempty"`        // Extra FastCGI params
-	Index        string            `yaml:"index,omitempty"`         // Default script (e.g., "index.php")
+	Pass          string            `yaml:"pass"`                      // FastCGI address (e.g., "127.0.0.1:9000" or "unix:/var/run/php-fpm.sock")
+	DocumentRoot  string            `yaml:"document_root,omitempty"`   // DOCUMENT_ROOT for SCRIPT_FILENAME
+	ScriptName    string            `yaml:"script_name,omitempty"`     // Override SCRIPT_NAME (default: from URL path)
+	SplitPathInfo string            `yaml:"split_path_info,omitempty"` // Regex to split PATH_INFO (like fastcgi_split_path_info)
+	Params        map[string]string `yaml:"params,omitempty"`          // Extra FastCGI params
+	Index         string            `yaml:"index,omitempty"`           // Default script (e.g., "index.php")
 }
 
 // StaticConfig defines static file serving.
 type StaticConfig struct {
-	Root      string   `yaml:"root"`                  // Document root directory
-	Index     []string `yaml:"index,omitempty"`        // Index files (default: ["index.html"])
-	Autoindex bool     `yaml:"autoindex,omitempty"`    // Directory listing
+	Root      string   `yaml:"root"`                // Document root directory
+	Index     []string `yaml:"index,omitempty"`     // Index files (default: ["index.html"])
+	Autoindex bool     `yaml:"autoindex,omitempty"` // Directory listing
 }
 
 // TryFilesConfig defines try_files behavior.
 type TryFilesConfig struct {
-	Files    []string `yaml:"files"`     // e.g., ["$uri", "$uri/", "/index.php$is_args$args"]
-	Fallback string   `yaml:"fallback"`  // Fallback path or =status (e.g., "=404", "/fallback.html")
+	Files    []string `yaml:"files"`    // e.g., ["$uri", "$uri/", "/index.php$is_args$args"]
+	Fallback string   `yaml:"fallback"` // Fallback path or =status (e.g., "=404", "/fallback.html")
 }
 
 // ScriptsConfig defines Lua script hooks for a route.
@@ -383,31 +394,31 @@ type HeadersConfig struct {
 // Backend defines a server pool.
 type Backend struct {
 	Name           string   `yaml:"name"`
-	Balance        string   `yaml:"balance"`          // "roundrobin", "leastconn", "random"
-	SendProxyV2    bool     `yaml:"send_proxy_v2"`    // Send PROXY Protocol v2 header to backend
-	Servers        []string `yaml:"servers"`          // List of server addresses
-	MaxConnections int      `yaml:"max_connections"`  // Max concurrent connections (0 = unlimited)
+	Balance        string   `yaml:"balance"`         // "roundrobin", "leastconn", "random"
+	SendProxyV2    bool     `yaml:"send_proxy_v2"`   // Send PROXY Protocol v2 header to backend
+	Servers        []string `yaml:"servers"`         // List of server addresses
+	MaxConnections int      `yaml:"max_connections"` // Max concurrent connections (0 = unlimited)
 
-	Timeouts      TimeoutConfig     `yaml:"timeouts,omitempty"`
-	Retry         RetryConfig       `yaml:"retry,omitempty"`
-	StickySession StickyConfig      `yaml:"sticky_session,omitempty"`
-	ResolveInterval string           `yaml:"resolve_interval,omitempty"` // DNS re-resolve interval
+	Timeouts        TimeoutConfig `yaml:"timeouts,omitempty"`
+	Retry           RetryConfig   `yaml:"retry,omitempty"`
+	StickySession   StickyConfig  `yaml:"sticky_session,omitempty"`
+	ResolveInterval string        `yaml:"resolve_interval,omitempty"` // DNS re-resolve interval
 	// AllowPrivateIPs: if true, backend hostnames may resolve to RFC1918,
 	// loopback, link-local or CGNAT addresses. Default (false) blocks these
 	// to prevent DNS-rebinding / SSRF when a hostname is attacker-controlled.
 	// Set to true only when backends legitimately live on a private network.
 	AllowPrivateIPs bool              `yaml:"allow_private_ips,omitempty"`
-	BackendTLS     BackendTLSConfig  `yaml:"backend_tls,omitempty"`
-	CircuitBreaker CBConfig         `yaml:"circuit_breaker,omitempty"`
-	HealthCheck    HealthCheckConfig `yaml:"health_check,omitempty"`
+	BackendTLS      BackendTLSConfig  `yaml:"backend_tls,omitempty"`
+	CircuitBreaker  CBConfig          `yaml:"circuit_breaker,omitempty"`
+	HealthCheck     HealthCheckConfig `yaml:"health_check,omitempty"`
 }
 
 // CBConfig defines circuit breaker settings per backend.
 type CBConfig struct {
 	Enabled     bool   `yaml:"enabled"`
-	Threshold   int    `yaml:"threshold"`       // failures to open
-	Timeout     string `yaml:"timeout"`          // time in open state before half-open
-	HalfOpenMax int    `yaml:"half_open_max"`    // max requests in half-open
+	Threshold   int    `yaml:"threshold"`     // failures to open
+	Timeout     string `yaml:"timeout"`       // time in open state before half-open
+	HalfOpenMax int    `yaml:"half_open_max"` // max requests in half-open
 }
 
 // BackendTLSConfig defines TLS settings for connecting to backend servers.
@@ -595,6 +606,15 @@ func validate(cfg *Config) error {
 		// Validate bind address format
 		if err := validateBindAddress(l.Bind); err != nil {
 			return fmt.Errorf("listener %s has invalid bind address %q: %v", l.Name, l.Bind, err)
+		}
+
+		// Validate accept_proxy_from CIDRs up front so a typo is caught at
+		// startup rather than silently dropped (which would mean an intended
+		// trusted peer is never trusted).
+		for _, c := range l.AcceptProxyFrom {
+			if _, _, err := net.ParseCIDR(strings.TrimSpace(c)); err != nil {
+				return fmt.Errorf("listener %s: invalid accept_proxy_from CIDR %q: %v", l.Name, c, err)
+			}
 		}
 
 		// Validate TLS config

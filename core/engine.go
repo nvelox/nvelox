@@ -30,67 +30,69 @@ import (
 )
 
 type Engine struct {
-	TCPEngine    *nbio.Engine
-	UDPEngine    *nbio.Engine
-	Listeners    []*ListenerConfig
-	Config       *config.Config
-	Balancers    map[string]lb.Balancer
-	Backends     map[string]*config.Backend
-	Checkers     map[string]*health.Checker
-	RateLimiters    map[string]*RateLimiter           // keyed by listener name
-	ConnLimiters    map[string]*ConnLimiter           // keyed by backend name
-	PassiveHealth   map[string]*PassiveHealthTracker  // keyed by backend name
-	StickyStores    map[string]*sticky.Store          // keyed by backend name
+	TCPEngine       *nbio.Engine
+	UDPEngine       *nbio.Engine
+	Listeners       []*ListenerConfig
+	Config          *config.Config
+	Balancers       map[string]lb.Balancer
+	Backends        map[string]*config.Backend
+	Checkers        map[string]*health.Checker
+	RateLimiters    map[string]*RateLimiter            // keyed by listener name
+	ConnLimiters    map[string]*ConnLimiter            // keyed by backend name
+	PassiveHealth   map[string]*PassiveHealthTracker   // keyed by backend name
+	StickyStores    map[string]*sticky.Store           // keyed by backend name
 	CircuitBreakers map[string]*circuitbreaker.Breaker // keyed by backend name
 	Metrics         *metrics.Registry
 	DNSResolvers    map[string]*discovery.DNSResolver // keyed by backend name
 	AdminServer     *admin.Server
 	metricsServer   *http.Server
-	UDPPool         *UDPPool                          // UDP session affinity pool
-	HTTPServers     []*httpproxy.HTTPServer           // L7 HTTP sites (per listener config)
-	BindGroups      []*httpproxy.BindGroup            // socket-owning groups (one per bind addr)
-	ActiveConns  sync.WaitGroup            // tracks in-flight connections for graceful drain
-	DrainTimeout time.Duration             // max wait on shutdown (default 30s)
-	tlsListeners []net.Listener            // TLS listeners to close on shutdown
-	reloadMu     sync.Mutex                // serializes concurrent SIGHUPs
-	configPath   string                    // path for reload
+	UDPPool         *UDPPool                // UDP session affinity pool
+	HTTPServers     []*httpproxy.HTTPServer // L7 HTTP sites (per listener config)
+	BindGroups      []*httpproxy.BindGroup  // socket-owning groups (one per bind addr)
+	ActiveConns     sync.WaitGroup          // tracks in-flight connections for graceful drain
+	DrainTimeout    time.Duration           // max wait on shutdown (default 30s)
+	tlsListeners    []net.Listener          // TLS listeners to close on shutdown
+	reloadMu        sync.Mutex              // serializes concurrent SIGHUPs
+	configPath      string                  // path for reload
 }
 
 type ListenerConfig struct {
-	Name           string
-	Addr           string
-	Protocol       string
-	ZeroCopy       bool
-	Backend        string
-	SendProxyV2    bool // Send PROXY protocol v2 to backend
-	Port           int
-	RateLimit      config.RateLimitConfig
-	Timeouts       config.TimeoutConfig
-	TLS            *config.TLSConfig
-	HTTP3          bool
-	Routes         []config.RouteConfig
-	Headers        config.HeadersConfig
-	IPAllowlist    []string
-	IPDenylist     []string
-	MaxBodySize    string
-	IPRateLimit    config.IPRateLimitConfig
-	ACL            []config.ACLRule
-	TrustedProxies []string
-	ServerNames    []string
-	DefaultServer  bool
-	Compression    config.CompressionConfig
-	ErrorPages     map[int]string
-	Buffering      config.BufferingConfig
-	Cache          config.CacheConfig
+	Name            string
+	Addr            string
+	Protocol        string
+	ZeroCopy        bool
+	Backend         string
+	SendProxyV2     bool // Send PROXY protocol v2 to backend
+	Port            int
+	RateLimit       config.RateLimitConfig
+	Timeouts        config.TimeoutConfig
+	TLS             *config.TLSConfig
+	HTTP3           bool
+	Routes          []config.RouteConfig
+	Headers         config.HeadersConfig
+	IPAllowlist     []string
+	IPDenylist      []string
+	MaxBodySize     string
+	IPRateLimit     config.IPRateLimitConfig
+	ACL             []config.ACLRule
+	TrustedProxies  []string
+	AcceptProxyFrom []string
+	proxyTrust      *proxyTrust // parsed once from AcceptProxyFrom (inbound PROXY-v2 trust)
+	ServerNames     []string
+	DefaultServer   bool
+	Compression     config.CompressionConfig
+	ErrorPages      map[int]string
+	Buffering       config.BufferingConfig
+	Cache           config.CacheConfig
 }
 
 func NewEngine(cfg *config.Config) *Engine {
 	e := &Engine{
-		Listeners:     make([]*ListenerConfig, 0),
-		Config:        cfg,
-		Balancers:     make(map[string]lb.Balancer),
-		Backends:      make(map[string]*config.Backend),
-		Checkers:      make(map[string]*health.Checker),
+		Listeners:       make([]*ListenerConfig, 0),
+		Config:          cfg,
+		Balancers:       make(map[string]lb.Balancer),
+		Backends:        make(map[string]*config.Backend),
+		Checkers:        make(map[string]*health.Checker),
 		RateLimiters:    make(map[string]*RateLimiter),
 		ConnLimiters:    make(map[string]*ConnLimiter),
 		PassiveHealth:   make(map[string]*PassiveHealthTracker),
@@ -564,30 +566,32 @@ func ExpandListeners(listeners []config.Listener) ([]*ListenerConfig, error) {
 
 		mk := func(name, addr string, port int) *ListenerConfig {
 			return &ListenerConfig{
-				Name:           name,
-				Addr:           addr,
-				Protocol:       l.Protocol,
-				ZeroCopy:       l.ZeroCopy,
-				Backend:        l.Backend,
-				RateLimit:      l.RateLimit,
-				Timeouts:       l.Timeouts,
-				TLS:            tlsCfg,
-				HTTP3:          l.HTTP3,
-				Routes:         l.Routes,
-				Headers:        l.Headers,
-				IPAllowlist:    l.IPAllowlist,
-				IPDenylist:     l.IPDenylist,
-				MaxBodySize:    l.MaxBodySize,
-				IPRateLimit:    l.IPRateLimit,
-				ACL:            l.ACL,
-				TrustedProxies: l.TrustedProxies,
-				ServerNames:    l.ServerNames,
-				DefaultServer:  l.DefaultServer,
-				Compression:    l.Compression,
-				ErrorPages:     l.ErrorPages,
-				Buffering:      l.Buffering,
-				Cache:          l.Cache,
-				Port:           port,
+				Name:            name,
+				Addr:            addr,
+				Protocol:        l.Protocol,
+				ZeroCopy:        l.ZeroCopy,
+				Backend:         l.Backend,
+				RateLimit:       l.RateLimit,
+				Timeouts:        l.Timeouts,
+				TLS:             tlsCfg,
+				HTTP3:           l.HTTP3,
+				Routes:          l.Routes,
+				Headers:         l.Headers,
+				IPAllowlist:     l.IPAllowlist,
+				IPDenylist:      l.IPDenylist,
+				MaxBodySize:     l.MaxBodySize,
+				IPRateLimit:     l.IPRateLimit,
+				ACL:             l.ACL,
+				TrustedProxies:  l.TrustedProxies,
+				AcceptProxyFrom: l.AcceptProxyFrom,
+				proxyTrust:      newProxyTrust(l.AcceptProxyFrom),
+				ServerNames:     l.ServerNames,
+				DefaultServer:   l.DefaultServer,
+				Compression:     l.Compression,
+				ErrorPages:      l.ErrorPages,
+				Buffering:       l.Buffering,
+				Cache:           l.Cache,
+				Port:            port,
 			}
 		}
 
@@ -894,12 +898,32 @@ func (e *Engine) startTLSListener(l *ListenerConfig, handler *ProxyEventHandler)
 		return fmt.Errorf("failed to listen on %s: %v", l.Addr, err)
 	}
 
-	e.tlsListeners = append(e.tlsListeners, ln)
+	// Trusted inbound PROXY-v2 acceptance: when accept_proxy_from is set, wrap
+	// the listener so the PROXY header sent by a trusted peer (read off the raw
+	// TCP stream BEFORE the TLS handshake) sets conn.RemoteAddr() to the real
+	// client; untrusted peers have any header IGNORED (no spoofing) and
+	// non-PROXY clients (browsers) pass through unchanged.
+	var listener net.Listener = ln
+	if l.proxyTrust.enabled() {
+		pol, perr := l.proxyTrust.policy()
+		if perr != nil {
+			ln.Close()
+			return fmt.Errorf("TLS listener %s accept_proxy_from: %v", l.Name, perr)
+		}
+		listener = &proxyproto.Listener{
+			Listener:          ln,
+			Policy:            pol,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		logging.Info("TLS listener %s accepts inbound PROXY-v2 from %v", l.Name, l.AcceptProxyFrom)
+	}
+
+	e.tlsListeners = append(e.tlsListeners, listener)
 	logging.Info("TLS listener %s started on %s", l.Name, l.Addr)
 
 	go func() {
 		for {
-			conn, err := ln.Accept()
+			conn, err := listener.Accept()
 			if err != nil {
 				return
 			}
