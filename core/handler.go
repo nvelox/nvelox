@@ -263,9 +263,17 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 			}
 		}
 
-		// Send PROXY protocol v2 header to the backend if enabled.
+		// Send PROXY protocol v2 header to the backend if enabled. The header's
+		// DESTINATION is the address the CLIENT connected to (clientConn.LocalAddr
+		// = our listener's local addr, i.e. the original dedicated port for a
+		// range listener) — NOT backendConn.LocalAddr (our ephemeral source toward
+		// the backend, which is useless to the backend). This is the correct PROXY
+		// semantic and is what lets a backend MUX a whole port range on one socket:
+		// it recovers the original dialed port from the header instead of needing a
+		// listener per port. (For a chained relay, clientConn.LocalAddr is still the
+		// dedicated port because the relay dials that same port.)
 		if backend != nil && backend.SendProxyV2 {
-			header := proxyproto.HeaderProxyFromAddrs(2, src, backendConn.LocalAddr())
+			header := proxyproto.HeaderProxyFromAddrs(2, src, clientConn.LocalAddr())
 			if _, err := header.WriteTo(backendConn); err != nil {
 				logging.Error("Failed to write PROXY v2 header: %v", err)
 				backendConn.Close()
@@ -325,20 +333,18 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 	clientCtx := h.getCtx(clientConn)
 
 	// Build PROXY v2 datagram prefix once per session if the backend has
-	// send_proxy_v2: true. src = real external client; dst = the UDP
-	// backend target. The same header is reused on every datagram from
-	// this client because both endpoints are stable for the session.
+	// send_proxy_v2: true. src = real external client; dst = the address the
+	// CLIENT sent to (clientConn.LocalAddr = our listener, i.e. the original
+	// dedicated UDP port) — NOT the backend target. This lets the backend MUX a
+	// whole UDP port range on one socket and recover the dialed port from the
+	// header. Reused on every datagram from this client (both ends are stable).
 	var proxyHdr []byte
 	if backend != nil && backend.SendProxyV2 {
-		if raddr, err := net.ResolveUDPAddr("udp", target); err == nil {
-			var buf bytes.Buffer
-			if err := proxy.WriteProxyHeaderV2(&buf, clientConn.RemoteAddr(), raddr); err == nil {
-				proxyHdr = buf.Bytes()
-			} else {
-				logging.Warn("[UDP] PROXY v2 header build failed: %v", err)
-			}
+		var buf bytes.Buffer
+		if err := proxy.WriteProxyHeaderV2(&buf, clientConn.RemoteAddr(), clientConn.LocalAddr()); err == nil {
+			proxyHdr = buf.Bytes()
 		} else {
-			logging.Warn("[UDP] resolve target %s for PROXY header: %v", target, err)
+			logging.Warn("[UDP] PROXY v2 header build failed: %v", err)
 		}
 	}
 

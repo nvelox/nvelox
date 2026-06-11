@@ -235,6 +235,27 @@ listeners:
     zero_copy: true
     backend: "game-servers"
 
+  # ─── Dedicated-port MUX (range → one backend port) ─────
+  # Bind a whole dedicated range but forward EVERY port to ONE backend port
+  # (give the backend an explicit port → nvelox does NOT append the listener
+  # port, so all ports funnel to that one socket). With send_proxy_v2, the
+  # PROXY-v2 header's DESTINATION is the port the client actually hit (the
+  # dedicated port), so the single backend listener can de-multiplex the whole
+  # range from one socket — no per-port listener. accept_proxy_from lets the
+  # backend also trust a relayed inbound header (cross-region). This is how the
+  # tunnel-server serves 10k–100k dedicated ports without 10k–100k listeners.
+  # - name: "dedicated-mux"
+  #   bind: ":17000-17100"          # the dedicated range (grow as needed)
+  #   protocol: "tcp"
+  #   zero_copy: true
+  #   backend: "tunnel-mux"         # backend MUST specify an explicit port (the mux port)
+  #   accept_proxy_from: ["10.50.0.0/16"]   # trust relayed PROXY headers from peer regions
+  # (and a matching backend, e.g.)
+  # backends:
+  #   - name: "tunnel-mux"
+  #     servers: ["10.1.0.5:17999"]  # explicit mux port → all range ports land here
+  #     send_proxy_v2: true
+
   # ─── TLS passthrough with SNI routing ──────────────────
   # - name: "tls-passthrough"
   #   bind: ":8443"
