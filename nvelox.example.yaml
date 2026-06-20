@@ -291,6 +291,27 @@ listeners:
     protocol: "udp"
     backend: "dns-servers"
 
+  # ─── Dedicated-UDP MUX (range → one backend UDP port) ──
+  # The UDP counterpart of "dedicated-mux" above (cross-region UDP). Funnel the
+  # whole dedicated UDP range to ONE backend UDP port (give the backend an
+  # explicit port so nvelox does NOT append the listener port). With
+  # send_proxy_v2 the per-datagram PROXY-v2 DGRAM header's DESTINATION is the
+  # dedicated port the client hit, so the tunnel-server UDP mux de-multiplexes the
+  # whole range from one socket. accept_proxy_from trusts a peer-region relay's
+  # inbound header so the REAL client (not the relay) is preserved end-to-end.
+  # NOTE: the mux backend port must be firewalled to nvelox/peer-regions only —
+  # it trusts the PROXY header. See docs/CROSS_REGION_TCP_UDP_PROXY.md (#77).
+  # - name: "dedicated-udp-mux"
+  #   bind: ":17000-17100"          # the dedicated UDP range
+  #   protocol: "udp"
+  #   backend: "tunnel-udp-mux"     # backend MUST specify an explicit port (the UDP mux port)
+  #   accept_proxy_from: ["10.50.0.0/16"]   # trust relayed PROXY headers from peer regions
+  # (and a matching backend, e.g.)
+  # backends:
+  #   - name: "tunnel-udp-mux"
+  #     servers: ["10.1.0.5:7444"]  # explicit UDP mux port (TUNNEL_SERVER_UDP_MUX_PORT)
+  #     send_proxy_v2: true
+
 # ═══════════════════════════════════════════════════════════
 # BACKENDS
 # ═══════════════════════════════════════════════════════════

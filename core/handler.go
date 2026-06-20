@@ -48,9 +48,19 @@ type ConnContext struct {
 	BalancerRef   lb.Balancer // Reference for OnDisconnect in OnClose
 	// ProxyHeader, when non-nil, is prepended to each datagram written to
 	// PeerConn. Built once per session in connectBackendUDP when the
-	// backend has send_proxy_v2: true.
+	// backend has send_proxy_v2: true (or, for StripInbound conns, in OnData
+	// once the real client is recovered from the inbound header).
 	ProxyHeader []byte
-	Mu          sync.Mutex
+	// StripInbound (UDP, cross-region #77 / N1): this listener trusts an inbound
+	// PROXY-v2 header from the immediate peer (a peer-region relay). OnData then
+	// strips a per-datagram DGRAM header and builds the OUTBOUND header from the
+	// parsed REAL client instead of the relay's address. SendProxyV2/LocalAddr are
+	// snapshotted so OnData can build that header (src = real client, dst =
+	// LocalAddr = the dedicated port the relay dialed).
+	StripInbound bool
+	SendProxyV2  bool
+	LocalAddr    net.Addr
+	Mu           sync.Mutex
 }
 
 func (h *ProxyEventHandler) setCtx(c *nbio.Conn, ctx *ConnContext) {
@@ -148,6 +158,35 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 		return
 	}
 
+	// Cross-region UDP inbound (#77 / N1): when this listener trusts the immediate
+	// peer (a peer-region relay), each datagram carries a leading PROXY-v2 DGRAM
+	// header naming the REAL client. Strip it and build the OUTBOUND send_proxy_v2
+	// header from that real client (once — it's stable per conn), so the backend
+	// (tunnel-server) sees the client, not the relay. The header's dst is our
+	// LocalAddr (the dedicated port the relay dialed) — already correct.
+	ctx.Mu.Lock()
+	stripInbound := ctx.StripInbound
+	sendProxyV2 := ctx.SendProxyV2
+	localAddr := ctx.LocalAddr
+	ctx.Mu.Unlock()
+	if stripInbound {
+		if src, consumed, isProxy := parseInboundProxyV2Datagram(data); isProxy {
+			data = data[consumed:]
+			if sendProxyV2 && src != nil {
+				ctx.Mu.Lock()
+				if ctx.ProxyHeader == nil {
+					var buf bytes.Buffer
+					if err := proxy.WriteProxyHeaderV2(&buf, src, localAddr); err == nil {
+						ctx.ProxyHeader = buf.Bytes()
+					} else {
+						logging.Warn("[UDP] inbound PROXY v2 rebuild failed: %v", err)
+					}
+				}
+				ctx.Mu.Unlock()
+			}
+		}
+	}
+
 	ctx.Mu.Lock()
 	if ctx.PeerConn != nil {
 		peer := ctx.PeerConn
@@ -204,7 +243,7 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 	}
 
 	if l.Protocol == "udp" {
-		h.connectBackendUDP(clientConn, dialTarget, backend)
+		h.connectBackendUDP(clientConn, dialTarget, backend, l)
 	} else {
 		h.connectBackendTCP(clientConn, dialTarget, backend, balancer, target, l)
 	}
@@ -329,17 +368,34 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 	}()
 }
 
-func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target string, backend *config.Backend) {
+func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target string, backend *config.Backend, l *ListenerConfig) {
 	clientCtx := h.getCtx(clientConn)
 
+	sendProxyV2 := backend != nil && backend.SendProxyV2
+	// acceptInbound: this listener trusts an inbound PROXY-v2 header from the
+	// immediate peer (a peer-region relay, cross-region #77 / N1). When set, the
+	// REAL client isn't known until the first inbound datagram is parsed, so we do
+	// NOT build the outbound header here — OnData strips the inbound header and
+	// builds the outbound one from the parsed real client. Untrusted peers skip
+	// this entirely (a forged header can never spoof a source).
+	acceptInbound := l.proxyTrust.trusts(clientConn.RemoteAddr())
+
+	// Snapshot what OnData needs to do the strip + outbound-header build. Set
+	// synchronously (this runs inside OnOpen, before any OnData for this conn).
+	clientCtx.Mu.Lock()
+	clientCtx.StripInbound = acceptInbound
+	clientCtx.SendProxyV2 = sendProxyV2
+	clientCtx.LocalAddr = clientConn.LocalAddr()
+	clientCtx.Mu.Unlock()
+
 	// Build PROXY v2 datagram prefix once per session if the backend has
-	// send_proxy_v2: true. src = real external client; dst = the address the
-	// CLIENT sent to (clientConn.LocalAddr = our listener, i.e. the original
-	// dedicated UDP port) — NOT the backend target. This lets the backend MUX a
-	// whole UDP port range on one socket and recover the dialed port from the
-	// header. Reused on every datagram from this client (both ends are stable).
+	// send_proxy_v2: true AND we are NOT accepting an inbound header. src = real
+	// external client; dst = the address the CLIENT sent to (clientConn.LocalAddr
+	// = our listener, i.e. the original dedicated UDP port) — NOT the backend
+	// target. This lets the backend MUX a whole UDP port range on one socket and
+	// recover the dialed port from the header.
 	var proxyHdr []byte
-	if backend != nil && backend.SendProxyV2 {
+	if sendProxyV2 && !acceptInbound {
 		var buf bytes.Buffer
 		if err := proxy.WriteProxyHeaderV2(&buf, clientConn.RemoteAddr(), clientConn.LocalAddr()); err == nil {
 			proxyHdr = buf.Bytes()
@@ -348,18 +404,26 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 		}
 	}
 
-	// Check UDP pool for existing session (session affinity)
-	poolKey := fmt.Sprintf("%s|%s", clientConn.RemoteAddr().String(), clientCtx.BackendServer)
+	// Check UDP pool for existing session (session affinity).
+	// The key includes the LOCAL (dedicated) port the client hit — portOf() reads
+	// the int Port field race-safely (vs .String() which walks the IP slice that
+	// nbio races on). Under a range-funnel ALL dedicated ports share one backend
+	// name, so without the local port two clients with the same source IP:port
+	// (CGNAT) hitting DIFFERENT dedicated ports would collide on one backend conn
+	// and their replies would cross. (UDP cross-region MUX, task #77 / N2.)
+	poolKey := fmt.Sprintf("%s|%d|%s", clientConn.RemoteAddr().String(), portOf(clientConn.LocalAddr()), clientCtx.BackendServer)
 	if session := h.engine.UDPPool.Get(poolKey); session != nil {
 		// Reuse existing backend connection
 		clientCtx.Mu.Lock()
 		clientCtx.PeerConn = session.BackendConn
-		clientCtx.ProxyHeader = proxyHdr
+		if !acceptInbound {
+			clientCtx.ProxyHeader = proxyHdr // else OnData builds it from the real client
+		}
 		if clientCtx.BalancerRef != nil {
 			clientCtx.BalancerRef.OnConnect(clientCtx.BackendServer)
 		}
 		if len(clientCtx.Buffer) > 0 {
-			writeWithProxy(session.BackendConn, proxyHdr, clientCtx.Buffer)
+			writeWithProxy(session.BackendConn, clientCtx.ProxyHeader, clientCtx.Buffer)
 			clientCtx.Buffer = nil
 		}
 		clientCtx.Mu.Unlock()
@@ -393,7 +457,9 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 		// Link client to backend
 		clientCtx.Mu.Lock()
 		clientCtx.PeerConn = backendConn
-		clientCtx.ProxyHeader = proxyHdr
+		if !acceptInbound {
+			clientCtx.ProxyHeader = proxyHdr // else OnData builds it from the real client
+		}
 
 		// Notify balancer of new connection (for LeastConn tracking)
 		if clientCtx.BalancerRef != nil {
@@ -402,7 +468,7 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 
 		// Flush any buffered data
 		if len(clientCtx.Buffer) > 0 {
-			_, writeErr := writeWithProxy(backendConn, proxyHdr, clientCtx.Buffer)
+			_, writeErr := writeWithProxy(backendConn, clientCtx.ProxyHeader, clientCtx.Buffer)
 			if writeErr != nil {
 				logging.Error("Failed to flush UDP buffer: %v", writeErr)
 				clientCtx.Mu.Unlock()
@@ -414,8 +480,11 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 		}
 		clientCtx.Mu.Unlock()
 
-		// Read from backend and write to client
-		buf := make([]byte, 4096)
+		// Read from backend and write to client. 65535 = max UDP payload; a
+		// 4096 buffer silently truncated any backend datagram >4 KB (the kernel
+		// discards the remainder of that datagram) — large DNS/QUIC/jumbo
+		// responses lost data. (UDP cross-region MUX, task #77 / N3.)
+		buf := make([]byte, 65535)
 		for {
 			backendConn.SetReadDeadline(time.Now().Add(60 * time.Second))
 			n, err := backendConn.Read(buf)

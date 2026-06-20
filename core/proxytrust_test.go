@@ -104,3 +104,53 @@ func TestTryParseInboundProxyV2(t *testing.T) {
 		t.Errorf("short non-sig bytes should be raw: done=%v src=%v", done, src)
 	}
 }
+
+// TestParseInboundProxyV2Datagram exercises the UDP (datagram) inbound parser
+// used by the owner-region nvelox to recover the real client from a peer-region
+// relay's per-datagram header (cross-region UDP #77 / N1). It round-trips against
+// the SAME WriteProxyHeaderV2 the relay/send path uses, so writer↔parser stay
+// symmetric.
+func TestParseInboundProxyV2Datagram(t *testing.T) {
+	// UDP DGRAM header (real client + the dedicated dst port), built exactly as
+	// the tunnel-server relay / nvelox send path builds it.
+	client := &net.UDPAddr{IP: net.ParseIP("203.0.113.7"), Port: 5555}
+	dest := &net.UDPAddr{IP: net.ParseIP("198.51.100.1"), Port: 17042}
+	hdr := proxyproto.HeaderProxyFromAddrs(2, client, dest)
+	full, err := hdr.Format()
+	if err != nil {
+		t.Fatalf("format header: %v", err)
+	}
+	payload := []byte("wireguard-handshake")
+	dgram := append(append([]byte{}, full...), payload...)
+
+	src, consumed, isProxy := parseInboundProxyV2Datagram(dgram)
+	if !isProxy || src == nil {
+		t.Fatalf("isProxy=%v src=%v (want true, non-nil)", isProxy, src)
+	}
+	if consumed != len(full) {
+		t.Errorf("consumed=%d want %d (header len)", consumed, len(full))
+	}
+	// go-proxyproto decodes a UDP/DGRAM header's source to a *net.UDPAddr;
+	// ipOf handles both UDP and TCP addr types.
+	if ip := ipOf(src); ip == nil || ip.String() != "203.0.113.7" {
+		t.Errorf("src IP=%v want 203.0.113.7", src)
+	}
+	if string(dgram[consumed:]) != "wireguard-handshake" {
+		t.Errorf("payload remainder = %q want %q", dgram[consumed:], payload)
+	}
+
+	// Raw datagram (no PROXY header): not a proxy datagram, nothing consumed.
+	if src, consumed, isProxy := parseInboundProxyV2Datagram([]byte("\x00\x01\x02 raw dns query")); isProxy || src != nil || consumed != 0 {
+		t.Errorf("raw datagram: isProxy=%v src=%v consumed=%d (want false,nil,0)", isProxy, src, consumed)
+	}
+
+	// Too-short datagram: treated as raw (no block).
+	if _, _, isProxy := parseInboundProxyV2Datagram([]byte{0x0D, 0x0A}); isProxy {
+		t.Error("short datagram should be treated as raw")
+	}
+
+	// Header truncated mid-address-block: treated as raw rather than blocking.
+	if _, _, isProxy := parseInboundProxyV2Datagram(full[:len(full)-2]); isProxy {
+		t.Error("truncated header datagram should be treated as raw")
+	}
+}

@@ -120,3 +120,30 @@ func tryParseInboundProxyV2(buf []byte) (done bool, src net.Addr, consumed int) 
 	}
 	return true, hdr.SourceAddr, total
 }
+
+// parseInboundProxyV2Datagram is the DATAGRAM-oriented counterpart of
+// tryParseInboundProxyV2, for the UDP plane (cross-region UDP #77 / N1). A UDP
+// datagram is atomic — the whole PROXY-v2 header is present in this one datagram
+// or it isn't, so there is no cross-read reassembly (no "need more bytes" state).
+//
+// Returns:
+//   - isProxy=false              => not a PROXY-v2 datagram (raw payload); forward
+//     as-is, keep the peer addr (consumed=0, src=nil).
+//   - isProxy=true, src!=nil, consumed=N => a valid PROXY (non-LOCAL) header: src
+//     is the real client; drop the first N bytes before forwarding the payload.
+//   - isProxy=true, src=nil, consumed=N  => malformed/LOCAL header: still strip N
+//     bytes (don't leak them as payload) but fall back to the peer addr.
+func parseInboundProxyV2Datagram(data []byte) (src net.Addr, consumed int, isProxy bool) {
+	if len(data) < 16 || !bytes.Equal(data[:len(proxyV2Signature)], proxyV2Signature) {
+		return nil, 0, false
+	}
+	total := 16 + (int(data[14])<<8 | int(data[15]))
+	if len(data) < total {
+		return nil, 0, false // truncated/garbled — treat as raw rather than block
+	}
+	hdr, err := proxyproto.Read(bufio.NewReader(bytes.NewReader(data[:total])))
+	if err != nil || hdr == nil || hdr.Command == proxyproto.LOCAL || hdr.SourceAddr == nil {
+		return nil, total, true
+	}
+	return hdr.SourceAddr, total, true
+}
