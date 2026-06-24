@@ -16,6 +16,7 @@ import (
 	"nvelox/config"
 	"nvelox/core/admin"
 	"nvelox/core/circuitbreaker"
+	"nvelox/core/denylist"
 	"nvelox/core/discovery"
 	"nvelox/core/health"
 	"nvelox/core/httpproxy"
@@ -121,8 +122,11 @@ func (e *Engine) Start(ctx context.Context) error {
 
 	// 1e. Start admin API
 	if e.Config.Admin.Enabled {
-		e.AdminServer = admin.NewServer(e.Config.Admin.Bind, e.Config.Admin.APIKey, e.Balancers)
+		e.AdminServer = admin.NewServer(e.Config.Admin.Bind, e.Config.Admin.APIKey, e.Balancers, denylist.Default)
 		e.AdminServer.Start()
+		// Evict expired dynamic-denylist entries periodically (admin API is the
+		// only mutator, so the sweeper only matters when admin is enabled).
+		denylist.Default.StartSweeper(time.Minute)
 	}
 
 	// 1f. Start metrics server

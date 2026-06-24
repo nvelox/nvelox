@@ -2,10 +2,13 @@ package admin
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"nvelox/core/denylist"
 	"nvelox/core/logging"
 	"nvelox/lb"
 )
@@ -17,7 +20,7 @@ func init() {
 const testAPIKey = "test-secret-key-12345"
 
 func newTestServer(balancers map[string]lb.Balancer) *Server {
-	return NewServer("127.0.0.1:0", testAPIKey, balancers)
+	return NewServer("127.0.0.1:0", testAPIKey, balancers, denylist.New())
 }
 
 func authedRequest(method, url string) *http.Request {
@@ -87,13 +90,63 @@ func TestAdminAPI_NoKeyConfigured(t *testing.T) {
 	// No API key = allow all (with warning logged)
 	srv := NewServer("127.0.0.1:0", "", map[string]lb.Balancer{
 		"be": lb.NewRoundRobin([]string{"s1:80"}),
-	})
+	}, denylist.New())
 
 	w := httptest.NewRecorder()
 	srv.authenticate(srv.handleStats)(w, localRequest("GET", "/api/v1/stats"))
 
 	if w.Code != 200 {
 		t.Errorf("expected 200 when no API key configured, got %d", w.Code)
+	}
+}
+
+func TestAdminAPI_Denylist(t *testing.T) {
+	srv := newTestServer(map[string]lb.Balancer{"be": lb.NewRoundRobin([]string{"s1:80"})})
+
+	post := func(jsonBody string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/api/v1/denylist", strings.NewReader(jsonBody))
+		req.Header.Set("X-API-Key", testAPIKey)
+		req.RemoteAddr = "127.0.0.1:12345"
+		w := httptest.NewRecorder()
+		srv.authenticate(srv.handleDenylist)(w, req)
+		return w
+	}
+
+	// Add a block.
+	if w := post(`{"ip":"203.0.113.7","ttl_seconds":3600}`); w.Code != 200 {
+		t.Fatalf("POST add: expected 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	if !srv.dynDeny.Blocked(net.ParseIP("203.0.113.7")) {
+		t.Error("203.0.113.7 should be blocked after POST")
+	}
+
+	// List shows it.
+	wl := httptest.NewRecorder()
+	srv.authenticate(srv.handleDenylist)(wl, authedRequest("GET", "/api/v1/denylist"))
+	if wl.Code != 200 {
+		t.Fatalf("GET list: expected 200, got %d", wl.Code)
+	}
+	var listResp struct {
+		Entries []denylist.Entry `json:"entries"`
+	}
+	json.NewDecoder(wl.Body).Decode(&listResp)
+	if len(listResp.Entries) != 1 || listResp.Entries[0].CIDR != "203.0.113.7" {
+		t.Errorf("list should contain 203.0.113.7, got %+v", listResp.Entries)
+	}
+
+	// Delete via query param.
+	wd := httptest.NewRecorder()
+	srv.authenticate(srv.handleDenylist)(wd, authedRequest("DELETE", "/api/v1/denylist?cidr=203.0.113.7"))
+	if wd.Code != 200 {
+		t.Fatalf("DELETE: expected 200, got %d", wd.Code)
+	}
+	if srv.dynDeny.Blocked(net.ParseIP("203.0.113.7")) {
+		t.Error("203.0.113.7 should be unblocked after DELETE")
+	}
+
+	// Invalid IP is rejected.
+	if w := post(`{"ip":"not-an-ip"}`); w.Code != http.StatusBadRequest {
+		t.Errorf("invalid IP should be 400, got %d", w.Code)
 	}
 }
 

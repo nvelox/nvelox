@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"nvelox/core/denylist"
 	"nvelox/core/logging"
 	"nvelox/lb"
 )
@@ -35,6 +36,7 @@ type Server struct {
 	balancers  map[string]lb.Balancer
 	startTime  time.Time
 	apiKey     string
+	dynDeny    *denylist.Dynamic // runtime IP/CIDR denylist (nil = endpoint disabled)
 
 	// Per-source-IP failed auth tracking.
 	authMu       sync.Mutex
@@ -53,12 +55,15 @@ type StatsResponse struct {
 	Backends int    `json:"backends"`
 }
 
-// NewServer creates an admin API server.
-func NewServer(bind string, apiKey string, balancers map[string]lb.Balancer) *Server {
+// NewServer creates an admin API server. dynDeny is the process-wide runtime
+// denylist exposed via /api/v1/denylist; pass denylist.Default (or nil to
+// disable that endpoint).
+func NewServer(bind string, apiKey string, balancers map[string]lb.Balancer, dynDeny *denylist.Dynamic) *Server {
 	s := &Server{
 		balancers:    balancers,
 		startTime:    time.Now(),
 		apiKey:       apiKey,
+		dynDeny:      dynDeny,
 		authFailures: make(map[string]*authAttempt),
 	}
 
@@ -66,6 +71,7 @@ func NewServer(bind string, apiKey string, balancers map[string]lb.Balancer) *Se
 	mux.HandleFunc("/api/v1/stats", s.authenticate(s.handleStats))
 	mux.HandleFunc("/api/v1/backends", s.authenticate(s.handleBackends))
 	mux.HandleFunc("/api/v1/backends/", s.authenticate(s.handleBackendAction))
+	mux.HandleFunc("/api/v1/denylist", s.authenticate(s.handleDenylist))
 
 	s.httpServer = &http.Server{
 		Addr:         bind,
@@ -253,6 +259,69 @@ func (s *Server) handleBackendAction(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": action, "server": server})
+}
+
+// denylistRequest is the POST/DELETE body for /api/v1/denylist.
+type denylistRequest struct {
+	IP         string `json:"ip"`          // IP or CIDR
+	TTLSeconds int    `json:"ttl_seconds"` // <=0 = never expires
+}
+
+// handleDenylist manages the runtime IP/CIDR denylist:
+//
+//	GET    /api/v1/denylist            → list active entries
+//	POST   /api/v1/denylist {ip,ttl_seconds} → add/refresh a block
+//	DELETE /api/v1/denylist?cidr=<ip>  (or body {ip})  → remove a block
+//
+// DELETE takes the target via the ?cidr= query (or body) rather than a path
+// segment so CIDRs (which contain '/') don't break path routing.
+func (s *Server) handleDenylist(w http.ResponseWriter, r *http.Request) {
+	if s.dynDeny == nil {
+		http.Error(w, "denylist unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case http.MethodGet:
+		json.NewEncoder(w).Encode(map[string]any{"entries": s.dynDeny.List()})
+
+	case http.MethodPost:
+		var req denylistRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		var ttl time.Duration
+		if req.TTLSeconds > 0 {
+			ttl = time.Duration(req.TTLSeconds) * time.Second
+		}
+		ent, err := s.dynDeny.Add(req.IP, ttl)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		logging.Info("[ADMIN] denylist add %s ttl=%ds (total=%d)", ent.CIDR, req.TTLSeconds, s.dynDeny.Count())
+		json.NewEncoder(w).Encode(map[string]any{"status": "blocked", "entry": ent})
+
+	case http.MethodDelete:
+		cidr := r.URL.Query().Get("cidr")
+		if cidr == "" {
+			var req denylistRequest
+			_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req)
+			cidr = req.IP
+		}
+		if cidr == "" {
+			http.Error(w, "cidr query param or {ip} body required", http.StatusBadRequest)
+			return
+		}
+		existed := s.dynDeny.Remove(cidr)
+		logging.Info("[ADMIN] denylist remove %s existed=%v (total=%d)", cidr, existed, s.dynDeny.Count())
+		json.NewEncoder(w).Encode(map[string]any{"status": "removed", "cidr": cidr, "existed": existed})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func splitPath(path string) []string {

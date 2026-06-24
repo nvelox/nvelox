@@ -17,6 +17,7 @@ import (
 
 	"nvelox/config"
 	"nvelox/core/acl"
+	"nvelox/core/denylist"
 	"nvelox/core/httpproxy/errorhtml"
 	"nvelox/core/logging"
 	"nvelox/core/middleware"
@@ -47,7 +48,10 @@ type CircuitBreakerI interface {
 type MetricsI interface {
 	GetCounter(name string, labels map[string]string) interface{ Inc() }
 	GetHistogram(name string) interface{ Observe(float64) }
-	GetGauge(name string, labels map[string]string) interface{ Inc(); Dec() }
+	GetGauge(name string, labels map[string]string) interface {
+		Inc()
+		Dec()
+	}
 }
 
 // EngineRef provides access to shared engine components without circular imports.
@@ -62,42 +66,46 @@ type EngineRef struct {
 // the BindGroup it's attached to does. ServeHTTP is the entry point the
 // BindGroup dispatches into.
 type HTTPServer struct {
-	Listener      *ListenerConfig
-	bindGroup     *BindGroup // back-reference; set by Start() for back-compat
-	router        *Router
-	Balancers     map[string]lb.Balancer
-	Backends      map[string]*config.Backend
-	RateLimiter   interface{ Allow() bool }
-	ConnLimiters  map[string]ConnLimiterI
-	PassiveHealth map[string]PassiveHealthI
-	StickyStores  map[string]*sticky.Store
-	ACLEngine     *acl.Engine
-	IPAllowlist   []*net.IPNet
-	IPDenylist    []*net.IPNet
+	Listener       *ListenerConfig
+	bindGroup      *BindGroup // back-reference; set by Start() for back-compat
+	router         *Router
+	Balancers      map[string]lb.Balancer
+	Backends       map[string]*config.Backend
+	RateLimiter    interface{ Allow() bool }
+	ConnLimiters   map[string]ConnLimiterI
+	PassiveHealth  map[string]PassiveHealthI
+	StickyStores   map[string]*sticky.Store
+	ACLEngine      *acl.Engine
+	IPAllowlist    []*net.IPNet
+	IPDenylist     []*net.IPNet
 	TrustedProxies []*net.IPNet
-	IPRateLimiter *middleware.IPRateLimiter
-	CircuitBreakers map[string]CircuitBreakerI
-	MaxBodySize     int64 // 0 = unlimited
-	Compression     config.CompressionConfig
-	ErrorPages      map[int][]byte // status code -> pre-loaded HTML content
-	ResponseCache   *Cache
-	BufferPool      *BufferPool
+	// DynDenylist is the process-wide runtime denylist (TTL-bearing blocks
+	// pushed via the admin API). Defaults to denylist.Default in NewHTTPServer;
+	// tests may inject their own. nil disables the dynamic check.
+	DynDenylist      *denylist.Dynamic
+	IPRateLimiter    *middleware.IPRateLimiter
+	CircuitBreakers  map[string]CircuitBreakerI
+	MaxBodySize      int64 // 0 = unlimited
+	Compression      config.CompressionConfig
+	ErrorPages       map[int][]byte // status code -> pre-loaded HTML content
+	ResponseCache    *Cache
+	BufferPool       *BufferPool
 	backendTransport *http.Transport // default transport (plaintext HTTP backends)
 	// backendTransports holds per-backend TLS-enabled transports. If a backend's
 	// name is absent here, the default backendTransport is used.
 	backendTransports map[string]*http.Transport
 	backendSchemes    map[string]string // "https" when backend_tls is enabled
-	altSvcHeader    string
-	closeOnce       sync.Once // guards Close() against double-invocation
+	altSvcHeader      string
+	closeOnce         sync.Once // guards Close() against double-invocation
 }
 
 // ListenerConfig mirrors core.ListenerConfig to avoid circular imports.
 type ListenerConfig struct {
-	Name     string
-	Addr     string
-	Protocol string
-	Backend  string
-	Port     int
+	Name           string
+	Addr           string
+	Protocol       string
+	Backend        string
+	Port           int
 	TLS            *config.TLSConfig
 	HTTP3          bool
 	Routes         []config.RouteConfig
@@ -114,8 +122,8 @@ type ListenerConfig struct {
 	Cache          config.CacheConfig
 	// Multi-server-per-port (nginx-style): SNI / Host names this site
 	// answers to, and whether it's the catch-all default for unknown SNI/Host.
-	ServerNames    []string
-	DefaultServer  bool
+	ServerNames   []string
+	DefaultServer bool
 	// Per-listener timeouts. ReadHeader / Idle are shared across sites on the
 	// same bind port (the http.Server has one slot each); the engine derives
 	// the per-port value as the max across sites. Read / Write are applied
@@ -127,19 +135,20 @@ type ListenerConfig struct {
 // NewHTTPServer creates an HTTP server for the given listener.
 func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends map[string]*config.Backend, rateLimiter interface{ Allow() bool }, connLimiters map[string]ConnLimiterI, passiveHealth map[string]PassiveHealthI, stickyStores map[string]*sticky.Store, circuitBreakers map[string]CircuitBreakerI) *HTTPServer {
 	s := &HTTPServer{
-		Listener:      l,
-		router:        NewRouter(l.Routes, l.Backend),
-		Balancers:     balancers,
-		Backends:      backends,
-		ConnLimiters:  connLimiters,
-		PassiveHealth: passiveHealth,
+		Listener:        l,
+		router:          NewRouter(l.Routes, l.Backend),
+		Balancers:       balancers,
+		Backends:        backends,
+		ConnLimiters:    connLimiters,
+		PassiveHealth:   passiveHealth,
 		StickyStores:    stickyStores,
 		CircuitBreakers: circuitBreakers,
 		IPAllowlist:     acl.ParseCIDRList(l.IPAllowlist),
-		IPDenylist:     acl.ParseCIDRList(l.IPDenylist),
-		TrustedProxies: acl.ParseCIDRList(l.TrustedProxies),
-		MaxBodySize:   parseByteSize(l.MaxBodySize),
-		RateLimiter: rateLimiter,
+		IPDenylist:      acl.ParseCIDRList(l.IPDenylist),
+		TrustedProxies:  acl.ParseCIDRList(l.TrustedProxies),
+		DynDenylist:     denylist.Default,
+		MaxBodySize:     parseByteSize(l.MaxBodySize),
+		RateLimiter:     rateLimiter,
 	}
 
 	s.Compression = l.Compression
@@ -390,10 +399,21 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// reflects the real client rather than the upstream proxy's address.
 	clientIP := s.realClientIP(r)
 
-	// IP denylist check
+	// IP denylist check (static, per-listener config)
 	if len(s.IPDenylist) > 0 && acl.CheckIPList(clientIP, s.IPDenylist) {
 		s.serveError(w, http.StatusForbidden)
 		return
+	}
+
+	// Dynamic (runtime) denylist — TTL-bearing blocks pushed via the admin
+	// API (e.g. by ngris-sentinel abuse detection). Consulted on every request
+	// using the same trusted-proxy-resolved client IP; process-global so it
+	// survives SIGHUP config reloads.
+	if s.DynDenylist != nil {
+		if ip := net.ParseIP(clientIP); ip != nil && s.DynDenylist.Blocked(ip) {
+			s.serveError(w, http.StatusForbidden)
+			return
+		}
 	}
 
 	// IP allowlist check (if set, only listed IPs are allowed)
