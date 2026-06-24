@@ -114,9 +114,11 @@ func TestAccessHTTP_LogInjection(t *testing.T) {
 		t.Fatalf("Init failed: %v", err)
 	}
 
-	// Attacker-controlled path tries to inject a fake log entry.
+	// Attacker-controlled path AND Host header both try to inject a fake
+	// log entry — both must be sanitized.
 	evilPath := "/legit\n10.0.0.1 - \"GET /admin HTTP/1.1\" 200 0 0.000ms -> backend"
-	AccessHTTP("1.2.3.4", "GET", evilPath, "HTTP/1.1", 200, 0, 0.1, "upstream:80")
+	evilHost := "victim.example\nINJECTED"
+	AccessHTTP("1.2.3.4", evilHost, "GET", evilPath, "HTTP/1.1", 200, 0, 0.1, "upstream:80")
 
 	content, err := os.ReadFile(accessPath)
 	if err != nil {

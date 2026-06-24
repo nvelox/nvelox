@@ -92,10 +92,18 @@ listeners:
       # cipher_suites:                 # TLS 1.2 only; TLS 1.3 suites are
       #   - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
       #   - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
-    # trusted_proxies: ["10.0.0.0/8"]
+    # trusted_proxies: ["10.0.0.2/32"]
     #   When set, X-Forwarded-For / X-Real-IP from peers in these CIDRs
     #   are trusted and appended; everyone else gets their forged
-    #   headers replaced with the authoritative peer IP.
+    #   headers replaced with the authoritative peer IP. This list ALSO
+    #   governs nvelox's own client-IP decisions: the access log, ip_allowlist,
+    #   ip_denylist, ip_rate_limit and acl resolve the real client from XFF /
+    #   X-Real-IP for trusted peers. SECURITY: scope this to the real upstream
+    #   proxy IPs only — never a broad range. Behind a k8s Service with
+    #   externalTrafficPolicy:Cluster, kube-proxy SNATs every packet to a node
+    #   IP, so a broad CIDR (e.g. 10.0.0.0/8) trusts ALL inbound traffic and
+    #   makes every IP-based control forgeable; prefer externalTrafficPolicy:
+    #   Local and/or firewall the listener to the proxy.
     # accept_proxy_from: ["10.50.0.0/16"]
     #   L4 inbound PROXY-protocol-v2 trust (tcp / https-passthrough listeners).
     #   For connections from these CIDRs, nvelox parses the inbound PROXY-v2

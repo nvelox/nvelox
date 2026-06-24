@@ -64,10 +64,20 @@ func NewEngine(rules []config.ACLRule) *Engine {
 	return &Engine{rules: compiled}
 }
 
-// Check evaluates the request against all rules. Returns "allow", "deny", or "" (no match).
+// Check evaluates the request against all rules, matching source-IP rules
+// against the raw connection peer (r.RemoteAddr). Returns "allow", "deny",
+// or "" (no match). Prefer CheckClientIP when a trusted-proxy-resolved
+// client IP is available so rules match the real client, not the upstream
+// proxy.
 func (e *Engine) Check(r *http.Request) string {
-	clientIP := extractIP(r.RemoteAddr)
+	return e.CheckClientIP(r, extractIP(r.RemoteAddr))
+}
 
+// CheckClientIP is like Check but matches source-IP rules against an
+// explicitly-resolved client IP (e.g. the real client recovered from a
+// trusted proxy's X-Forwarded-For) instead of the raw connection peer. A
+// nil clientIP simply never matches a source-IP rule.
+func (e *Engine) CheckClientIP(r *http.Request, clientIP net.IP) string {
 	for _, rule := range e.rules {
 		if e.matches(r, clientIP, &rule) {
 			return rule.Action

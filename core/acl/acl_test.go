@@ -1,12 +1,38 @@
 package acl
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"nvelox/config"
 )
+
+func TestACL_CheckClientIP_ExplicitIP(t *testing.T) {
+	// CheckClientIP must match source-IP rules against the explicitly-resolved
+	// client (e.g. recovered from a trusted proxy's XFF), NOT the peer.
+	engine := NewEngine([]config.ACLRule{
+		{Match: config.ACLMatch{SourceIP: []string{"203.0.113.0/24"}}, Action: "deny"},
+	})
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.1:1234" // peer is NOT in the denied range...
+
+	// ...but the resolved client IS — must match on it.
+	if action := engine.CheckClientIP(r, net.ParseIP("203.0.113.9")); action != "deny" {
+		t.Errorf("expected deny on resolved client 203.0.113.9, got %q", action)
+	}
+	// A resolved client outside the range does not match.
+	if action := engine.CheckClientIP(r, net.ParseIP("198.51.100.1")); action != "" {
+		t.Errorf("expected no match for 198.51.100.1, got %q", action)
+	}
+	// A nil resolved client never matches a source-IP rule (fails closed for
+	// allowlists, open for denylists — same as the prior unparseable-peer path).
+	if action := engine.CheckClientIP(r, nil); action != "" {
+		t.Errorf("expected no match for nil clientIP, got %q", action)
+	}
+}
 
 func TestACL_SourceIP_Deny(t *testing.T) {
 	engine := NewEngine([]config.ACLRule{

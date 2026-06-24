@@ -128,6 +128,18 @@ type Listener struct {
 	// these headers *replaced* (not appended) so a direct client can't spoof
 	// their source IP by presenting a forged XFF chain.
 	// If empty, no peer is trusted → XFF is always replaced with the peer IP.
+	//
+	// SECURITY: this list also governs nvelox's OWN client-IP decisions — the
+	// access log, ip_allowlist, ip_denylist, ip_rate_limit and acl all resolve
+	// the real client from X-Forwarded-For / X-Real-IP when the connection peer
+	// is trusted (see HTTPServer.realClientIP). Scope it to the ACTUAL upstream
+	// proxy IPs/CIDR, never a broad range. In particular, behind a Kubernetes
+	// Service with externalTrafficPolicy:Cluster, kube-proxy SNATs every inbound
+	// packet to a node IP — so a broad CIDR like 10.0.0.0/8 marks ALL inbound
+	// traffic (including anyone who can reach the NodePort directly) as trusted,
+	// making the forwarding headers — and therefore every IP-based control above
+	// — forgeable. Use externalTrafficPolicy:Local (or an LB that preserves the
+	// source) and/or firewall the listener so only the real proxy can reach it.
 	TrustedProxies []string `yaml:"trusted_proxies,omitempty"`
 
 	// AcceptProxyFrom: CIDRs whose INBOUND PROXY-protocol-v2 header is trusted

@@ -183,6 +183,102 @@ func TestSetForwardedHeaders_TrustedPeerBackfill(t *testing.T) {
 	}
 }
 
+func TestRealClientIP(t *testing.T) {
+	tests := []struct {
+		name    string
+		trust   []string // trusted_proxies CIDRs
+		remote  string   // r.RemoteAddr
+		xff     string   // X-Forwarded-For
+		xRealIP string   // X-Real-IP
+		want    string
+	}{
+		{"no trust list: peer verbatim, XFF ignored",
+			nil, "203.0.113.5:443", "1.2.3.4", "", "203.0.113.5"},
+		{"untrusted peer: peer verbatim, forged XFF/X-Real-IP ignored",
+			[]string{"10.0.0.0/8"}, "203.0.113.5:443", "1.2.3.4, 5.6.7.8", "9.9.9.9", "203.0.113.5"},
+		{"trusted peer, single XFF entry: that entry",
+			[]string{"10.0.0.0/8"}, "10.0.0.2:1234", "203.0.113.5", "", "203.0.113.5"},
+		{"trusted peer, chain: first untrusted from the right (skip trusted hops)",
+			[]string{"10.0.0.0/8"}, "10.0.0.2:1234", "203.0.113.5, 10.0.0.9, 10.0.0.8", "", "203.0.113.5"},
+		{"trusted peer, attacker-prepended fake is unreachable",
+			[]string{"10.0.0.0/8"}, "10.0.0.2:1234", "9.9.9.9, 203.0.113.5", "", "203.0.113.5"},
+		{"trusted peer, all-trusted chain: X-Real-IP fallback",
+			[]string{"10.0.0.0/8"}, "10.0.0.2:1234", "10.0.0.9, 10.0.0.8", "198.51.100.7", "198.51.100.7"},
+		{"trusted peer, all-trusted chain, no X-Real-IP: peer",
+			[]string{"10.0.0.0/8"}, "10.0.0.2:1234", "10.0.0.9", "", "10.0.0.2"},
+		{"trusted peer, malformed/empty XFF entries skipped",
+			[]string{"10.0.0.0/8"}, "10.0.0.2:1234", "garbage, , 203.0.113.5", "", "203.0.113.5"},
+		{"trusted peer, no XFF: X-Real-IP",
+			[]string{"10.0.0.0/8"}, "10.0.0.2:1234", "", "198.51.100.7", "198.51.100.7"},
+		{"trusted peer, no XFF, malformed X-Real-IP: peer",
+			[]string{"10.0.0.0/8"}, "10.0.0.2:1234", "", "not-an-ip", "10.0.0.2"},
+		{"bare IPv6 peer without port (SplitHostPort error): verbatim",
+			[]string{"10.0.0.0/8"}, "2001:db8::1", "1.2.3.4", "", "2001:db8::1"},
+		{"trusted IPv6 peer, untrusted IPv6 client",
+			[]string{"2001:db8::/32"}, "[2001:db8::2]:443", "2001:dead:beef::9", "", "2001:dead:beef::9"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &HTTPServer{Listener: &ListenerConfig{}}
+			s.TrustedProxies = acl.ParseCIDRList(tt.trust)
+
+			r := httptest.NewRequest("GET", "/", nil)
+			r.RemoteAddr = tt.remote
+			if tt.xff != "" {
+				r.Header.Set("X-Forwarded-For", tt.xff)
+			}
+			if tt.xRealIP != "" {
+				r.Header.Set("X-Real-IP", tt.xRealIP)
+			}
+
+			if got := s.realClientIP(r); got != tt.want {
+				t.Errorf("realClientIP() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestServeHTTP_Denylist_ResolvesClientBehindTrustedProxy proves the IP
+// denylist (and, by the same clientIP wiring, the allowlist / rate limiter /
+// ACL) keys off the trusted-proxy-resolved client, not the connection peer.
+func TestServeHTTP_Denylist_ResolvesClientBehindTrustedProxy(t *testing.T) {
+	s := &HTTPServer{Listener: &ListenerConfig{}}
+	s.TrustedProxies = acl.ParseCIDRList([]string{"10.0.0.0/8"})
+	s.IPDenylist = acl.ParseCIDRList([]string{"1.2.3.4/32"})
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.2:1234"               // trusted proxy peer (itself NOT denied)
+	r.Header.Set("X-Forwarded-For", "1.2.3.4")   // real client, on the denylist
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403: denylist must match the XFF-resolved client behind a trusted proxy, got %d", w.Code)
+	}
+}
+
+// TestServeHTTP_Allowlist_IgnoresForgedXFFFromUntrustedPeer proves a direct
+// (untrusted) client cannot bypass an IP allowlist by forging X-Forwarded-For
+// to claim an allowed address — the peer is used and the forged header ignored.
+func TestServeHTTP_Allowlist_IgnoresForgedXFFFromUntrustedPeer(t *testing.T) {
+	s := &HTTPServer{Listener: &ListenerConfig{}}
+	s.TrustedProxies = acl.ParseCIDRList([]string{"10.0.0.0/8"})
+	s.IPAllowlist = acl.ParseCIDRList([]string{"9.9.9.9/32"})
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "203.0.113.5:443"            // untrusted direct peer
+	r.Header.Set("X-Forwarded-For", "9.9.9.9")  // forged claim of an allowlisted IP
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403: untrusted peer's forged XFF must be ignored and the peer denied, got %d", w.Code)
+	}
+}
+
 func TestExpandRedirectVars(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -168,12 +168,20 @@ func SanitizeLogField(s string) string {
 	return string(b)
 }
 
-// AccessHTTP logs an HTTP request in CLF-like format. User-controlled
-// fields (method, path, proto, backend) are sanitized against CRLF log
-// injection; clientIP is produced by net.SplitHostPort and is trusted.
-func AccessHTTP(clientIP, method, path, proto string, status int, bytes int64, duration float64, backend string) {
-	current.Load().accessLog.Printf("%s - \"%s %s %s\" %d %d %.3fms -> %s",
-		clientIP,
+// AccessHTTP logs an HTTP request in CLF-like format. Every variable field is
+// sanitized against CRLF log injection. clientIP comes from the server's
+// trusted-proxy-aware resolver (always a validated IP — the real client behind
+// a trusted proxy, else the connection peer), so sanitizing it is normally a
+// no-op; we do it anyway as defense-in-depth against future callers passing a
+// less-validated value. host is the requested vhost (r.Host); an empty host is
+// logged as "-".
+func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes int64, duration float64, backend string) {
+	if host == "" {
+		host = "-"
+	}
+	current.Load().accessLog.Printf("%s - %s \"%s %s %s\" %d %d %.3fms -> %s",
+		SanitizeLogField(clientIP),
+		SanitizeLogField(host),
 		SanitizeLogField(method),
 		SanitizeLogField(path),
 		SanitizeLogField(proto),

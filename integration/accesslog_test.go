@@ -73,6 +73,11 @@ func TestHTTP_AccessLogging(t *testing.T) {
 	if !strings.Contains(logContent, "200") {
 		t.Errorf("access log missing status 200, got: %s", logContent)
 	}
+	// The requested vhost (Host header) must now appear in the access log.
+	wantHost := fmt.Sprintf("127.0.0.1:%d", proxyPort)
+	if !strings.Contains(logContent, wantHost) {
+		t.Errorf("access log missing host %q, got: %s", wantHost, logContent)
+	}
 
 	cancel()
 }

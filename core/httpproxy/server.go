@@ -383,14 +383,21 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Alt-Svc", s.altSvcHeader)
 	}
 
+	// Resolve the real client IP once: behind a trusted proxy this is the
+	// origin client recovered from X-Forwarded-For; otherwise it's the
+	// connection peer. Reused below for the allow/deny lists, the per-IP
+	// rate limiter, the ACL engine and the access log so every decision
+	// reflects the real client rather than the upstream proxy's address.
+	clientIP := s.realClientIP(r)
+
 	// IP denylist check
-	if len(s.IPDenylist) > 0 && acl.CheckIPList(r.RemoteAddr, s.IPDenylist) {
+	if len(s.IPDenylist) > 0 && acl.CheckIPList(clientIP, s.IPDenylist) {
 		s.serveError(w, http.StatusForbidden)
 		return
 	}
 
 	// IP allowlist check (if set, only listed IPs are allowed)
-	if len(s.IPAllowlist) > 0 && !acl.CheckIPList(r.RemoteAddr, s.IPAllowlist) {
+	if len(s.IPAllowlist) > 0 && !acl.CheckIPList(clientIP, s.IPAllowlist) {
 		s.serveError(w, http.StatusForbidden)
 		return
 	}
@@ -405,7 +412,7 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Per-IP rate limiting
 	if s.IPRateLimiter != nil {
-		if !s.IPRateLimiter.Allow(r.RemoteAddr) {
+		if !s.IPRateLimiter.Allow(clientIP) {
 			s.serveError(w, http.StatusTooManyRequests)
 			return
 		}
@@ -413,7 +420,7 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// ACL check
 	if s.ACLEngine != nil {
-		action := s.ACLEngine.Check(r)
+		action := s.ACLEngine.CheckClientIP(r, net.ParseIP(clientIP))
 		if action == "deny" {
 			s.serveError(w, http.StatusForbidden)
 			return
@@ -567,7 +574,7 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// WebSocket upgrade detection
 	if isWebSocketUpgrade(r) {
-		s.handleWebSocket(w, r, balancer, backendName)
+		s.handleWebSocket(w, r, balancer, backendName, clientIP)
 		return
 	}
 
@@ -742,8 +749,7 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	duration := float64(time.Since(start).Microseconds()) / 1000.0
-	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-	logging.AccessHTTP(clientIP, r.Method, r.URL.Path, r.Proto, rec.status, rec.bytes, duration, lastTarget)
+	logging.AccessHTTP(clientIP, r.Host, r.Method, r.URL.Path, r.Proto, rec.status, rec.bytes, duration, lastTarget)
 }
 
 // getStickyKey returns the session key based on the sticky session config.
@@ -857,6 +863,67 @@ func (s *HTTPServer) setForwardedHeaders(r *http.Request) {
 	}
 }
 
+// realClientIP returns the best-effort real client IP for the request as a
+// bare IP string. When the immediate connection peer is a configured trusted
+// proxy, it walks the X-Forwarded-For chain right-to-left, skipping entries
+// that are themselves trusted proxies, and returns the first untrusted,
+// parseable address — the real client (matching nginx's real_ip_recursive).
+// X-Real-IP is the fallback when XFF yields nothing usable. When the peer is
+// NOT trusted (or no trust list is configured) the peer address is returned
+// verbatim, so a direct client can never spoof its source via a forged
+// header. The result is always a validated IP (the peer, or a parsed header
+// value), so callers — including the access logger — can treat it as trusted.
+//
+// This is what makes the real client survive the hop in the access log, the
+// IP allow/deny lists, the per-IP rate limiter and the ACL engine when this
+// nvelox runs behind another proxy. trusted_proxies previously only affected
+// the X-Forwarded-For forwarded to the backend (see setForwardedHeaders);
+// every internal decision still keyed off the upstream proxy's address.
+func (s *HTTPServer) realClientIP(r *http.Request) string {
+	peer, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		peer = r.RemoteAddr
+	}
+	peerIP := net.ParseIP(peer)
+	if peerIP == nil || !s.ipTrusted(peerIP) {
+		// Direct/untrusted client — never believe forwarding headers.
+		return peer
+	}
+	// Peer is a trusted proxy: believe its forwarding headers.
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			ip := strings.TrimSpace(parts[i])
+			parsed := net.ParseIP(ip)
+			if parsed == nil {
+				continue // skip malformed entries
+			}
+			if s.ipTrusted(parsed) {
+				continue // another trusted hop — keep walking toward the origin
+			}
+			return ip // first untrusted, valid entry = the real client
+		}
+	}
+	if xr := strings.TrimSpace(r.Header.Get("X-Real-IP")); net.ParseIP(xr) != nil {
+		return xr
+	}
+	return peer
+}
+
+// ipTrusted reports whether ip falls within the listener's configured
+// trusted_proxies CIDRs.
+func (s *HTTPServer) ipTrusted(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	for _, cidr := range s.TrustedProxies {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // applyRequestHeaders applies header add/set/remove to the request.
 // expandRedirectVars substitutes variables in redirect URLs.
 // Supported: ${host}, ${path}, ${query}, ${scheme}, ${uri}, ${port}
@@ -948,7 +1015,7 @@ func applyResponseHeaders(h http.Header, cfg *config.HeadersConfig) {
 }
 
 // handleWebSocket handles WebSocket upgrade requests by hijacking and relaying.
-func (s *HTTPServer) handleWebSocket(w http.ResponseWriter, r *http.Request, balancer lb.Balancer, backendName string) {
+func (s *HTTPServer) handleWebSocket(w http.ResponseWriter, r *http.Request, balancer lb.Balancer, backendName string, clientIP string) {
 	target, err := balancer.Next()
 	if err != nil {
 		s.serveError(w, http.StatusServiceUnavailable)
@@ -986,7 +1053,7 @@ func (s *HTTPServer) handleWebSocket(w http.ResponseWriter, r *http.Request, bal
 	}
 	defer clientConn.Close()
 
-	logging.Info("[WS] %s -> %s (%s)", r.RemoteAddr, target, backendName)
+	logging.Info("[WS] %s -> %s (%s)", clientIP, target, backendName)
 
 	// Bidirectional relay
 	done := make(chan struct{})
