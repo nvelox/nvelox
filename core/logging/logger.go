@@ -189,6 +189,25 @@ func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes in
 		SanitizeLogField(backend))
 }
 
+// AccessL4 logs one raw TCP/UDP connection (or rejection) to the SAME access log
+// as AccessHTTP, so the existing shipper/queue/consumer pick it up unchanged. The
+// ` - l4 ` marker distinguishes it from an HTTP record:
+//
+//	<clientIP> - l4 <proto>/<dstPort> <status> <bytesIn> <bytesOut> <durMs>ms
+//	  e.g. 203.0.113.5 - l4 tcp/7000 no_route 0 0 0.400ms
+//
+// clientIP MUST be the real client (the PROXY-protocol-decoded source for
+// cross-region, not the relay). proto is "tcp"|"udp"; status is a short token
+// (ok|no_route|refused|ratelimited|timeout|error). Fields are CRLF-sanitized.
+func AccessL4(clientIP, proto string, dstPort int, status string, bytesIn, bytesOut int64, durationMs float64) {
+	current.Load().accessLog.Printf("%s - l4 %s/%d %s %d %d %.3fms",
+		SanitizeLogField(clientIP),
+		SanitizeLogField(proto),
+		dstPort,
+		SanitizeLogField(status),
+		bytesIn, bytesOut, durationMs)
+}
+
 func Fatal(format string, v ...interface{}) {
 	current.Load().errorLog.Output(2, fmt.Sprintf("[FATAL] "+format, v...))
 	os.Exit(1)

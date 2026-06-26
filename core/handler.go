@@ -46,6 +46,14 @@ type ConnContext struct {
 	Buffer        []byte      // Buffer for data received before backend is connected
 	BackendServer string      // Original value from balancer.Next() (matches conns map key)
 	BalancerRef   lb.Balancer // Reference for OnDisconnect in OnClose
+	// L4 access logging (one record per connection at close, via logging.AccessL4):
+	// the protocol, the dialed (listener) port, and the REAL client — the
+	// PROXY-v2-decoded source for a cross-region/trusted peer, NOT the relay. Proto
+	// and DstPort are set once at OnOpen; RealClientIP defaults to the peer and is
+	// upgraded to the parsed client when a trusted inbound PROXY-v2 header resolves.
+	Proto        string
+	DstPort      int
+	RealClientIP string
 	// ProxyHeader, when non-nil, is prepended to each datagram written to
 	// PeerConn. Built once per session in connectBackendUDP when the
 	// backend has send_proxy_v2: true (or, for StripInbound conns, in OnData
@@ -100,22 +108,29 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 		return
 	}
 
+	dstPort := portOf(localAddr)
+
 	// Check rate limit
 	if rl, ok := h.engine.RateLimiters[l.Name]; ok {
 		if !rl.Allow() {
 			logging.Warn("[RATE] Connection from %s rejected (rate limit on %s)", c.RemoteAddr(), l.Name)
+			// L4 access record so ngris-sentinel sees the rejected flood (ratelimited→429).
+			logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, "ratelimited", 0, 0, 0)
 			c.Close()
 			return
 		}
 	}
 
-	logging.Info("[CONN] New %s client %s -> :%d", l.Protocol, c.RemoteAddr(), portOf(localAddr))
+	logging.Info("[CONN] New %s client %s -> :%d", l.Protocol, c.RemoteAddr(), dstPort)
 
 	h.engine.ActiveConns.Add(1)
 
 	clientCtx := &ConnContext{
-		IsBackend: false,
-		StartTime: time.Now(),
+		IsBackend:    false,
+		StartTime:    time.Now(),
+		Proto:        l.Protocol,
+		DstPort:      dstPort,
+		RealClientIP: ipStrOf(c.RemoteAddr()), // upgraded to the PROXY-v2 client if a trusted header resolves
 	}
 	h.setCtx(c, clientCtx)
 
@@ -134,6 +149,9 @@ func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
 	backendServer := ctx.BackendServer
 	balancerRef := ctx.BalancerRef
 	isBackend := ctx.IsBackend
+	proto := ctx.Proto
+	dstPort := ctx.DstPort
+	realClientIP := ctx.RealClientIP
 	ctx.PeerConn = nil // prevent double-close
 	ctx.Mu.Unlock()
 
@@ -148,6 +166,17 @@ func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
 
 	if !isBackend {
 		logging.Info("[CONN] Closed %s (Dur: %v, Err: %v)", c.RemoteAddr(), time.Since(ctx.StartTime), err)
+		// L4 access record (mirrors AccessHTTP for HTTP). A backend was linked iff
+		// peer!=nil at close → "ok"; otherwise the connection never reached a backend
+		// (no active tunnel on the dialed port) → "no_route", the L4 analogue of a 404
+		// that drives ngris-sentinel's port-scan fan-out heuristic. Bytes are not
+		// accumulated in v1 (the heuristics key off port fan-out + status, not volume).
+		status := "no_route"
+		if peer != nil {
+			status = "ok"
+		}
+		durMs := float64(time.Since(ctx.StartTime).Nanoseconds()) / 1e6
+		logging.AccessL4(realClientIP, proto, dstPort, status, 0, 0, durMs)
 		h.engine.ActiveConns.Done()
 	}
 }
@@ -172,9 +201,10 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 	if stripInbound {
 		if src, consumed, isProxy := parseInboundProxyV2Datagram(data); isProxy {
 			data = data[consumed:]
-			if sendProxyV2 && src != nil {
+			if src != nil {
 				ctx.Mu.Lock()
-				if ctx.ProxyHeader == nil {
+				ctx.RealClientIP = ipStrOf(src) // the real UDP client (not the relay) for the L4 access record
+				if sendProxyV2 && ctx.ProxyHeader == nil {
 					var buf bytes.Buffer
 					if err := proxy.WriteProxyHeaderV2(&buf, src, localAddr); err == nil {
 						ctx.ProxyHeader = buf.Bytes()
@@ -324,6 +354,7 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 		// Link client to backend
 		clientCtx.Mu.Lock()
 		clientCtx.PeerConn = backendConn
+		clientCtx.RealClientIP = ipStrOf(src) // the resolved client (PROXY-v2 source if trusted, else peer) for the L4 access record
 
 		// Notify balancer
 		balancer.OnConnect(balancerKey)
@@ -555,6 +586,18 @@ func portOf(addr net.Addr) int {
 		return a.Port
 	}
 	return 0
+}
+
+// ipStrOf is the string form of the existing ipOf(addr) net.IP helper, "" when the
+// IP can't be resolved — used for the L4 access record's client field.
+func ipStrOf(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	if ip := ipOf(addr); ip != nil {
+		return ip.String()
+	}
+	return ""
 }
 
 // writeWithProxy writes data to peer, optionally prepending a PROXY v2

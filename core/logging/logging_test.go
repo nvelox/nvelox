@@ -87,15 +87,15 @@ func TestSanitizeLogField(t *testing.T) {
 		in, want string
 	}{
 		{"", ""},
-		{"/api/v1/users", "/api/v1/users"},                                // clean ASCII fast path
-		{"/path\nINJECTED", "/path\\nINJECTED"},                           // LF → \n literal
-		{"/path\rINJECTED", "/path\\rINJECTED"},                           // CR → \r literal
-		{"/path\tINJECTED", "/path\\tINJECTED"},                           // TAB → \t literal
-		{"/path\r\nGET /secret", "/path\\r\\nGET /secret"},                // CRLF attack
-		{"/path\x00\x01\x02", "/path???"},                                 // other controls → ?
-		{"/path\x7f", "/path?"},                                           // DEL → ?
-		{"normal text with space", "normal text with space"},              // space preserved
-		{"unicode ☃ éclair", "unicode ☃ éclair"},                          // multibyte UTF-8 preserved
+		{"/api/v1/users", "/api/v1/users"},                   // clean ASCII fast path
+		{"/path\nINJECTED", "/path\\nINJECTED"},              // LF → \n literal
+		{"/path\rINJECTED", "/path\\rINJECTED"},              // CR → \r literal
+		{"/path\tINJECTED", "/path\\tINJECTED"},              // TAB → \t literal
+		{"/path\r\nGET /secret", "/path\\r\\nGET /secret"},   // CRLF attack
+		{"/path\x00\x01\x02", "/path???"},                    // other controls → ?
+		{"/path\x7f", "/path?"},                              // DEL → ?
+		{"normal text with space", "normal text with space"}, // space preserved
+		{"unicode ☃ éclair", "unicode ☃ éclair"},             // multibyte UTF-8 preserved
 	}
 	for _, c := range cases {
 		got := SanitizeLogField(c.in)
@@ -133,6 +133,26 @@ func TestAccessHTTP_LogInjection(t *testing.T) {
 	}
 	if !strings.Contains(s, "\\n10.0.0.1") {
 		t.Errorf("expected escaped '\\n10.0.0.1' in sanitized output, got: %q", s)
+	}
+}
+
+// TestAccessL4_Format locks the L4 access-line format to exactly what the
+// ngris-sentinel parser (l4Re) expects: "<ip> - l4 <proto>/<port> <status> <in> <out> <durMs>ms".
+func TestAccessL4_Format(t *testing.T) {
+	tmpDir := t.TempDir()
+	accessPath := filepath.Join(tmpDir, "access.log")
+	if err := Init("debug", accessPath, ""); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+	AccessL4("203.0.113.5", "tcp", 7000, "no_route", 0, 0, 0.4)
+	content, err := os.ReadFile(accessPath)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	got := strings.TrimRight(string(content), "\n")
+	want := "203.0.113.5 - l4 tcp/7000 no_route 0 0 0.400ms"
+	if got != want {
+		t.Errorf("AccessL4 line = %q, want %q", got, want)
 	}
 }
 
