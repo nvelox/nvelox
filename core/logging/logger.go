@@ -8,7 +8,29 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"unicode/utf8"
 )
+
+// maxUALogLen bounds the User-Agent written to the access log. The UA is
+// attacker-controlled and effectively only capped by the server's max header size
+// (~1MB), so without a clip a single request could emit a multi-KB log line. Because
+// the UA is the LAST field, an oversized line that a downstream shipper truncates
+// would lose its closing quote and corrupt the record — an attacker could pad their UA
+// to push their own request past the shipper's per-line limit and evade log-based
+// detection entirely. 512 bytes is ample for any legitimate UA.
+const maxUALogLen = 512
+
+// clipUA bounds s to at most maxUALogLen bytes without splitting a UTF-8 rune.
+func clipUA(s string) string {
+	if len(s) <= maxUALogLen {
+		return s
+	}
+	cut := maxUALogLen
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
 
 type Level int
 
@@ -175,18 +197,22 @@ func SanitizeLogField(s string) string {
 // no-op; we do it anyway as defense-in-depth against future callers passing a
 // less-validated value. host is the requested vhost (r.Host); an empty host is
 // logged as "-".
-func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes int64, duration float64, backend string) {
+func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes int64, duration float64, backend, userAgent string) {
 	if host == "" {
 		host = "-"
 	}
-	current.Load().accessLog.Printf("%s - %s \"%s %s %s\" %d %d %.3fms -> %s",
+	// User-Agent is appended LAST as a quoted field so a consumer can make it optional
+	// and stay back-compatible with the old (UA-less) format. CRLF-sanitized like the
+	// rest; the UA is attacker-controlled.
+	current.Load().accessLog.Printf("%s - %s \"%s %s %s\" %d %d %.3fms -> %s \"%s\"",
 		SanitizeLogField(clientIP),
 		SanitizeLogField(host),
 		SanitizeLogField(method),
 		SanitizeLogField(path),
 		SanitizeLogField(proto),
 		status, bytes, duration,
-		SanitizeLogField(backend))
+		SanitizeLogField(backend),
+		SanitizeLogField(clipUA(userAgent)))
 }
 
 // AccessL4 logs one raw TCP/UDP connection (or rejection) to the SAME access log

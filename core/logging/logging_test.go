@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestInit(t *testing.T) {
@@ -114,11 +115,12 @@ func TestAccessHTTP_LogInjection(t *testing.T) {
 		t.Fatalf("Init failed: %v", err)
 	}
 
-	// Attacker-controlled path AND Host header both try to inject a fake
-	// log entry — both must be sanitized.
+	// Attacker-controlled path, Host header AND User-Agent all try to inject a
+	// fake log entry — all must be sanitized.
 	evilPath := "/legit\n10.0.0.1 - \"GET /admin HTTP/1.1\" 200 0 0.000ms -> backend"
 	evilHost := "victim.example\nINJECTED"
-	AccessHTTP("1.2.3.4", evilHost, "GET", evilPath, "HTTP/1.1", 200, 0, 0.1, "upstream:80")
+	evilUA := "sqlmap/1.5\nINJECTED-VIA-UA"
+	AccessHTTP("1.2.3.4", evilHost, "GET", evilPath, "HTTP/1.1", 200, 0, 0.1, "upstream:80", evilUA)
 
 	content, err := os.ReadFile(accessPath)
 	if err != nil {
@@ -133,6 +135,26 @@ func TestAccessHTTP_LogInjection(t *testing.T) {
 	}
 	if !strings.Contains(s, "\\n10.0.0.1") {
 		t.Errorf("expected escaped '\\n10.0.0.1' in sanitized output, got: %q", s)
+	}
+}
+
+// TestAccessHTTP_UAClipped verifies the attacker-controlled User-Agent is length-bounded
+// (so a multi-KB UA can't blow up the log line and risk shipper truncation) and the clip
+// is rune-safe (never splits a UTF-8 sequence).
+func TestAccessHTTP_UAClipped(t *testing.T) {
+	// Multi-byte runes (é = 2 bytes) so a naive byte-cut could split one.
+	hugeUA := strings.Repeat("é", 4000) // 8000 bytes
+	got := clipUA(hugeUA)
+	if len(got) > maxUALogLen {
+		t.Errorf("clipUA len=%d want <= %d", len(got), maxUALogLen)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("clipUA produced invalid UTF-8 (split a rune)")
+	}
+	// A normal-length UA is returned unchanged.
+	const normal = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+	if clipUA(normal) != normal {
+		t.Errorf("clipUA mutated a normal UA")
 	}
 }
 

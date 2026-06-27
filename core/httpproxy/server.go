@@ -769,7 +769,7 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	duration := float64(time.Since(start).Microseconds()) / 1000.0
-	logging.AccessHTTP(clientIP, r.Host, r.Method, r.URL.Path, r.Proto, rec.status, rec.bytes, duration, lastTarget)
+	logging.AccessHTTP(clientIP, r.Host, r.Method, r.URL.Path, r.Proto, rec.status, rec.bytes, duration, lastTarget, r.UserAgent())
 }
 
 // getStickyKey returns the session key based on the sticky session config.
