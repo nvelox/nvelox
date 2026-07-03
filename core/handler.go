@@ -181,15 +181,18 @@ func (h *ProxyEventHandler) l4Denied(addr net.Addr, peerTrusted bool) bool {
 }
 
 // closeOnOpen closes a connection being REJECTED from OnOpen (rate-limit or
-// denylist). It must NOT call c.Close() directly: nbio's addConn calls OnOpen and
-// only AFTER it returns registers the fd with the poller (addRead). Closing the
-// fd synchronously inside OnOpen makes that addRead fail with EBADF ("addConn
-// failed: bad file descriptor") and, under fd reuse, can orphan a reused fd — a
-// leaked connection that never gets served and lingers until timeout. Conn.Execute
-// defers the close onto the engine job pool, which runs after addConn has finished
-// — the nbio-intended pattern for post-callback work on a connection.
+// denylist). It must NOT close synchronously: nbio's addConn calls OnOpen and
+// only AFTER it returns registers the fd with the poller (addRead). A synchronous
+// close makes that addRead fail with EBADF ("addConn [fd] failed: bad file
+// descriptor") and, under fd reuse, orphans the reused fd — a leaked connection
+// that lingers until timeout. Conn.Execute is NOT a fix here: nvelox runs nbio
+// with the default (inline) Engine.Execute, which runs the job synchronously in
+// place. A real goroutine is genuinely deferred — OnOpen returns and addConn
+// finishes registering the fd (nanoseconds) long before the Go scheduler can
+// dispatch this goroutine, so addRead always succeeds and the close then runs
+// through nbio's normal, fd-registered path.
 func closeOnOpen(c *nbio.Conn) {
-	c.Execute(func() { c.Close() })
+	go func() { _ = c.Close() }()
 }
 
 func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
