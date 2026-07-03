@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"nvelox/config"
+	"nvelox/core/denylist"
 	"nvelox/core/logging"
 	"nvelox/lb"
 	"nvelox/proxy"
@@ -137,6 +138,18 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 		}
 	}
 
+	// Dynamic denylist (sentinel-pushed runtime blocks): honor on the L4 accept
+	// path the same blocks the HTTP plane enforces (httpproxy Blocked() gate), so
+	// TCP and UDP drop blocked clients too. Enforced on the immediate peer only
+	// when it IS the client (untrusted/direct) — for a trusted relay the peer is
+	// infra and the real client isn't known until OnData parses PROXY-v2 (gated
+	// there). Mirrors the rate-limiter's peer-scoped enforcement above.
+	if h.l4Denied(c.RemoteAddr(), peerTrusted) {
+		logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, "denylisted", 0, 0, 0)
+		c.Close()
+		return
+	}
+
 	logging.Info("[CONN] New %s client %s -> :%d", l.Protocol, c.RemoteAddr(), dstPort)
 
 	h.engine.ActiveConns.Add(1)
@@ -152,6 +165,19 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 	h.setCtx(c, clientCtx)
 
 	h.connectBackend(c, l)
+}
+
+// l4Denied reports whether an L4 (TCP/UDP) connection from addr must be dropped
+// by the dynamic denylist. Only the immediate peer is consulted, and only when
+// it is the real client (untrusted/direct): a trusted relay's peer IS infra, so
+// blocking it would sever cross-region traffic — the real client behind such a
+// relay is enforced in OnData once PROXY-v2 resolves it.
+func (h *ProxyEventHandler) l4Denied(addr net.Addr, peerTrusted bool) bool {
+	if peerTrusted || addr == nil {
+		return false
+	}
+	ip := ipOf(addr)
+	return ip != nil && denylist.Default.Blocked(ip)
 }
 
 func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
@@ -220,15 +246,24 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 	stripInbound := ctx.StripInbound
 	sendProxyV2 := ctx.SendProxyV2
 	localAddr := ctx.LocalAddr
+	proto := ctx.Proto
+	dstPort := ctx.DstPort
 	ctx.Mu.Unlock()
 	if stripInbound {
 		if src, consumed, isProxy := parseInboundProxyV2Datagram(data); isProxy {
 			data = data[consumed:]
 			if src != nil {
+				resolvedBlocked := false
 				ctx.Mu.Lock()
 				if !ctx.ClientResolved { // set-once: the real UDP client (not the relay) for the L4 access record
 					ctx.RealClientIP = ipStrOf(src)
 					ctx.ClientResolved = true
+					// Dynamic denylist on the REAL client behind a trusted relay
+					// (cross-region UDP): the OnOpen peer gate only saw the relay,
+					// so enforce here, once, when the client is first resolved.
+					if ip := ipOf(src); ip != nil {
+						resolvedBlocked = denylist.Default.Blocked(ip)
+					}
 				}
 				if sendProxyV2 && ctx.ProxyHeader == nil {
 					var buf bytes.Buffer
@@ -239,6 +274,11 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 					}
 				}
 				ctx.Mu.Unlock()
+				if resolvedBlocked {
+					logging.AccessL4(ipStrOf(src), proto, dstPort, "denylisted", 0, 0, 0)
+					c.Close()
+					return
+				}
 			}
 		}
 	}
