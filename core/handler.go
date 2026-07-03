@@ -133,7 +133,7 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 			if !peerTrusted {
 				logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, "ratelimited", 0, 0, 0)
 			}
-			c.Close()
+			closeOnOpen(c)
 			return
 		}
 	}
@@ -146,7 +146,7 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 	// there). Mirrors the rate-limiter's peer-scoped enforcement above.
 	if h.l4Denied(c.RemoteAddr(), peerTrusted) {
 		logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, "denylisted", 0, 0, 0)
-		c.Close()
+		closeOnOpen(c)
 		return
 	}
 
@@ -178,6 +178,18 @@ func (h *ProxyEventHandler) l4Denied(addr net.Addr, peerTrusted bool) bool {
 	}
 	ip := ipOf(addr)
 	return ip != nil && denylist.Default.Blocked(ip)
+}
+
+// closeOnOpen closes a connection being REJECTED from OnOpen (rate-limit or
+// denylist). It must NOT call c.Close() directly: nbio's addConn calls OnOpen and
+// only AFTER it returns registers the fd with the poller (addRead). Closing the
+// fd synchronously inside OnOpen makes that addRead fail with EBADF ("addConn
+// failed: bad file descriptor") and, under fd reuse, can orphan a reused fd — a
+// leaked connection that never gets served and lingers until timeout. Conn.Execute
+// defers the close onto the engine job pool, which runs after addConn has finished
+// — the nbio-intended pattern for post-callback work on a connection.
+func closeOnOpen(c *nbio.Conn) {
+	c.Execute(func() { c.Close() })
 }
 
 func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
