@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual re-run: dispatch against an existing tag (Run workflow → pick the tag,
+  # or `gh workflow run goreleaser --ref vX.Y.Z`) to (re)build a release when the
+  # tag-push event didn't fire. GoReleaser reads the version from the checked-out
+  # tag, so dispatch against the TAG ref (not a branch), else it builds a snapshot.
+  workflow_dispatch: {}
 
 permissions:
   contents: write
