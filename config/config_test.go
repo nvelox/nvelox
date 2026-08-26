@@ -230,6 +230,46 @@ func TestValidation_ServerAddress(t *testing.T) {
 	}
 }
 
+func TestValidation_ACL(t *testing.T) {
+	tests := []struct {
+		name    string
+		acl     []ACLRule
+		wantErr bool
+	}{
+		{"valid allow + deny 404", []ACLRule{
+			{Match: ACLMatch{PathRegex: `^/admin(/|$)`, SourceIP: []string{"10.0.0.253/32"}}, Action: "allow"},
+			{Match: ACLMatch{PathRegex: `^/admin(/|$)`}, Action: "deny", Status: 404},
+		}, false},
+		{"valid path_prefix deny default status", []ACLRule{
+			{Match: ACLMatch{PathPrefix: "/internal"}, Action: "deny"},
+		}, false},
+		{"unknown action", []ACLRule{
+			{Match: ACLMatch{PathPrefix: "/x"}, Action: "block"},
+		}, true},
+		{"status out of range", []ACLRule{
+			{Match: ACLMatch{PathPrefix: "/x"}, Action: "deny", Status: 99},
+		}, true},
+		{"invalid path_regex", []ACLRule{
+			{Match: ACLMatch{PathRegex: "([unclosed"}, Action: "deny"},
+		}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				Version:  "2",
+				Backends: []Backend{{Name: "b1", Servers: []string{"10.0.0.1:80"}}},
+				Listeners: []Listener{{
+					Name: "l1", Bind: ":80", Protocol: "http", Backend: "b1", ACL: tt.acl,
+				}},
+			}
+			err := validate(cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidation_BindAddress(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -389,23 +429,23 @@ func TestValidation_FullValid(t *testing.T) {
 		Logging: LoggingConfig{Level: "info"},
 		Listeners: []Listener{
 			{
-				Name:           "http",
-				Bind:           ":80",
-				Protocol:       "tcp",
-				Backend: "web",
+				Name:     "http",
+				Bind:     ":80",
+				Protocol: "tcp",
+				Backend:  "web",
 			},
 			{
-				Name:           "https",
-				Bind:           ":443",
-				Protocol:       "tcp",
-				Backend: "web",
-				TLS:            TLSConfig{Cert: certFile, Key: keyFile},
+				Name:     "https",
+				Bind:     ":443",
+				Protocol: "tcp",
+				Backend:  "web",
+				TLS:      TLSConfig{Cert: certFile, Key: keyFile},
 			},
 			{
-				Name:           "range",
-				Bind:           "0.0.0.0:3000-3005",
-				Protocol:       "tcp",
-				Backend: "web",
+				Name:     "range",
+				Bind:     "0.0.0.0:3000-3005",
+				Protocol: "tcp",
+				Backend:  "web",
 			},
 		},
 		Backends: []Backend{
@@ -619,14 +659,14 @@ func TestValidateServerName(t *testing.T) {
 
 	bad := []string{
 		"",
-		"*.*.foo.com",      // multiple wildcards
-		"foo.*",            // right-prefix wildcard
-		"foo.*.com",        // mid wildcard
-		"*.",               // wildcard with no hostname
-		"https://foo.com",  // scheme
-		"foo.com/bar",      // path
-		"foo.com:8080",     // port
-		"foo .com",         // space
+		"*.*.foo.com",     // multiple wildcards
+		"foo.*",           // right-prefix wildcard
+		"foo.*.com",       // mid wildcard
+		"*.",              // wildcard with no hostname
+		"https://foo.com", // scheme
+		"foo.com/bar",     // path
+		"foo.com:8080",    // port
+		"foo .com",        // space
 	}
 	for _, s := range bad {
 		if err := validateServerName(s); err == nil {
@@ -726,8 +766,16 @@ func TestValidateBindGroups_Rejections(t *testing.T) {
 		{
 			name: "duplicate server_name across sites",
 			in: []Listener{
-				func() Listener { l := mkListener("a", ":443", "https"); l.ServerNames = []string{"api.foo.com"}; return l }(),
-				func() Listener { l := mkListener("b", ":443", "https"); l.ServerNames = []string{"api.foo.com"}; return l }(),
+				func() Listener {
+					l := mkListener("a", ":443", "https")
+					l.ServerNames = []string{"api.foo.com"}
+					return l
+				}(),
+				func() Listener {
+					l := mkListener("b", ":443", "https")
+					l.ServerNames = []string{"api.foo.com"}
+					return l
+				}(),
 			},
 			want: "claimed by both",
 		},

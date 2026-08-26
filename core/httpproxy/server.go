@@ -438,11 +438,15 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// ACL check
+	// ACL check. A deny may carry a custom status (e.g. 404 to hide an admin
+	// surface from unauthorized clients); default to 403 when unset.
 	if s.ACLEngine != nil {
-		action := s.ACLEngine.CheckClientIP(r, net.ParseIP(clientIP))
+		action, status := s.ACLEngine.DecideClientIP(r, net.ParseIP(clientIP))
 		if action == "deny" {
-			s.serveError(w, http.StatusForbidden)
+			if status == 0 {
+				status = http.StatusForbidden
+			}
+			s.serveError(w, status)
 			return
 		}
 	}

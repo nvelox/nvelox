@@ -3,6 +3,7 @@ package acl
 import (
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"nvelox/config"
@@ -10,10 +11,13 @@ import (
 
 // CompiledRule is a pre-compiled ACL rule for fast matching.
 type CompiledRule struct {
-	Networks []*net.IPNet
-	Methods  map[string]bool
-	Headers  map[string]string // header name -> required value
-	Action   string            // "allow" or "deny"
+	Networks   []*net.IPNet
+	Methods    map[string]bool
+	Headers    map[string]string // header name -> required value
+	PathPrefix string            // request path must start with this (if set)
+	PathRegex  *regexp.Regexp    // request path must match this (if set)
+	Action     string            // "allow" or "deny"
+	Status     int               // HTTP status for a matched "deny" (0 = default 403)
 }
 
 // Engine evaluates ACL rules against HTTP requests.
@@ -27,6 +31,15 @@ func NewEngine(rules []config.ACLRule) *Engine {
 	for _, r := range rules {
 		cr := CompiledRule{
 			Action: r.Action,
+			Status: r.Status,
+		}
+
+		// Compile path conditions. A path_regex that fails to compile is
+		// dropped to nil here; config validation (validate() in config)
+		// rejects bad regexes at startup, so this is only defense-in-depth.
+		cr.PathPrefix = r.Match.PathPrefix
+		if r.Match.PathRegex != "" {
+			cr.PathRegex, _ = regexp.Compile(r.Match.PathRegex)
 		}
 
 		// Compile source IP CIDRs
@@ -78,15 +91,35 @@ func (e *Engine) Check(r *http.Request) string {
 // trusted proxy's X-Forwarded-For) instead of the raw connection peer. A
 // nil clientIP simply never matches a source-IP rule.
 func (e *Engine) CheckClientIP(r *http.Request, clientIP net.IP) string {
+	action, _ := e.DecideClientIP(r, clientIP)
+	return action
+}
+
+// DecideClientIP is like CheckClientIP but also returns the HTTP status the
+// caller should use when the winning rule is a "deny". The status is 0 for an
+// "allow" or no match, and for a "deny" it is the rule's configured Status or 0
+// if unset (the caller applies its own default, conventionally 403). The first
+// matching rule wins.
+func (e *Engine) DecideClientIP(r *http.Request, clientIP net.IP) (string, int) {
 	for _, rule := range e.rules {
 		if e.matches(r, clientIP, &rule) {
-			return rule.Action
+			return rule.Action, rule.Status
 		}
 	}
-	return "" // no rule matched
+	return "", 0 // no rule matched
 }
 
 func (e *Engine) matches(r *http.Request, clientIP net.IP, rule *CompiledRule) bool {
+	// Check path prefix
+	if rule.PathPrefix != "" && !strings.HasPrefix(r.URL.Path, rule.PathPrefix) {
+		return false
+	}
+
+	// Check path regex
+	if rule.PathRegex != nil && !rule.PathRegex.MatchString(r.URL.Path) {
+		return false
+	}
+
 	// Check source IP
 	if len(rule.Networks) > 0 {
 		matched := false
