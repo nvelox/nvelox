@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -197,13 +198,25 @@ type IPRateLimitConfig struct {
 type ACLRule struct {
 	Match  ACLMatch `yaml:"match"`
 	Action string   `yaml:"action"` // "allow" or "deny"
+	// Status is the HTTP status returned when a "deny" rule matches. Optional;
+	// defaults to 403 Forbidden. Set it to 404 to hide the existence of a path
+	// (e.g. an admin surface) from unauthorized clients rather than advertising
+	// it with a Forbidden. Ignored for "allow" rules.
+	Status int `yaml:"status,omitempty"`
 }
 
-// ACLMatch defines conditions for an ACL rule.
+// ACLMatch defines conditions for an ACL rule. All specified conditions must
+// match (AND); an empty field is a wildcard for that dimension.
 type ACLMatch struct {
 	SourceIP []string          `yaml:"source_ip,omitempty"` // CIDR notation
 	Method   []string          `yaml:"method,omitempty"`
 	Headers  map[string]string `yaml:"headers,omitempty"`
+	// PathPrefix matches when the request path starts with this string.
+	PathPrefix string `yaml:"path_prefix,omitempty"`
+	// PathRegex matches when the request path matches this RE2 regular
+	// expression. Prefer this over PathPrefix for boundary-safe matches, e.g.
+	// "^/admin(/|$)" so "/administrator" is not caught.
+	PathRegex string `yaml:"path_regex,omitempty"`
 }
 
 // RateLimitConfig defines per-listener connection rate limiting.
@@ -678,6 +691,25 @@ func validate(cfg *Config) error {
 				}
 				if r.Match.Host == "" && r.Match.PathPrefix == "" && r.Match.PathRegex == "" {
 					return fmt.Errorf("listener %s: route %d must have at least host, path_prefix, or path_regex", l.Name, i)
+				}
+			}
+			// Validate ACL rules: known action, sane deny status, and a
+			// compilable path_regex. A bad ACL regex must fail startup rather
+			// than silently letting a security rule never match.
+			for i, a := range l.ACL {
+				if a.Action != "allow" && a.Action != "deny" {
+					return fmt.Errorf("listener %s: acl %d: action must be 'allow' or 'deny', got %q", l.Name, i, a.Action)
+				}
+				if a.Status != 0 && (a.Status < 100 || a.Status > 599) {
+					return fmt.Errorf("listener %s: acl %d: status %d out of range (100-599)", l.Name, i, a.Status)
+				}
+				if a.Match.PathRegex != "" {
+					if len(a.Match.PathRegex) > 1024 {
+						return fmt.Errorf("listener %s: acl %d: path_regex too long", l.Name, i)
+					}
+					if _, err := regexp.Compile(a.Match.PathRegex); err != nil {
+						return fmt.Errorf("listener %s: acl %d: invalid path_regex: %v", l.Name, i, err)
+					}
 				}
 			}
 		}

@@ -185,5 +185,68 @@ func TestACL_NoRules(t *testing.T) {
 	}
 }
 
+// TestACL_AdminPathAllowlist covers the canonical "admin surface" pattern:
+// allow /admin only from a single management IP, and return 404 (not 403) to
+// everyone else so the path's existence stays hidden. Non-/admin paths are
+// unaffected regardless of source IP.
+func TestACL_AdminPathAllowlist(t *testing.T) {
+	engine := NewEngine([]config.ACLRule{
+		{
+			Match:  config.ACLMatch{PathRegex: `^/admin(/|$)`, SourceIP: []string{"10.0.0.253/32"}},
+			Action: "allow",
+		},
+		{
+			Match:  config.ACLMatch{PathRegex: `^/admin(/|$)`},
+			Action: "deny",
+			Status: http.StatusNotFound,
+		},
+	})
+
+	cases := []struct {
+		name       string
+		path       string
+		clientIP   string
+		wantAction string
+		wantStatus int
+	}{
+		{"admin from mgmt IP allowed", "/admin", "10.0.0.253", "allow", 0},
+		{"admin subpath from mgmt IP allowed", "/admin/users/1", "10.0.0.253", "allow", 0},
+		{"admin from other IP denied 404", "/admin", "203.0.113.7", "deny", http.StatusNotFound},
+		{"admin subpath from other IP denied 404", "/admin/users", "203.0.113.7", "deny", http.StatusNotFound},
+		{"non-admin path from other IP passes", "/dashboard", "203.0.113.7", "", 0},
+		{"admin-lookalike is not caught", "/administrator", "203.0.113.7", "", 0},
+		{"non-admin from mgmt IP passes", "/", "10.0.0.253", "", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest("GET", tc.path, nil)
+			r.RemoteAddr = "192.0.2.1:443" // peer irrelevant; decision uses resolved client
+			action, status := engine.DecideClientIP(r, net.ParseIP(tc.clientIP))
+			if action != tc.wantAction {
+				t.Errorf("action = %q, want %q", action, tc.wantAction)
+			}
+			if status != tc.wantStatus {
+				t.Errorf("status = %d, want %d", status, tc.wantStatus)
+			}
+		})
+	}
+}
+
+// TestACL_PathPrefixMatch covers the path_prefix condition (as opposed to
+// path_regex), including that other dimensions still AND together.
+func TestACL_PathPrefixMatch(t *testing.T) {
+	engine := NewEngine([]config.ACLRule{
+		{Match: config.ACLMatch{PathPrefix: "/internal"}, Action: "deny", Status: http.StatusNotFound},
+	})
+	deny := httptest.NewRequest("GET", "/internal/metrics", nil)
+	if action, status := engine.DecideClientIP(deny, net.ParseIP("203.0.113.1")); action != "deny" || status != http.StatusNotFound {
+		t.Errorf("expected deny/404 for /internal/*, got %q/%d", action, status)
+	}
+	pass := httptest.NewRequest("GET", "/public", nil)
+	if action, _ := engine.DecideClientIP(pass, net.ParseIP("203.0.113.1")); action != "" {
+		t.Errorf("expected no match for /public, got %q", action)
+	}
+}
+
 // Ensure http import is used
 var _ = http.StatusOK

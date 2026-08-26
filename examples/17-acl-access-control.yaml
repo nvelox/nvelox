@@ -1,5 +1,9 @@
 ## 17 — ACL Access Control
-## Deny DELETE method, deny specific IP range.
+## Rules are evaluated top-down; the FIRST match wins. Each match dimension
+## (source_ip / method / headers / path_prefix / path_regex) is ANDed; an
+## omitted dimension is a wildcard. source_ip is matched against the real
+## client IP (recovered from a trusted proxy's X-Forwarded-For when
+## trusted_proxies is set), not the connection peer.
 version: "2"
 logging:
   level: "debug"
@@ -9,13 +13,28 @@ listeners:
     protocol: "http"
     backend: "backend"
     acl:
+      # Deny DELETE / PUT for everyone.
       - match:
           method: ["DELETE", "PUT"]
         action: "deny"
+      # Deny POST from a specific range.
       - match:
           source_ip: ["192.168.0.0/16"]
           method: ["POST"]
         action: "deny"
+
+      # Path-scoped IP allowlist: expose /admin ONLY to a management IP and
+      # return 404 (not 403) to everyone else, so the path's existence stays
+      # hidden. path_regex "^/admin(/|$)" is boundary-safe (won't catch
+      # "/administrator"). Order matters — the allow must precede the deny.
+      - match:
+          path_regex: "^/admin(/|$)"
+          source_ip: ["10.0.0.253/32"]
+        action: "allow"
+      - match:
+          path_regex: "^/admin(/|$)"
+        action: "deny"
+        status: 404   # optional; defaults to 403 when omitted
 backends:
   - name: "backend"
     balance: "roundrobin"
