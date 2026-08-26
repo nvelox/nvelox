@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"nvelox/config"
+	"nvelox/core/denylist"
 	"nvelox/core/logging"
 	"nvelox/lb"
 	"nvelox/proxy"
@@ -46,6 +47,21 @@ type ConnContext struct {
 	Buffer        []byte      // Buffer for data received before backend is connected
 	BackendServer string      // Original value from balancer.Next() (matches conns map key)
 	BalancerRef   lb.Balancer // Reference for OnDisconnect in OnClose
+	// L4 access logging (one record per connection at close, via logging.AccessL4):
+	// the protocol, the dialed (listener) port, and the REAL client — the
+	// PROXY-v2-decoded source for a cross-region/trusted peer, NOT the relay. Proto
+	// and DstPort are set once at OnOpen; RealClientIP defaults to the peer and is
+	// upgraded to the parsed client when a trusted inbound PROXY-v2 header resolves.
+	// PeerTrusted: the immediate peer is a trusted relay (its inbound PROXY-v2 header
+	// names the real client). ClientResolved: that header was actually parsed, so
+	// RealClientIP is the real client. When PeerTrusted && !ClientResolved we must NOT
+	// emit an L4 record — attributing it to the relay could get a peer-region relay
+	// scored/blocked (a cross-region outage).
+	Proto          string
+	DstPort        int
+	RealClientIP   string
+	PeerTrusted    bool
+	ClientResolved bool
 	// ProxyHeader, when non-nil, is prepended to each datagram written to
 	// PeerConn. Built once per session in connectBackendUDP when the
 	// backend has send_proxy_v2: true (or, for StripInbound conns, in OnData
@@ -100,26 +116,83 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 		return
 	}
 
+	dstPort := portOf(localAddr)
+	// Is the immediate peer a TRUSTED relay (cross-region)? Its inbound PROXY-v2
+	// header names the REAL client — but that isn't parsed until after the backend
+	// dial, so until then an L4 record can only carry the relay IP. Track it so the
+	// emit paths can suppress a relay-misattributed record (cross-region-outage risk).
+	peerTrusted := l.proxyTrust != nil && l.proxyTrust.trusts(c.RemoteAddr())
+
 	// Check rate limit
 	if rl, ok := h.engine.RateLimiters[l.Name]; ok {
 		if !rl.Allow() {
 			logging.Warn("[RATE] Connection from %s rejected (rate limit on %s)", c.RemoteAddr(), l.Name)
-			c.Close()
+			// Attribute the rejection only when the peer IS the client (untrusted/direct).
+			// For a trusted relay the real client is unknowable here (no header parsed
+			// yet), so emitting would misattribute the relay — suppress it.
+			if !peerTrusted {
+				logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, "ratelimited", 0, 0, 0)
+			}
+			closeOnOpen(c)
 			return
 		}
 	}
 
-	logging.Info("[CONN] New %s client %s -> :%d", l.Protocol, c.RemoteAddr(), portOf(localAddr))
+	// Dynamic denylist (sentinel-pushed runtime blocks): honor on the L4 accept
+	// path the same blocks the HTTP plane enforces (httpproxy Blocked() gate), so
+	// TCP and UDP drop blocked clients too. Enforced on the immediate peer only
+	// when it IS the client (untrusted/direct) — for a trusted relay the peer is
+	// infra and the real client isn't known until OnData parses PROXY-v2 (gated
+	// there). Mirrors the rate-limiter's peer-scoped enforcement above.
+	if h.l4Denied(c.RemoteAddr(), peerTrusted) {
+		logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, "denylisted", 0, 0, 0)
+		closeOnOpen(c)
+		return
+	}
+
+	logging.Info("[CONN] New %s client %s -> :%d", l.Protocol, c.RemoteAddr(), dstPort)
 
 	h.engine.ActiveConns.Add(1)
 
 	clientCtx := &ConnContext{
-		IsBackend: false,
-		StartTime: time.Now(),
+		IsBackend:    false,
+		StartTime:    time.Now(),
+		Proto:        l.Protocol,
+		DstPort:      dstPort,
+		RealClientIP: ipStrOf(c.RemoteAddr()), // upgraded to the PROXY-v2 client if a trusted header resolves
+		PeerTrusted:  peerTrusted,
 	}
 	h.setCtx(c, clientCtx)
 
 	h.connectBackend(c, l)
+}
+
+// l4Denied reports whether an L4 (TCP/UDP) connection from addr must be dropped
+// by the dynamic denylist. Only the immediate peer is consulted, and only when
+// it is the real client (untrusted/direct): a trusted relay's peer IS infra, so
+// blocking it would sever cross-region traffic — the real client behind such a
+// relay is enforced in OnData once PROXY-v2 resolves it.
+func (h *ProxyEventHandler) l4Denied(addr net.Addr, peerTrusted bool) bool {
+	if peerTrusted || addr == nil {
+		return false
+	}
+	ip := ipOf(addr)
+	return ip != nil && denylist.Default.Blocked(ip)
+}
+
+// closeOnOpen closes a connection being REJECTED from OnOpen (rate-limit or
+// denylist). It must NOT close synchronously: nbio's addConn calls OnOpen and
+// only AFTER it returns registers the fd with the poller (addRead). A synchronous
+// close makes that addRead fail with EBADF ("addConn [fd] failed: bad file
+// descriptor") and, under fd reuse, orphans the reused fd — a leaked connection
+// that lingers until timeout. Conn.Execute is NOT a fix here: nvelox runs nbio
+// with the default (inline) Engine.Execute, which runs the job synchronously in
+// place. A real goroutine is genuinely deferred — OnOpen returns and addConn
+// finishes registering the fd (nanoseconds) long before the Go scheduler can
+// dispatch this goroutine, so addRead always succeeds and the close then runs
+// through nbio's normal, fd-registered path.
+func closeOnOpen(c *nbio.Conn) {
+	go func() { _ = c.Close() }()
 }
 
 func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
@@ -134,6 +207,11 @@ func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
 	backendServer := ctx.BackendServer
 	balancerRef := ctx.BalancerRef
 	isBackend := ctx.IsBackend
+	proto := ctx.Proto
+	dstPort := ctx.DstPort
+	realClientIP := ctx.RealClientIP
+	peerTrusted := ctx.PeerTrusted
+	clientResolved := ctx.ClientResolved
 	ctx.PeerConn = nil // prevent double-close
 	ctx.Mu.Unlock()
 
@@ -148,6 +226,21 @@ func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
 
 	if !isBackend {
 		logging.Info("[CONN] Closed %s (Dur: %v, Err: %v)", c.RemoteAddr(), time.Since(ctx.StartTime), err)
+		// L4 access record (mirrors AccessHTTP for HTTP). A backend was linked iff
+		// peer!=nil at close → "ok"; otherwise the connection never reached a backend
+		// → "no_route" (the L4 analogue of a 404). Bytes are not accumulated in v1.
+		// SUPPRESS when the peer is a trusted relay whose real client we never resolved
+		// (connection died before its inbound PROXY-v2 header was read): attributing the
+		// record to the relay could get a peer-region relay scored/blocked. A direct
+		// (untrusted) peer IS the client, so it always emits.
+		if !peerTrusted || clientResolved {
+			status := "no_route"
+			if peer != nil {
+				status = "ok"
+			}
+			durMs := float64(time.Since(ctx.StartTime).Nanoseconds()) / 1e6
+			logging.AccessL4(realClientIP, proto, dstPort, status, 0, 0, durMs)
+		}
 		h.engine.ActiveConns.Done()
 	}
 }
@@ -168,13 +261,26 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 	stripInbound := ctx.StripInbound
 	sendProxyV2 := ctx.SendProxyV2
 	localAddr := ctx.LocalAddr
+	proto := ctx.Proto
+	dstPort := ctx.DstPort
 	ctx.Mu.Unlock()
 	if stripInbound {
 		if src, consumed, isProxy := parseInboundProxyV2Datagram(data); isProxy {
 			data = data[consumed:]
-			if sendProxyV2 && src != nil {
+			if src != nil {
+				resolvedBlocked := false
 				ctx.Mu.Lock()
-				if ctx.ProxyHeader == nil {
+				if !ctx.ClientResolved { // set-once: the real UDP client (not the relay) for the L4 access record
+					ctx.RealClientIP = ipStrOf(src)
+					ctx.ClientResolved = true
+					// Dynamic denylist on the REAL client behind a trusted relay
+					// (cross-region UDP): the OnOpen peer gate only saw the relay,
+					// so enforce here, once, when the client is first resolved.
+					if ip := ipOf(src); ip != nil {
+						resolvedBlocked = denylist.Default.Blocked(ip)
+					}
+				}
+				if sendProxyV2 && ctx.ProxyHeader == nil {
 					var buf bytes.Buffer
 					if err := proxy.WriteProxyHeaderV2(&buf, src, localAddr); err == nil {
 						ctx.ProxyHeader = buf.Bytes()
@@ -183,6 +289,11 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 					}
 				}
 				ctx.Mu.Unlock()
+				if resolvedBlocked {
+					logging.AccessL4(ipStrOf(src), proto, dstPort, "denylisted", 0, 0, 0)
+					c.Close()
+					return
+				}
 			}
 		}
 	}
@@ -324,6 +435,8 @@ func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target stri
 		// Link client to backend
 		clientCtx.Mu.Lock()
 		clientCtx.PeerConn = backendConn
+		clientCtx.RealClientIP = ipStrOf(src) // the resolved client (PROXY-v2 source if trusted, else peer) for the L4 access record
+		clientCtx.ClientResolved = true       // real client is now known → the L4 record may be emitted
 
 		// Notify balancer
 		balancer.OnConnect(balancerKey)
@@ -555,6 +668,18 @@ func portOf(addr net.Addr) int {
 		return a.Port
 	}
 	return 0
+}
+
+// ipStrOf is the string form of the existing ipOf(addr) net.IP helper, "" when the
+// IP can't be resolved — used for the L4 access record's client field.
+func ipStrOf(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	if ip := ipOf(addr); ip != nil {
+		return ip.String()
+	}
+	return ""
 }
 
 // writeWithProxy writes data to peer, optionally prepending a PROXY v2
