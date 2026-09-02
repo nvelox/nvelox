@@ -59,6 +59,10 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 	if err := logging.Init(cfg.Logging.Level, cfg.Logging.AccessLog, cfg.Logging.ErrorLog); err != nil {
 		return fmt.Errorf("failed to init logger: %v", err)
 	}
+	// Stamp this gateway's identity on every access-log line (gw=<id>) so a
+	// request can be attributed to the gateway that first received it. Empty
+	// gateway_id falls back to os.Hostname() inside SetGateway.
+	logging.SetGateway(cfg.Server.GatewayID)
 	logging.Info("Nvelox Server %s starting...", Version)
 	logging.Info("Loaded configuration from %s", *configPath)
 
@@ -116,4 +120,3 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 		return nil
 	}
 }
-

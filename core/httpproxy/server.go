@@ -120,6 +120,7 @@ type ListenerConfig struct {
 	ErrorPages     map[int]string
 	Buffering      config.BufferingConfig
 	Cache          config.CacheConfig
+	RequestID      config.RequestIDConfig
 	// Multi-server-per-port (nginx-style): SNI / Host names this site
 	// answers to, and whether it's the catch-all default for unknown SNI/Host.
 	ServerNames   []string
@@ -390,6 +391,18 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Advertise HTTP/3 if enabled
 	if s.altSvcHeader != "" {
 		w.Header().Set("Alt-Svc", s.altSvcHeader)
+	}
+
+	// Correlation id (opt-in per listener via request_id). Resolved BEFORE any
+	// gate or early return so the id is echoed on every response (including the
+	// error / redirect / static and WebSocket paths) and is available for both
+	// the upstream request and the access log. When enabled and the inbound id
+	// isn't trusted, a fresh id is minted here — making this gateway the
+	// recorded origin of the trace. See resolveRequestID for the trust policy.
+	reqID, reqIDOn := s.resolveRequestID(r)
+	if reqIDOn {
+		r.Header.Set(requestIDHeader, reqID)   // propagate to the backend (before the WebSocket / FastCGI / ReverseProxy forks)
+		w.Header().Set(requestIDHeader, reqID) // echo to the client
 	}
 
 	// Resolve the real client IP once: behind a trusted proxy this is the
@@ -773,7 +786,7 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	duration := float64(time.Since(start).Microseconds()) / 1000.0
-	logging.AccessHTTP(clientIP, r.Host, r.Method, r.URL.Path, r.Proto, rec.status, rec.bytes, duration, lastTarget, r.UserAgent())
+	logging.AccessHTTP(clientIP, r.Host, r.Method, r.URL.Path, r.Proto, rec.status, rec.bytes, duration, lastTarget, r.UserAgent(), reqID, s.Listener.Name)
 }
 
 // getStickyKey returns the session key based on the sticky session config.

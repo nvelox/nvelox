@@ -85,6 +85,7 @@ type ListenerConfig struct {
 	ErrorPages      map[int]string
 	Buffering       config.BufferingConfig
 	Cache           config.CacheConfig
+	RequestID       config.RequestIDConfig
 }
 
 func NewEngine(cfg *config.Config) *Engine {
@@ -595,6 +596,7 @@ func ExpandListeners(listeners []config.Listener) ([]*ListenerConfig, error) {
 				ErrorPages:      l.ErrorPages,
 				Buffering:       l.Buffering,
 				Cache:           l.Cache,
+				RequestID:       l.RequestID,
 				Port:            port,
 			}
 		}
@@ -656,6 +658,7 @@ func (e *Engine) buildL7Site(l *ListenerConfig) *httpproxy.HTTPServer {
 		ErrorPages:     l.ErrorPages,
 		Buffering:      l.Buffering,
 		Cache:          l.Cache,
+		RequestID:      l.RequestID,
 		Timeouts:       l.Timeouts,
 	}
 	connLimiters := make(map[string]httpproxy.ConnLimiterI)
