@@ -64,6 +64,31 @@ func init() {
 		errorLog:  log.New(os.Stderr, "", log.LstdFlags),
 		level:     WarnLevel,
 	})
+	empty := ""
+	gatewayID.Store(&empty)
+}
+
+// gatewayID is this process's gateway identity, stamped on every HTTP access-log
+// line as gw=<id>. Set once at startup via SetGateway. Stored as an atomic
+// pointer so it stays race-free alongside the hot-swappable logger state.
+var gatewayID atomic.Pointer[string]
+
+// SetGateway records the gateway identity for the access log. An empty id falls
+// back to os.Hostname() so operators get a sensible value with zero config.
+func SetGateway(id string) {
+	if id == "" {
+		if h, err := os.Hostname(); err == nil {
+			id = h
+		}
+	}
+	gatewayID.Store(&id)
+}
+
+func gateway() string {
+	if p := gatewayID.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 // Init initializes the logger with config.
@@ -197,14 +222,22 @@ func SanitizeLogField(s string) string {
 // no-op; we do it anyway as defense-in-depth against future callers passing a
 // less-validated value. host is the requested vhost (r.Host); an empty host is
 // logged as "-".
-func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes int64, duration float64, backend, userAgent string) {
+func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes int64, duration float64, backend, userAgent, requestID, site string) {
 	if host == "" {
 		host = "-"
 	}
-	// User-Agent is appended LAST as a quoted field so a consumer can make it optional
-	// and stay back-compatible with the old (UA-less) format. CRLF-sanitized like the
-	// rest; the UA is attacker-controlled.
-	current.Load().accessLog.Printf("%s - %s \"%s %s %s\" %d %d %.3fms -> %s \"%s\"",
+	if requestID == "" {
+		requestID = "-"
+	}
+	if site == "" {
+		site = "-"
+	}
+	// User-Agent is appended as a quoted field; the correlation id (rid), the
+	// gateway identity (gw) and the site/listener name follow as trailing
+	// key=value tokens. All are appended LAST so a consumer can treat them as
+	// optional and stay back-compatible with the old format. CRLF-sanitized
+	// like the rest; the UA and an inbound-derived rid are attacker-influenced.
+	current.Load().accessLog.Printf("%s - %s \"%s %s %s\" %d %d %.3fms -> %s \"%s\" rid=%s gw=%s site=%s",
 		SanitizeLogField(clientIP),
 		SanitizeLogField(host),
 		SanitizeLogField(method),
@@ -212,7 +245,10 @@ func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes in
 		SanitizeLogField(proto),
 		status, bytes, duration,
 		SanitizeLogField(backend),
-		SanitizeLogField(clipUA(userAgent)))
+		SanitizeLogField(clipUA(userAgent)),
+		SanitizeLogField(requestID),
+		SanitizeLogField(gateway()),
+		SanitizeLogField(site))
 }
 
 // AccessL4 logs one raw TCP/UDP connection (or rejection) to the SAME access log

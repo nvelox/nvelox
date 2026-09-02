@@ -54,11 +54,34 @@ type ThrottleConfig struct {
 	WriteRate string `yaml:"write_rate,omitempty"` // e.g., "10MB/s"
 }
 
+// RequestIDConfig controls edge correlation-id (X-Request-ID) handling for an
+// HTTP/HTTPS listener. When Enabled, nvelox reads an inbound X-Request-ID and,
+// if absent — or present but not trusted (see TrustInbound) — generates a fresh
+// 32-hex-char id, injects it on the upstream request, echoes it on the response,
+// and records it (with the gateway identity) in the access log. This makes the
+// gateway the origin of truth for the trace: one id follows the request from the
+// gateway that first received it through every downstream service. The header
+// name is fixed to X-Request-ID to stay consistent with the rest of the stack.
+type RequestIDConfig struct {
+	Enabled bool `yaml:"enabled,omitempty"`
+	// TrustInbound: honor a well-formed inbound X-Request-ID from ANY peer.
+	// Set this on INTERNAL listeners, where the caller is a trusted service
+	// that already carries an id and we want the whole chain to share it.
+	// Default false = at the true public edge an inbound id is honored only
+	// when the immediate peer is a configured trusted_proxy, otherwise it is
+	// overwritten with a fresh id so a client cannot forge or poison the trace.
+	TrustInbound bool `yaml:"trust_inbound,omitempty"`
+}
+
 type ServerConfig struct {
 	User    string `yaml:"user"`
 	Group   string `yaml:"group"`
 	PidFile string `yaml:"pid_file"`
 	Workers int    `yaml:"workers,omitempty"` // SO_REUSEPORT workers (0 = single process)
+	// GatewayID identifies THIS gateway on every HTTP access-log line as
+	// gw=<id>, so a request can be attributed to the gateway that first
+	// received it. Empty (default) → os.Hostname() is used at startup.
+	GatewayID string `yaml:"gateway_id,omitempty"`
 }
 
 type LoggingConfig struct {
@@ -163,8 +186,9 @@ type Listener struct {
 	Root        string            `yaml:"root,omitempty"`        // Document root for static files
 	Buffering   BufferingConfig   `yaml:"buffering,omitempty"`
 	Cache       CacheConfig       `yaml:"cache,omitempty"`
-	GRPC        bool              `yaml:"grpc,omitempty"`     // Enable gRPC-aware proxying
-	Throttle    ThrottleConfig    `yaml:"throttle,omitempty"` // Bandwidth throttling
+	GRPC        bool              `yaml:"grpc,omitempty"`       // Enable gRPC-aware proxying
+	Throttle    ThrottleConfig    `yaml:"throttle,omitempty"`   // Bandwidth throttling
+	RequestID   RequestIDConfig   `yaml:"request_id,omitempty"` // Edge correlation-id (X-Request-ID)
 }
 
 // BufferingConfig defines request/response buffer sizes.
