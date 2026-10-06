@@ -104,7 +104,10 @@ type Listener struct {
 	Name     string `yaml:"name"`
 	Bind     string `yaml:"bind"`     // e.g., ":80" or "*:1024-2048"
 	Protocol string `yaml:"protocol"` // "tcp", "udp", "http", "https"
-	ZeroCopy bool   `yaml:"zero_copy"`
+	// ZeroCopy is accepted for config compatibility but currently has no
+	// effect: L4 TCP sessions are relayed with a 16 KiB buffered copy per
+	// direction (core/relay.go). Kernel splice is not implemented.
+	ZeroCopy bool `yaml:"zero_copy"`
 
 	// Backend names the upstream pool. For TCP/UDP listeners it's the
 	// pool every connection is forwarded to. For HTTP/HTTPS listeners

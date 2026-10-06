@@ -31,7 +31,6 @@ import (
 )
 
 type Engine struct {
-	TCPEngine       *nbio.Engine
 	UDPEngine       *nbio.Engine
 	Listeners       []*ListenerConfig
 	Config          *config.Config
@@ -53,6 +52,10 @@ type Engine struct {
 	ActiveConns     sync.WaitGroup          // tracks in-flight connections for graceful drain
 	DrainTimeout    time.Duration           // max wait on shutdown (default 30s)
 	tlsListeners    []net.Listener          // TLS listeners to close on shutdown
+	tcpListeners    []tcpListener           // plain L4 TCP listeners (std accept loop + relayL4)
+	acceptWG        sync.WaitGroup          // L4 TCP/TLS accept loops; waited on before closing live conns
+	l4Conns         sync.Map                // live L4 TCP/TLS client conns (net.Conn -> struct{}), closed on shutdown
+	runCtx          context.Context         // Start's ctx: cancels in-flight L4 backend dials on shutdown
 	reloadMu        sync.Mutex              // serializes concurrent SIGHUPs
 	configPath      string                  // path for reload
 }
@@ -200,32 +203,37 @@ func (e *Engine) Start(ctx context.Context) error {
 	// 2. Setup Handler
 	handler := NewProxyEventHandler(e)
 
-	// 3. Setup TCP Engine (non-TLS listeners only; TLS uses separate accept loop)
-	tcpAddrs := e.getAddrs("tcp")
-	tlsListeners := e.getTLSListeners()
-	needsTCPEngine := len(tcpAddrs) > 0 || len(tlsListeners) > 0
+	e.runCtx = ctx
 
-	if needsTCPEngine {
-		conf := nbio.Config{
-			Network:            "tcp",
-			Addrs:              tcpAddrs,
-			MaxWriteBufferSize: 6 * 1024 * 1024,
+	// 3. L4 TCP listeners. Plain (non-TLS) listeners run a std accept loop
+	// with one relayL4 goroutine pair per connection; TLS-terminating
+	// listeners use their own accept loop and the same relay. (TCP no longer
+	// runs on nbio: nbio cannot half-close and drops unflushed bytes on close
+	// — see relay.go.) Bind everything first so a bind failure leaves no
+	// accept loop running.
+	for _, l := range e.Listeners {
+		if l.Protocol != "tcp" || l.TLS != nil {
+			continue
 		}
-		e.TCPEngine = nbio.NewEngine(conf)
-		e.TCPEngine.OnOpen(handler.OnOpen)
-		e.TCPEngine.OnData(handler.OnData)
-		e.TCPEngine.OnClose(handler.OnClose)
-
-		if err := e.TCPEngine.Start(); err != nil {
-			return fmt.Errorf("TCP Engine start failed: %v", err)
+		ln, err := net.Listen("tcp", l.Addr)
+		if err != nil {
+			e.closeTCPListeners()
+			return fmt.Errorf("TCP listener %s start failed: %v", l.Name, err)
 		}
-		logging.Info("NBIO TCP Engine Started on %d listeners", len(tcpAddrs))
-
-		// Start TLS accept loops
-		for _, tlsL := range tlsListeners {
-			if err := e.startTLSListener(tlsL, handler); err != nil {
-				return fmt.Errorf("TLS listener %s start failed: %v", tlsL.Name, err)
-			}
+		logging.Info("Registering listener %s on %s", l.Name, l.Addr)
+		e.tcpListeners = append(e.tcpListeners, tcpListener{ln: ln, l: l})
+	}
+	for _, tl := range e.tcpListeners {
+		l := tl.l
+		e.startAcceptLoop(tl.ln, l.Name, func(c net.Conn) { handler.serveTCP(c, l) })
+	}
+	if len(e.tcpListeners) > 0 {
+		logging.Info("L4 TCP started on %d listeners", len(e.tcpListeners))
+	}
+	for _, tlsL := range e.getTLSListeners() {
+		if err := e.startTLSListener(tlsL, handler); err != nil {
+			e.closeTCPListeners()
+			return fmt.Errorf("TLS listener %s start failed: %v", tlsL.Name, err)
 		}
 	}
 
@@ -272,15 +280,14 @@ func (e *Engine) Start(ctx context.Context) error {
 		cancel()
 	}
 
-	// Close TLS listeners to stop accepting new connections
-	for _, l := range e.tlsListeners {
-		l.Close()
-	}
+	// Stop accepting new L4 TCP/TLS connections, wait for the accept loops to
+	// exit (no further ActiveConns.Add), then close the live L4 TCP sessions —
+	// the restart behaviour the nbio TCP engine's Stop() had.
+	e.closeTCPListeners()
+	e.acceptWG.Wait()
+	e.closeL4Conns()
 
-	// Stop nbio engines (stops accepting new L4 connections)
-	if e.TCPEngine != nil {
-		e.TCPEngine.Stop()
-	}
+	// Stop the nbio UDP engine
 	if e.UDPEngine != nil {
 		e.UDPEngine.Stop()
 	}
@@ -842,6 +849,8 @@ func sliceEqual(a, b []string) bool {
 	return true
 }
 
+// getAddrs returns the bind addresses of the nbio-served listeners of proto
+// (UDP; plain TCP now runs its own accept loops — see l4tcp.go).
 func (e *Engine) getAddrs(proto string) []string {
 	addrs := make([]string, 0)
 	for _, l := range e.Listeners {
@@ -855,6 +864,17 @@ func (e *Engine) getAddrs(proto string) []string {
 		}
 	}
 	return addrs
+}
+
+// closeTCPListeners closes the plain L4 TCP and TLS listeners (idempotent:
+// a second Close just returns an error) so their accept loops exit.
+func (e *Engine) closeTCPListeners() {
+	for _, tl := range e.tcpListeners {
+		tl.ln.Close()
+	}
+	for _, l := range e.tlsListeners {
+		l.Close()
+	}
 }
 
 func (e *Engine) getTLSListeners() []*ListenerConfig {
@@ -928,15 +948,7 @@ func (e *Engine) startTLSListener(l *ListenerConfig, handler *ProxyEventHandler)
 	e.tlsListeners = append(e.tlsListeners, listener)
 	logging.Info("TLS listener %s started on %s", l.Name, l.Addr)
 
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			go e.handleTLSConn(conn, l, handler)
-		}
-	}()
+	e.startAcceptLoop(listener, l.Name, func(c net.Conn) { e.handleTLSConn(c, l, handler) })
 
 	return nil
 }
@@ -981,7 +993,7 @@ func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *
 	if backend != nil && backend.Timeouts.Connect != "" {
 		connectTimeout = backend.Timeouts.ParseConnect()
 	}
-	backendConn, err := net.DialTimeout("tcp", dialTarget, connectTimeout)
+	backendConn, err := e.dialL4Backend(dialTarget, connectTimeout)
 	if err != nil {
 		logging.Error("TLS backend dial failed: %v", err)
 		return
@@ -1001,34 +1013,14 @@ func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *
 		}
 	}
 
-	// Bidirectional relay
-	done := make(chan struct{})
-
-	go func() {
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := backendConn.Read(buf)
-			if err != nil {
-				break
-			}
-			if _, err := clientConn.Write(buf[:n]); err != nil {
-				break
-			}
-		}
-		close(done)
-	}()
-
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := clientConn.Read(buf)
-		if err != nil {
-			break
-		}
-		if _, err := backendConn.Write(buf[:n]); err != nil {
-			break
-		}
+	// Bidirectional relay with half-close semantics (relay.go): a backend that
+	// closes first gets its whole response delivered followed by close_notify
+	// + FIN; a client that half-closes still gets the backend's answer. The
+	// idle timeout applies only when timeouts.idle is set — this path never
+	// had a default one.
+	res := relayL4(clientConn, backendConn, l.Timeouts.ParseIdle())
+	if res.Err != nil {
+		logging.Debug("[CONN] TLS %s ended with error: %v", clientConn.RemoteAddr(), res.Err)
 	}
-
-	<-done
 	logging.Info("[CONN] Closed TLS %s (Dur: %v)", clientConn.RemoteAddr(), time.Since(startTime))
 }
