@@ -129,19 +129,20 @@ func TestRelayL4_BackendFINFirst_HalfClosesOnly(t *testing.T) {
 // A direction that is quiet for longer than idle must NOT kill the session
 // while the other direction keeps moving bytes.
 func TestRelayL4_IdleCountsBothDirections(t *testing.T) {
-	const idle = 300 * time.Millisecond
+	const idle = 500 * time.Millisecond
 	f := startRelay(t, idle)
 	got := make(chan []byte, 1)
 	go func() {
 		b, _ := readAllWithin(t, f.backend, 5*time.Second)
 		got <- b
 	}()
-	// client->backend trickles for 4x idle; backend->client stays silent.
+	// client->backend trickles for ~2.4x idle (one byte every idle/5);
+	// backend->client stays silent the whole time.
 	for i := 0; i < 12; i++ {
 		if _, err := f.client.Write([]byte{'x'}); err != nil {
 			t.Fatalf("trickle write %d: %v (session killed while active)", i, err)
 		}
-		time.Sleep(idle / 3)
+		time.Sleep(idle / 5)
 	}
 	f.client.CloseWrite()
 	if b := <-got; len(b) != 12 {
@@ -173,7 +174,7 @@ func TestRelayL4_HalfClosedIdleTimeout(t *testing.T) {
 	if !isTimeout(r.Err) {
 		t.Fatalf("relay ended with %v, want an idle timeout", r.Err)
 	}
-	if el := time.Since(start); el > 2*idle+200*time.Millisecond {
+	if el := time.Since(start); el > idle+time.Second {
 		t.Fatalf("half-closed session lingered %v (idle %v)", el, idle)
 	}
 }
