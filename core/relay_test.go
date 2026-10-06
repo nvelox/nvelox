@@ -1,13 +1,20 @@
+//go:build linux
+
+// Linux-specific: these tests pin down Linux TCP behaviour (half-close,
+// RST on close with unread input, SIOCOUTQ).
+
 package core
 
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/pires/go-proxyproto"
 )
@@ -215,25 +222,64 @@ func TestRelayL4_StalledWriterAborts(t *testing.T) {
 	}
 }
 
-// Backend sends its whole response + FIN while the client is still sending:
-// the backend socket then answers further data with an RST, so writing to it
-// fails. That must NOT cut the response still queued for the client.
+// sendQueueLen returns the bytes c's kernel still holds unacknowledged
+// (SIOCOUTQ: unsent + unacked, including a pending FIN).
+func sendQueueLen(t *testing.T, c *net.TCPConn) int {
+	t.Helper()
+	rc, err := c.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int32
+	var ierr syscall.Errno
+	rc.Control(func(fd uintptr) {
+		_, _, ierr = syscall.Syscall(syscall.SYS_IOCTL, fd, syscall.TIOCOUTQ, uintptr(unsafe.Pointer(&n)))
+	})
+	if ierr != 0 {
+		t.Fatalf("SIOCOUTQ: %v", ierr)
+	}
+	return int(n)
+}
+
+// The backend sends its whole response + FIN and closes while the client is
+// still sending: the backend's socket answers the client's later bytes with
+// an RST, so nvelox's writes toward it fail (EPIPE/ECONNRESET). That must NOT
+// cut the response nvelox already holds for the client.
 func TestRelayL4_ClientKeepsSendingAfterBackendClosed(t *testing.T) {
 	f := startRelayRcvBuf(t, 0, 4096)
-	resp := bytes.Repeat([]byte("R"), 2<<20)
+	// Small enough that the backend's kernel can hand ALL of it (and the FIN)
+	// to nvelox while the client reads nothing — even with stock 16 KiB/128 KiB
+	// socket buffer defaults — yet far more than the client's 4 KiB window, so
+	// most of it is still inside nvelox when the client sends more. (Bytes
+	// still in the BACKEND's own send queue would be discarded by the
+	// backend's kernel when it resets; no proxy can deliver those.)
+	resp := bytes.Repeat([]byte("R"), 48*1024)
 	req := []byte("REQ")
-	backendClosed := make(chan struct{})
+	backendClosed := make(chan error, 1)
 	go func() {
-		defer close(backendClosed)
 		b := make([]byte, len(req))
-		io.ReadFull(f.backend, b)
+		if _, err := io.ReadFull(f.backend, b); err != nil {
+			backendClosed <- err
+			return
+		}
 		f.backend.Write(resp)
-		f.backend.Close() // full close: later client bytes get an RST
+		f.backend.CloseWrite()
+		deadline := time.Now().Add(3 * time.Second)
+		for q := sendQueueLen(t, f.backend); q > 0; q = sendQueueLen(t, f.backend) {
+			if time.Now().After(deadline) {
+				backendClosed <- fmt.Errorf("backend send queue never drained into nvelox (%d bytes left)", q)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		backendClosed <- f.backend.Close() // full close: later client bytes get an RST
 	}()
 	f.client.Write(req)
-	<-backendClosed
-	// Keep sending while NOT reading yet: the first writes reach the closed
-	// backend, which resets; later ones fail inside nvelox (EPIPE/ECONNRESET).
+	if err := <-backendClosed; err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	// Keep sending while NOT reading yet: the first bytes reach the closed
+	// backend, which resets; later writes fail inside nvelox.
 	for i := 0; i < 20; i++ {
 		f.client.Write(bytes.Repeat([]byte("x"), 1024))
 		time.Sleep(5 * time.Millisecond)

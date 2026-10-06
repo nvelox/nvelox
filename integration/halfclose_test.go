@@ -1,3 +1,5 @@
+//go:build linux
+
 package integration
 
 // L4 half-close regression suite.
