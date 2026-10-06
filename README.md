@@ -14,7 +14,7 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 ## Why Nvelox?
 
 * **L4 + L7 in one binary** — TCP/UDP proxy, HTTP reverse proxy, static file server, FastCGI (PHP-FPM)
-* **Massive Scale** — Bind 10,000+ ports with a single config line, event-driven via nbio
+* **Massive Scale** — Bind 10,000+ ports with a single config line (port ranges)
 * **HTTP/1.1 + HTTP/2 + HTTP/3** — Full protocol support including QUIC
 * **nginx-compatible features** — try_files, expires, FastCGI, regex routes, URL rewrite
 * **Simple YAML config** — No complex directive syntax
@@ -22,7 +22,7 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 ## Features
 
 ### Core Proxy
-- **L4 TCP/UDP Proxy** — async I/O via nbio with zero-copy splice support
+- **L4 TCP/UDP Proxy** — TCP relay with standard half-close semantics (back-pressured; when either side closes first, everything already read is delivered before the FIN is passed on), UDP via the nbio event loop
 - **L7 HTTP Reverse Proxy** — `httputil.ReverseProxy` with shared connection pool
 - **HTTP/1.1 + HTTP/2** — automatic HTTP/2 via ALPN on HTTPS listeners
 - **HTTP/3 (QUIC)** — via quic-go with Alt-Svc header advertisement
@@ -100,13 +100,15 @@ graph TD
     Client -->|TCP/UDP/HTTP| Listeners
     subgraph Nvelox
         Listeners -->|IP Filter| ACL{ACL + Rate Limit}
-        ACL -->|L4| NBIOEngine[nbio Event Loop]
+        ACL -->|L4 TCP| L4Relay[TCP relay, half-close]
+        ACL -->|L4 UDP| NBIOEngine[nbio UDP Event Loop]
         ACL -->|L7| HTTPServer[net/http Server]
         ACL -->|FastCGI| FCGIClient[FastCGI Client]
         HTTPServer -->|Route Match| Router
         Router -->|Static| FileServer[Static Files]
         Router -->|Proxy| ReverseProxy[httputil.ReverseProxy]
         Router -->|Redirect| RedirectHandler
+        L4Relay -->|Dial| BackendPool
         NBIOEngine -->|DialAsync| BackendPool
         ReverseProxy -->|Shared Transport| BackendPool[Backend Pool]
         FCGIClient --> PHPFPM[PHP-FPM]
@@ -332,7 +334,9 @@ See [`examples/README.md`](examples/README.md) for manual real-world testing wit
 ```
 core/
   engine.go          — Engine orchestration, lifecycle
-  handler.go         — L4 proxy (TCP/UDP via nbio)
+  handler.go         — L4 accept gating + UDP proxy (nbio)
+  l4tcp.go           — L4 TCP accept loop + per-connection proxying
+  relay.go           — L4 TCP relay (half-close semantics, idle timeout)
   httpproxy/
     server.go        — L7 HTTP reverse proxy
     router.go        — Route matching (host/path/regex)

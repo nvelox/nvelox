@@ -14,9 +14,11 @@ import (
 	"nvelox/proxy"
 
 	"github.com/lesismal/nbio"
-	"github.com/pires/go-proxyproto"
 )
 
+// ProxyEventHandler holds the L4 accept-time gating shared by every L4 path
+// and is the nbio event handler for UDP. Plain TCP connections are served by
+// serveTCP (l4tcp.go) on their own goroutines, not through nbio.
 type ProxyEventHandler struct {
 	engine      *Engine
 	listenerMap map[string]*ListenerConfig
@@ -353,132 +355,8 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 		dialTarget = fmt.Sprintf("%s:%d", dialTarget, l.Port)
 	}
 
-	if l.Protocol == "udp" {
-		h.connectBackendUDP(clientConn, dialTarget, backend, l)
-	} else {
-		h.connectBackendTCP(clientConn, dialTarget, backend, balancer, target, l)
-	}
-}
-
-func (h *ProxyEventHandler) connectBackendTCP(clientConn *nbio.Conn, target string, backend *config.Backend, balancer lb.Balancer, balancerKey string, l *ListenerConfig) {
-	// Use configurable timeout: prefer backend timeout, fall back to listener timeout, default 10s
-	connectTimeout := l.Timeouts.ParseConnect()
-	if backend != nil && backend.Timeouts.Connect != "" {
-		connectTimeout = backend.Timeouts.ParseConnect()
-	}
-
-	go func() {
-		// Blocking dial — guarantees sequential byte ordering for PROXY v2 + TLS
-		backendConn, err := net.DialTimeout("tcp", target, connectTimeout)
-		if err != nil {
-			logging.Error("Backend TCP dial failed: %v", err)
-			clientConn.Close()
-			return
-		}
-
-		clientCtx := h.getCtx(clientConn)
-		if clientCtx == nil {
-			// Client already closed during backend dial
-			backendConn.Close()
-			return
-		}
-
-		// Determine the real client. When this listener trusts an inbound
-		// PROXY-v2 header from this peer (a peer-region relay), wait briefly for
-		// the header to land in the pre-backend buffer, parse it, and strip the
-		// consumed bytes so they aren't forwarded as payload. Untrusted peers
-		// skip this entirely (no spoofing). PeerConn is still nil here, so OnData
-		// keeps buffering — we set it only after the header is resolved.
-		src := clientConn.RemoteAddr()
-		if l.proxyTrust.trusts(clientConn.RemoteAddr()) {
-			deadline := time.Now().Add(5 * time.Second)
-			for {
-				clientCtx.Mu.Lock()
-				done, parsedSrc, consumed := tryParseInboundProxyV2(clientCtx.Buffer)
-				if done {
-					if parsedSrc != nil {
-						src = parsedSrc
-					}
-					if consumed > 0 {
-						clientCtx.Buffer = clientCtx.Buffer[consumed:]
-					}
-					clientCtx.Mu.Unlock()
-					break
-				}
-				clientCtx.Mu.Unlock()
-				if time.Now().After(deadline) {
-					break // header never completed; fall back to peer addr, buffer intact
-				}
-				time.Sleep(5 * time.Millisecond)
-			}
-		}
-
-		// Send PROXY protocol v2 header to the backend if enabled. The header's
-		// DESTINATION is the address the CLIENT connected to (clientConn.LocalAddr
-		// = our listener's local addr, i.e. the original dedicated port for a
-		// range listener) — NOT backendConn.LocalAddr (our ephemeral source toward
-		// the backend, which is useless to the backend). This is the correct PROXY
-		// semantic and is what lets a backend MUX a whole port range on one socket:
-		// it recovers the original dialed port from the header instead of needing a
-		// listener per port. (For a chained relay, clientConn.LocalAddr is still the
-		// dedicated port because the relay dials that same port.)
-		if backend != nil && backend.SendProxyV2 {
-			header := proxyproto.HeaderProxyFromAddrs(2, src, clientConn.LocalAddr())
-			if _, err := header.WriteTo(backendConn); err != nil {
-				logging.Error("Failed to write PROXY v2 header: %v", err)
-				backendConn.Close()
-				clientConn.Close()
-				return
-			}
-		}
-
-		// Link client to backend
-		clientCtx.Mu.Lock()
-		clientCtx.PeerConn = backendConn
-		clientCtx.RealClientIP = ipStrOf(src) // the resolved client (PROXY-v2 source if trusted, else peer) for the L4 access record
-		clientCtx.ClientResolved = true       // real client is now known → the L4 record may be emitted
-
-		// Notify balancer
-		balancer.OnConnect(balancerKey)
-
-		// Flush any buffered data
-		if len(clientCtx.Buffer) > 0 {
-			_, writeErr := backendConn.Write(clientCtx.Buffer)
-			if writeErr != nil {
-				logging.Error("Failed to flush buffer: %v", writeErr)
-				clientCtx.Mu.Unlock()
-				clientConn.Close()
-				backendConn.Close()
-				return
-			}
-			clientCtx.Buffer = nil
-		}
-		clientCtx.Mu.Unlock()
-
-		// Blocking read loop: backend → client (with idle timeout)
-		idleTimeout := 5 * time.Minute
-		if l.Timeouts.Idle != "" {
-			idleTimeout = l.Timeouts.ParseIdle()
-		}
-		buf := make([]byte, 32*1024)
-		for {
-			if idleTimeout > 0 {
-				backendConn.SetReadDeadline(time.Now().Add(idleTimeout))
-			}
-			n, err := backendConn.Read(buf)
-			if err != nil {
-				backendConn.Close()
-				clientConn.Close()
-				return
-			}
-			_, err = clientConn.Write(buf[:n])
-			if err != nil {
-				backendConn.Close()
-				clientConn.Close()
-				return
-			}
-		}
-	}()
+	// nbio serves UDP only; plain TCP runs serveTCP (l4tcp.go).
+	h.connectBackendUDP(clientConn, dialTarget, backend, l)
 }
 
 func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target string, backend *config.Backend, l *ListenerConfig) {

@@ -237,6 +237,17 @@ listeners:
       #     response_script: "/etc/nvelox/scripts/transform.lua"
 
   # ─── TCP L4 proxy (gaming/tunneling) ───────────────────
+  # L4 TCP sessions follow standard half-close semantics: when either side
+  # finishes (FIN), everything already read from it is delivered to the other
+  # side, then only that write direction is shut down; the opposite direction
+  # keeps flowing until it ends too. Only a real error (RST) aborts both.
+  #   timeouts.idle    — close a session after no bytes moved in EITHER
+  #                      direction for this long, including a half-closed
+  #                      one. Default 5m on plain tcp listeners ("0" =
+  #                      never); on tls-terminating tcp listeners only when set.
+  #   timeouts.connect — backend dial timeout (default 10s).
+  #   zero_copy        — accepted for compatibility; no effect (L4 TCP uses a
+  #                      16 KiB buffered copy per direction).
   - name: "game-ports"
     bind: ":10000-10100"
     protocol: "tcp"
