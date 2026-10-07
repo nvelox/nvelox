@@ -110,6 +110,20 @@ func NewEngine(cfg *config.Config) *Engine {
 }
 
 func (e *Engine) Start(ctx context.Context) error {
+	// Engine.Reload (SIGHUP) rewrites Listeners, BindGroups, HTTPServers and
+	// the backend maps under reloadMu. Hold it for the whole startup so a
+	// reload that arrives early waits for a fully started engine instead of
+	// racing it (the race detector caught Start's listener loop reading
+	// e.Listeners while a SIGHUP reload replaced it). Released before blocking
+	// on ctx; the shutdown path snapshots BindGroups under it again.
+	e.reloadMu.Lock()
+	startupLocked := true
+	defer func() {
+		if startupLocked {
+			e.reloadMu.Unlock()
+		}
+	}()
+
 	// 1. Initialize Backends & Health Checkers
 	e.initBackends()
 
@@ -256,10 +270,18 @@ func (e *Engine) Start(ctx context.Context) error {
 		logging.Info("NBIO UDP Engine Started on %d listeners", len(udpAddrs))
 	}
 
-	// 5. Wait for Context
+	// 5. Wait for Context. Reloads may run from here on.
+	startupLocked = false
+	e.reloadMu.Unlock()
 	<-ctx.Done()
 
 	logging.Info("Stopping Engines...")
+
+	// Snapshot the bind groups under reloadMu: a reload in flight may still be
+	// adding or removing one.
+	e.reloadMu.Lock()
+	stopGroups := append([]*httpproxy.BindGroup(nil), e.BindGroups...)
+	e.reloadMu.Unlock()
 
 	// Stop admin API
 	if e.AdminServer != nil {
@@ -274,7 +296,7 @@ func (e *Engine) Start(ctx context.Context) error {
 
 	// Stop HTTP bind groups (each owns the socket; HTTPServers are sites
 	// within them and have nothing to shut down on their own).
-	for _, bg := range e.BindGroups {
+	for _, bg := range stopGroups {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		bg.Stop(shutdownCtx)
 		cancel()
