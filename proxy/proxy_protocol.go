@@ -54,6 +54,14 @@ func WriteProxyHeaderV2(w io.Writer, src, dst net.Addr) error {
 		return fmt.Errorf("unsupported address type: %T", dst)
 	}
 
+	// A UDP listener bound to all interfaces (":443", ":17000-17100") reports
+	// its own address as the dual-stack unspecified [::] while clients arrive
+	// as IPv4: the pair failed as a family mismatch, so no header was written
+	// and every UDP datagram went to the backend without one (HTTP/3 and UDP
+	// tunnels behind send_proxy_v2 dropped all of them). An unspecified side
+	// takes the other side's family; the backend reads only its port.
+	srcIP, dstIP = matchUnspecified(srcIP, dstIP)
+
 	// Family and Protocol
 	sIP4 := srcIP.To4()
 	dIP4 := dstIP.To4()
@@ -102,4 +110,26 @@ func WriteProxyHeaderV2(w io.Writer, src, dst net.Addr) error {
 
 	_, err := w.Write(header)
 	return err
+}
+
+// matchUnspecified gives an unspecified (or missing) address the other side's
+// family, as that family's zero address: a UDP listener bound to all
+// interfaces reports itself as [::] while its client is IPv4, and the pair then
+// goes as IPv4 with dst 0.0.0.0 (dst port kept). Two concrete addresses of
+// different families are left alone — still a mismatch.
+func matchUnspecified(src, dst net.IP) (net.IP, net.IP) {
+	unspec := func(ip net.IP) bool { return len(ip) == 0 || ip.IsUnspecified() }
+	zeroLike := func(ip net.IP) net.IP {
+		if ip.To4() != nil {
+			return net.IPv4zero
+		}
+		return net.IPv6unspecified
+	}
+	switch {
+	case unspec(dst) && !unspec(src):
+		return src, zeroLike(src)
+	case unspec(src) && !unspec(dst):
+		return zeroLike(dst), dst
+	}
+	return src, dst
 }
