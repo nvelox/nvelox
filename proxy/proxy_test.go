@@ -118,3 +118,52 @@ func TestWriteProxyHeaderV2_Mismatch(t *testing.T) {
 		t.Fatal("Expected error for mismatched address families, got nil")
 	}
 }
+
+// A UDP listener bound to all interfaces reports [::] as its own address while
+// the client is IPv4: the header goes as IPv4 with dst 0.0.0.0 and the dst
+// port kept. Before, the pair failed as a family mismatch and the datagram went
+// to the backend with no header at all.
+func TestWriteProxyHeaderV2_UnspecifiedListenerAddr(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		src, dst net.Addr
+		fam      byte
+		dstIP    net.IP
+	}{
+		{"udp v4 client, [::] listener", &net.UDPAddr{IP: net.ParseIP("176.0.29.117"), Port: 54885}, &net.UDPAddr{IP: net.IPv6unspecified, Port: 17084}, 0x12, net.IPv4zero.To4()},
+		{"udp v4 client, 0.0.0.0 listener", &net.UDPAddr{IP: net.ParseIP("176.0.29.117"), Port: 54885}, &net.UDPAddr{IP: net.IPv4zero, Port: 443}, 0x12, net.IPv4zero.To4()},
+		{"udp v4 client, nil listener IP", &net.UDPAddr{IP: net.ParseIP("176.0.29.117"), Port: 54885}, &net.UDPAddr{Port: 443}, 0x12, net.IPv4zero.To4()},
+		{"tcp v4 client, [::] listener", &net.TCPAddr{IP: net.ParseIP("176.0.29.117"), Port: 54885}, &net.TCPAddr{IP: net.IPv6unspecified, Port: 443}, 0x11, net.IPv4zero.To4()},
+		{"udp v6 client, [::] listener", &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 54885}, &net.UDPAddr{IP: net.IPv6unspecified, Port: 443}, 0x22, net.IPv6unspecified},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := WriteProxyHeaderV2(&buf, tc.src, tc.dst); err != nil {
+				t.Fatalf("WriteProxyHeaderV2: %v (no header means the backend gets the datagram raw)", err)
+			}
+			b := buf.Bytes()
+			if b[13] != tc.fam {
+				t.Fatalf("fam/proto 0x%X, want 0x%X", b[13], tc.fam)
+			}
+			n := 4
+			if tc.fam>>4 == 2 {
+				n = 16
+			}
+			dst := net.IP(b[16+n : 16+2*n])
+			if !dst.Equal(tc.dstIP) {
+				t.Fatalf("dst IP %v, want %v", dst, tc.dstIP)
+			}
+			dstPort := int(binary.BigEndian.Uint16(b[16+2*n+2:]))
+			want := 0
+			switch a := tc.dst.(type) {
+			case *net.UDPAddr:
+				want = a.Port
+			case *net.TCPAddr:
+				want = a.Port
+			}
+			if dstPort != want {
+				t.Fatalf("dst port %d, want %d (the backend demuxes on it)", dstPort, want)
+			}
+		})
+	}
+}
