@@ -436,6 +436,9 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 			clientConn.Close()
 			return
 		}
+		// DF off: the PROXY v2 header can push a full-size datagram over a later
+		// hop's MTU (a 1,450 B VXLAN pod network); fragment it, don't drop it.
+		setUDPNoDF(backendConn)
 
 		// Store in pool for session affinity
 		session := &UDPSession{
