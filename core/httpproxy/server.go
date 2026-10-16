@@ -412,6 +412,10 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// reflects the real client rather than the upstream proxy's address.
 	clientIP := s.realClientIP(r)
 
+	// Browser Fetch Metadata as the client sent it — read before any configured
+	// request-header rewrite can drop it — for the access log.
+	fetchSite, fetchDest := r.Header.Get("Sec-Fetch-Site"), r.Header.Get("Sec-Fetch-Dest")
+
 	// IP denylist check (static, per-listener config)
 	if len(s.IPDenylist) > 0 && acl.CheckIPList(clientIP, s.IPDenylist) {
 		s.serveError(w, http.StatusForbidden)
@@ -786,7 +790,8 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	duration := float64(time.Since(start).Microseconds()) / 1000.0
-	logging.AccessHTTP(clientIP, r.Host, r.Method, r.URL.Path, r.Proto, rec.status, rec.bytes, duration, lastTarget, r.UserAgent(), reqID, s.Listener.Name)
+	logging.AccessHTTP(clientIP, r.Host, r.Method, r.URL.Path, r.Proto, rec.status, rec.bytes, duration, lastTarget, r.UserAgent(),
+		fetchSite, fetchDest, r.TLS != nil, reqID, s.Listener.Name)
 }
 
 // getStickyKey returns the session key based on the sticky session config.

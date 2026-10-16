@@ -32,6 +32,38 @@ func clipUA(s string) string {
 	return s[:cut]
 }
 
+// maxFetchMetaLen bounds a logged Fetch Metadata header value. Browsers send short
+// lowercase tokens ("cross-site", "same-origin", "image", "document", ...); any
+// other value is client-chosen.
+const maxFetchMetaLen = 32
+
+// fetchMetaToken renders a Sec-Fetch-* request header value as a single access-log
+// token: "-" when the header is absent or empty, otherwise the value clipped to
+// maxFetchMetaLen bytes with every byte outside [A-Za-z0-9._-] replaced by '_', so
+// a client-chosen value can neither split the token nor forge another key=value
+// token. A present value that would read as "-" is logged as "_".
+func fetchMetaToken(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "-"
+	}
+	if len(v) > maxFetchMetaLen {
+		v = v[:maxFetchMetaLen]
+	}
+	b := []byte(v)
+	for i, c := range b {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-':
+		default:
+			b[i] = '_'
+		}
+	}
+	if len(b) == 1 && b[0] == '-' {
+		return "_"
+	}
+	return string(b)
+}
+
 type Level int
 
 const (
@@ -221,8 +253,10 @@ func SanitizeLogField(s string) string {
 // a trusted proxy, else the connection peer), so sanitizing it is normally a
 // no-op; we do it anyway as defense-in-depth against future callers passing a
 // less-validated value. host is the requested vhost (r.Host); an empty host is
-// logged as "-".
-func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes int64, duration float64, backend, userAgent, requestID, site string) {
+// logged as "-". fetchSite / fetchDest are the request's Sec-Fetch-Site /
+// Sec-Fetch-Dest headers ("" when absent) and tls whether it arrived over TLS
+// (HTTPS, including HTTP/3).
+func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes int64, duration float64, backend, userAgent, fetchSite, fetchDest string, tls bool, requestID, site string) {
 	if host == "" {
 		host = "-"
 	}
@@ -232,12 +266,19 @@ func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes in
 	if site == "" {
 		site = "-"
 	}
-	// User-Agent is appended as a quoted field; the correlation id (rid), the
-	// gateway identity (gw) and the site/listener name follow as trailing
-	// key=value tokens. All are appended LAST so a consumer can treat them as
-	// optional and stay back-compatible with the old format. CRLF-sanitized
-	// like the rest; the UA and an inbound-derived rid are attacker-influenced.
-	current.Load().accessLog.Printf("%s - %s \"%s %s %s\" %d %d %.3fms -> %s \"%s\" rid=%s gw=%s site=%s",
+	scheme := "http"
+	if tls {
+		scheme = "https"
+	}
+	// User-Agent is appended as a quoted field; the browser Fetch Metadata
+	// (fetch_site, fetch_dest — "-" when absent), the scheme, the correlation id
+	// (rid), the gateway identity (gw) and the site/listener name follow as
+	// trailing key=value tokens. All are appended LAST so a consumer can treat
+	// them as optional and stay back-compatible with the old format; rid, gw and
+	// site stay the final three, so a consumer anchored on that tail keeps
+	// matching. CRLF-sanitized like the rest; the UA, the Fetch Metadata and an
+	// inbound-derived rid are attacker-influenced.
+	current.Load().accessLog.Printf("%s - %s \"%s %s %s\" %d %d %.3fms -> %s \"%s\" fetch_site=%s fetch_dest=%s scheme=%s rid=%s gw=%s site=%s",
 		SanitizeLogField(clientIP),
 		SanitizeLogField(host),
 		SanitizeLogField(method),
@@ -246,6 +287,9 @@ func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes in
 		status, bytes, duration,
 		SanitizeLogField(backend),
 		SanitizeLogField(clipUA(userAgent)),
+		fetchMetaToken(fetchSite),
+		fetchMetaToken(fetchDest),
+		scheme,
 		SanitizeLogField(requestID),
 		SanitizeLogField(gateway()),
 		SanitizeLogField(site))
