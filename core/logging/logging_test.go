@@ -121,7 +121,7 @@ func TestAccessHTTP_LogInjection(t *testing.T) {
 	evilHost := "victim.example\nINJECTED"
 	evilUA := "sqlmap/1.5\nINJECTED-VIA-UA"
 	evilRID := "abcdef\nINJECTED-VIA-RID"
-	AccessHTTP("1.2.3.4", evilHost, "GET", evilPath, "HTTP/1.1", 200, 0, 0.1, "upstream:80", evilUA, evilRID, "test-site")
+	AccessHTTP("1.2.3.4", evilHost, "GET", evilPath, "HTTP/1.1", 200, 0, 0.1, "upstream:80", evilUA, "cross-site\nINJECTED", "image", true, evilRID, "test-site")
 
 	content, err := os.ReadFile(accessPath)
 	if err != nil {

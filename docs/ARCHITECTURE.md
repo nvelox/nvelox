@@ -320,8 +320,8 @@ Accepted but with no effect in this code: `server.user`, `group`, `pid_file`, `w
 
 **Health and metrics.** There is no health or readiness endpoint. `GET /api/v1/stats` on the admin API returns uptime and the backend count (`core/admin/api.go:200-207`). The metrics endpoint exports only `nvelox_reload_total{result}` and `nvelox_reload_duration_seconds` (`core/engine.go:426-432`). No traffic metrics are recorded.
 
-**Logs.** The access log has no timestamp and two line shapes (`core/logging/logger.go:225-271`):
-- HTTP: `<client> - <host> "<method> <path> <proto>" <status> <bytes> <ms>ms -> <backend> "<UA>" rid=<id> gw=<gw> site=<listener>`
+**Logs.** The access log has no timestamp and two line shapes (`core/logging/logger.go:259-315`):
+- HTTP: `<client> - <host> "<method> <path> <proto>" <status> <bytes> <ms>ms -> <backend> "<UA>" fetch_site=<Sec-Fetch-Site> fetch_dest=<Sec-Fetch-Dest> scheme=<https|http> rid=<id> gw=<gw> site=<listener>`. `fetch_site` and `fetch_dest` are `-` when the header is absent; `scheme` is `https` when the request arrived over TLS (HTTP/3 included)
 - L4: `<client> - l4 <proto>/<port> <ok|no_route|ratelimited|denylisted> 0 0 <ms>ms`
 
 All fields are sanitised against CRLF, and the User-Agent is cut to 512 bytes (`core/logging/logger.go:21-34`, `core/logging/logger.go:182-217`). Operational messages go to the error log. In ngris both logs land in `/var/log/nvelox/` (`tf-infra/ansible/roles/nvelox/templates/nvelox.service.j2:15-16`).
