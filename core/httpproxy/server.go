@@ -95,6 +95,11 @@ type HTTPServer struct {
 	// name is absent here, the default backendTransport is used.
 	backendTransports map[string]*http.Transport
 	backendSchemes    map[string]string // "https" when backend_tls is enabled
+	// backendTLSConfigs holds a copy of each TLS backend's client config for
+	// the WebSocket path, which dials the backend itself. A copy, not the
+	// Transport's: the Transport adds its ALPN protocols to its own
+	// TLSClientConfig on first use, so reading that one would race.
+	backendTLSConfigs map[string]*tls.Config
 	altSvcHeader      string
 	closeOnce         sync.Once // guards Close() against double-invocation
 }
@@ -209,6 +214,7 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 	// its own Transport with a TLSClientConfig built from the backend config.
 	s.backendTransports = make(map[string]*http.Transport)
 	s.backendSchemes = make(map[string]string)
+	s.backendTLSConfigs = make(map[string]*tls.Config)
 	for name, be := range backends {
 		if be == nil || !be.BackendTLS.Enabled {
 			continue
@@ -228,6 +234,7 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 			ForceAttemptHTTP2:   true,
 		}
 		s.backendSchemes[name] = "https"
+		s.backendTLSConfigs[name] = tlsCfg.Clone()
 	}
 
 	// http.Server / TLS / HTTP/3 setup now lives on BindGroup. Site is
@@ -1066,8 +1073,22 @@ func (s *HTTPServer) handleWebSocket(w http.ResponseWriter, r *http.Request, bal
 	balancer.OnConnect(target)
 	defer balancer.OnDisconnect(target)
 
-	// Dial backend
-	backendConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	// Dial backend. A backend_tls backend gets the TLS config its HTTP
+	// transport uses; the 10 s timeout covers the handshake too.
+	var backendConn net.Conn
+	if tlsCfg, ok := s.backendTLSConfigs[backendName]; ok {
+		cfg := tlsCfg.Clone()
+		// As http.Transport does for an upgrade: verify the target's host
+		// unless the config names a server, and offer no ALPN (HTTP/1.1).
+		if cfg.ServerName == "" {
+			cfg.ServerName, _, _ = net.SplitHostPort(target)
+		}
+		cfg.NextProtos = nil
+		d := &tls.Dialer{NetDialer: &net.Dialer{Timeout: 10 * time.Second}, Config: cfg}
+		backendConn, err = d.DialContext(r.Context(), "tcp", target)
+	} else {
+		backendConn, err = net.DialTimeout("tcp", target, 10*time.Second)
+	}
 	if err != nil {
 		logging.Error("[WS] Backend dial failed: %v", err)
 		s.serveError(w, http.StatusBadGateway)
@@ -1097,7 +1118,16 @@ func (s *HTTPServer) handleWebSocket(w http.ResponseWriter, r *http.Request, bal
 
 	logging.Info("[WS] %s -> %s (%s)", clientIP, target, backendName)
 
-	// Bidirectional relay
+	// Bidirectional relay. Whichever direction ends first closes both
+	// connections, so the other loop's blocked Read returns instead of
+	// holding the connection (and this goroutine) until the peer gives up.
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			clientConn.Close()
+			backendConn.Close()
+		})
+	}
 	done := make(chan struct{})
 	go func() {
 		buf := make([]byte, 32*1024)
@@ -1110,6 +1140,7 @@ func (s *HTTPServer) handleWebSocket(w http.ResponseWriter, r *http.Request, bal
 				break
 			}
 		}
+		closeBoth()
 		close(done)
 	}()
 
@@ -1130,5 +1161,6 @@ func (s *HTTPServer) handleWebSocket(w http.ResponseWriter, r *http.Request, bal
 			break
 		}
 	}
+	closeBoth()
 	<-done
 }
