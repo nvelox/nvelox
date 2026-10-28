@@ -397,6 +397,14 @@ func TestNewHTTPServer_BackendTLSWiring(t *testing.T) {
 	if s.backendSchemes["tls"] != "https" {
 		t.Errorf("tls backend scheme must be https, got %q", s.backendSchemes["tls"])
 	}
+	// The WebSocket path dials with its own copy: the Transport mutates its
+	// TLSClientConfig on first use.
+	if c := s.backendTLSConfigs["tls"]; c == nil || c == s.backendTransports["tls"].TLSClientConfig {
+		t.Error("tls backend must have its own TLS config copy for the WebSocket path")
+	}
+	if _, ok := s.backendTLSConfigs["plain"]; ok {
+		t.Error("plain backend must NOT have a WebSocket TLS config")
+	}
 }
 
 func TestParseByteSize_Overflow(t *testing.T) {
