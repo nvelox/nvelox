@@ -25,7 +25,10 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          # Release binaries and GHCR images are built with this Go. 1.27.x +
+          # check-latest picks up every 1.27 security release at tag time.
+          go-version: '1.27.x'
+          check-latest: true
       # Pull the tag's annotation message into a file. goreleaser uses
       # this as the release body — overrides its default auto-changelog,
       # which is still appended below per .goreleaser.yaml's changelog
