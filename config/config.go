@@ -1281,6 +1281,18 @@ func validatePathRegex(re string) error {
 // validateFastCGI checks a route's fastcgi block. document_root is required:
 // without it the script path was joined onto the process working directory
 // ("/" in the container image). script_name must not climb out of it.
+// fastCGIReservedParams are the FastCGI params that choose the script PHP-FPM
+// runs. nvelox sets them from the script it confined to document_root; a
+// route's params may not override them (an override such as
+// SCRIPT_FILENAME: $request_uri would hand PHP-FPM an unchecked file).
+var fastCGIReservedParams = map[string]bool{
+	"SCRIPT_FILENAME": true,
+	"SCRIPT_NAME":     true,
+	"DOCUMENT_ROOT":   true,
+	"PATH_INFO":       true,
+	"PATH_TRANSLATED": true,
+}
+
 func validateFastCGI(f FastCGIConfig) error {
 	if f.DocumentRoot == "" {
 		return fmt.Errorf("document_root is required")
@@ -1288,6 +1300,11 @@ func validateFastCGI(f FastCGIConfig) error {
 	if f.SplitPathInfo != "" {
 		if err := validatePathRegex(f.SplitPathInfo); err != nil {
 			return fmt.Errorf("split_path_info: %v", err)
+		}
+	}
+	for k := range f.Params {
+		if fastCGIReservedParams[strings.ToUpper(strings.TrimSpace(k))] {
+			return fmt.Errorf("params: %s is set by nvelox (the script it checked under document_root) and cannot be overridden", k)
 		}
 	}
 	if f.ScriptName != "" {

@@ -427,3 +427,39 @@ func TestFastCGI_ExpiresOnlyOnCacheableResponses(t *testing.T) {
 		}
 	}
 }
+
+// TestFastCGI_ParamsCannotReplaceScript (H1): a route's params cannot replace
+// the script variables nvelox sets from the script it confined to
+// document_root. The config load refuses such params; this route is built
+// without it, so only the order in which the params are set stands between
+// SCRIPT_FILENAME and the sibling directory.
+func TestFastCGI_ParamsCannotReplaceScript(t *testing.T) {
+	root := phpDocRoot(t)
+	fpm, addr := startFakeFPM(t)
+	routes := []config.RouteConfig{{Match: config.RouteMatch{PathRegex: `\.php$`},
+		FastCGI: config.FastCGIConfig{Pass: addr, DocumentRoot: root, Params: map[string]string{
+			"SCRIPT_FILENAME": filepath.Join(filepath.Dir(root), "html-old", "x.php"),
+			"SCRIPT_NAME":     "/../html-old/x.php",
+			"DOCUMENT_ROOT":   "/",
+			"PATH_TRANSLATED": "/etc/passwd",
+			"APP_ENV":         "prod",
+		}}}}
+	rec := serveRaw(phpSite(routes, nil, config.HeadersConfig{}), "/index.php")
+	_, env, _ := fpm.last()
+	if rec.Code != http.StatusOK || env == nil {
+		t.Fatalf("HTTP %d, FPM params %v; want the front controller to run", rec.Code, env)
+	}
+	// SCRIPT_NAME is set last like the others, but net/http/fcgi (the fake
+	// FPM) consumes it into the request and does not record it.
+	want := map[string]string{
+		"SCRIPT_FILENAME": filepath.Join(root, "index.php"),
+		"DOCUMENT_ROOT":   root,
+		"PATH_TRANSLATED": "",
+		"APP_ENV":         "prod",
+	}
+	for k, v := range want {
+		if env[k] != v {
+			t.Errorf("%s = %q, want %q", k, env[k], v)
+		}
+	}
+}
