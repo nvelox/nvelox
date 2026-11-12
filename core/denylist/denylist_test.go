@@ -127,3 +127,39 @@ func TestDynamic_AddReplacesTTL(t *testing.T) {
 		t.Errorf("re-add should not duplicate; got %d entries", c)
 	}
 }
+
+// TestDynamic_RefusesTooBroadRanges: a range wider than an IPv4 /8 or an IPv6
+// /16 is refused and stores nothing — including ::ffff:0:0/96, which matches
+// every IPv4 client exactly like 0.0.0.0/0. Ranges at the limit still work.
+func TestDynamic_RefusesTooBroadRanges(t *testing.T) {
+	d := New()
+	for _, c := range []string{
+		"0.0.0.0/0", "0.0.0.0/1", "128.0.0.0/7",
+		"::/0", "2000::/3", "2001::/15",
+		"::ffff:0:0/96", "::ffff:0.0.0.0/100",
+	} {
+		if _, err := d.Add(c, 0); err == nil {
+			t.Errorf("Add(%q) accepted a range wider than /%d (v4) or /%d (v6)", c, MinPrefixV4, MinPrefixV6)
+		}
+	}
+	if n := d.Count(); n != 0 {
+		t.Fatalf("refused ranges must store nothing, Count() = %d", n)
+	}
+	for _, ip := range []string{"1.2.3.4", "203.0.113.9", "2001:db8::1", "::ffff:1.2.3.4"} {
+		if d.Blocked(net.ParseIP(ip)) {
+			t.Errorf("%s blocked after only refused adds", ip)
+		}
+	}
+
+	for _, c := range []string{"10.0.0.0/8", "2001::/16", "2001:db8::/32", "::ffff:10.0.0.0/104", "1.2.3.0/24", "1.2.3.4", "1.2.3.4/32"} {
+		if _, err := d.Add(c, 0); err != nil {
+			t.Errorf("Add(%q): %v", c, err)
+		}
+	}
+	if !d.Blocked(net.ParseIP("10.200.0.1")) || !d.Blocked(net.ParseIP("2001:0:1::1")) {
+		t.Error("ranges at the limit (/8 v4, /16 v6) must still block")
+	}
+	if d.Blocked(net.ParseIP("11.0.0.1")) {
+		t.Error("11.0.0.1 is outside every accepted range")
+	}
+}

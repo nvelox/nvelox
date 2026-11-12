@@ -30,15 +30,15 @@ type Config struct {
 // MetricsConfig defines the Prometheus metrics endpoint.
 type MetricsConfig struct {
 	Enabled bool   `yaml:"enabled"`
-	Bind    string `yaml:"bind"`
+	Bind    string `yaml:"bind"` // empty = 127.0.0.1:9090 (loopback only)
 	Path    string `yaml:"path"`
 }
 
 // AdminConfig defines the admin REST API endpoint.
 type AdminConfig struct {
 	Enabled bool   `yaml:"enabled"`
-	Bind    string `yaml:"bind"`    // e.g., "127.0.0.1:9091"
-	APIKey  string `yaml:"api_key"` // Required for all requests (via X-API-Key header)
+	Bind    string `yaml:"bind"`    // e.g., "127.0.0.1:9091"; empty = 127.0.0.1:9091
+	APIKey  string `yaml:"api_key"` // Required when enabled (startup error without it); sent as X-API-Key
 }
 
 // TracingConfig defines OpenTelemetry tracing settings.
@@ -769,6 +769,11 @@ func validate(cfg *Config) error {
 
 	// Cross-listener bind-group rules (nginx-style multi-server-per-port).
 	if err := validateBindGroups(cfg.Listeners); err != nil {
+		return err
+	}
+
+	// Admin API and metrics endpoint (config/controlplane.go).
+	if err := validateControlPlane(cfg); err != nil {
 		return err
 	}
 

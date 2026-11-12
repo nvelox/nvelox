@@ -21,13 +21,13 @@ go test -v ./integration/  # Integration tests only
 | `config/` | Config validation | Version, addresses, ports, TLS, health check durations, balance algorithms, HTTP listener rules, routes, FastCGI |
 | `core/` | Rate limiter, conn limiter, UDP pool, passive health, engine reload, drain, timeouts | Token bucket, semaphore, session affinity, failure tracking, graceful shutdown |
 | `core/acl/` | ACL engine | Source IP/CIDR, method, header matching, allow/deny |
-| `core/admin/` | Admin API | Stats, backends, drain/enable/disable endpoints |
+| `core/admin/` | Admin API | Stats, backends, drain/enable/disable, denylist; required key, lockout that never refuses a valid key, bounded failure table, Host / cross-origin / Content-Type checks, ngris-sentinel client calls |
 | `core/circuitbreaker/` | Circuit breaker | Closed/open/half-open states, threshold, timeout, success reset |
 | `core/discovery/` | DNS resolver | IP passthrough, hostname resolution, change detection |
 | `core/health/` | Health checker | TCP connect, HTTP GET, lifecycle |
 | `core/httpproxy/` | Router, handler, cache, static | Host/path/regex matching, redirect vars, headers, WebSocket detection, caching, buffer pool, try_files, expires, static files |
 | `core/httpproxy/errorhtml/` | Error pages | All status codes, icons, colors, HTML structure |
-| `core/logging/` | Logger | Init, file logging, level filtering |
+| `core/logging/` | Logger | Init, file logging, level filtering, 0640/0750 file modes, reopen after rotation (no lost lines) |
 | `core/metrics/` | Prometheus metrics | Counter, gauge, histogram, text output, label handling |
 | `core/middleware/` | Per-IP rate limiter | Burst, replenish, different IPs, same IP different ports |
 | `core/scripting/` | Lua VM | Get/set headers, path, deny, set_backend, logging, invalid scripts |

@@ -8,8 +8,8 @@ nvelox is a single-binary L4/L7 proxy and load balancer written in Go. It listen
 |---|---|
 | Role | L4/L7 reverse proxy for ngris's gateway hosts and the in-cluster Ingress data plane |
 | Language / runtime | Go 1.25 (`go.mod:3`), one static binary built with `CGO_ENABLED=0` (`Dockerfile:18`, `.goreleaser.yaml:6-7`) |
-| Entrypoint | `main.go:25`: parse `-config`, `config.Load`, start `core.Engine`, handle SIGHUP (`main.go:39-104`) |
-| Listeners | Declared in config: `tcp`, `udp`, `http`, `https`, single port or range (`config/config.go:103-195`, `core/engine.go:588-655`). HTTP/3 over QUIC on `https` binds with `http3: true` (`core/httpproxy/bindgroup.go:358-379`). Admin REST API on `admin.bind` (`core/admin/api.go:61-86`), Prometheus text on `metrics.bind` (`core/engine.go:150-168`) |
+| Entrypoint | `main.go:25`: parse `-config`, `config.Load`, start `core.Engine`, handle SIGHUP and SIGUSR1 (`main.go:40-121`, `main_signals_unix.go`) |
+| Listeners | Declared in config: `tcp`, `udp`, `http`, `https`, single port or range (`config/config.go:103-195`, `core/engine.go:588-655`). HTTP/3 over QUIC on `https` binds with `http3: true` (`core/httpproxy/bindgroup.go:358-379`). Admin REST API on `admin.bind`, loopback `127.0.0.1:9091` when empty (`core/admin/api.go:121-155`), Prometheus text on `metrics.bind`, loopback `127.0.0.1:9090` when empty (`core/engine.go:152-167`, `core/controlplane.go`) |
 | How ngris runs it | systemd unit on 5 gateway hosts (`tf-infra/ansible/inventory/prod/hosts.ini:32-40`, `tf-infra/ansible/inventory/prod/hosts.ini:63-69`), built from source by the `nvelox` Ansible role (`tf-infra/ansible/roles/nvelox/tasks/main.yml:80-136`). One process per host, no replicas, no Helm chart. The in-cluster Ingress controller runs it as a sidecar, image `ghcr.io/nvelox/nvelox:v1.0.4` by default (`nvelox-ingress-controller/deploy/helm/nvelox-ingress-controller/values.yaml:84-87`) |
 | State | In memory only: runtime denylist, balancer and health status, sticky sessions, UDP sessions, rate-limit buckets, response cache. Nothing is persisted |
 | Main dependencies | `lesismal/nbio` (UDP event loop), `pires/go-proxyproto`, `quic-go/quic-go`, `yookoala/gofast` (FastCGI), `gopkg.in/yaml.v3` (`go.mod:5-12`). No database, Redis or queue client |
@@ -113,7 +113,7 @@ flowchart LR
 
 | Package | Responsibility | Key files |
 |---|---|---|
-| `main` | Flags, config load, logger init, gateway id, engine start, SIGHUP loop | `main.go:39-122` |
+| `main` | Flags, config load, logger init, gateway id, engine start, SIGHUP / SIGUSR1 loop | `main.go:40-137` |
 | `config` | YAML schema, `include:` merge, defaults, validation | `config/config.go:516-585`, `config/config.go:587-767`, `config/config.go:800-898` |
 | `core` (engine) | Builds backends, opens every listener, reload, graceful stop | `core/engine.go:112-357`, `core/engine.go:366-573`, `core/engine.go:712-858` |
 | `core` (L4) | TCP accept loops, TLS L4, half-close relay, UDP handler, PROXY trust, UDP session pool, listener rate limiter | `core/l4tcp.go:42-247`, `core/relay.go:16-258`, `core/handler.go:101-501`, `core/proxytrust.go:28-149`, `core/udppool.go:12-138`, `core/ratelimit.go:9-50` |
@@ -121,10 +121,10 @@ flowchart LR
 | `lb` | `roundrobin` (default), `leastconn` and `random` over the healthy set | `lb/lb.go:16-45` |
 | `core/health`, `core/discovery` | Active TCP or HTTP probes. DNS re-resolve that drops private IPs unless `allow_private_ips` is set | `core/health/checker.go:36-131`, `core/discovery/dns.go:87-145` |
 | `core/denylist` | Process-wide IP and CIDR denylist with TTL | `core/denylist/denylist.go:28-228` |
-| `core/admin` | REST API: stats, backends, drain or enable or disable, denylist | `core/admin/api.go:61-325` |
+| `core/admin` | REST API: stats, backends, drain or enable or disable, denylist | `core/admin/api.go:121-517` |
 | `core/acl`, `core/middleware` | ACL rules, CIDR lists, per-IP token buckets | `core/acl/acl.go:28-197`, `core/middleware/ipratelimit.go:24-138` |
 | `core/circuitbreaker`, `core/sticky`, `core/passivehealth.go`, `core/connlimit.go` | Per-backend breaker, sticky store, passive failure counting, concurrency cap. Used on the HTTP path only | `core/httpproxy/server.go:595-611`, `core/httpproxy/server.go:696-750` |
-| `core/logging` | Error log, HTTP and L4 access-log formats | `core/logging/logger.go:95-271` |
+| `core/logging` | Error log, HTTP and L4 access-log formats, log file modes and reopen | `core/logging/logger.go:95-288`, `core/logging/reopen.go` |
 | `core/metrics` | Small Prometheus text registry | `core/metrics/metrics.go:19-197` |
 | `core/tlsutil` | TLS version and cipher policy, SNI wildcard matching | `core/tlsutil/clientauth.go:105-128`, `core/tlsutil/sni.go:13-94` |
 | `proxy` | PROXY v2 header writer for UDP datagrams | `proxy/proxy_protocol.go:26-105` |
@@ -233,12 +233,12 @@ sequenceDiagram
   end
 ```
 
-- SIGHUP is caught in `main`. A config that fails to parse or validate is logged and the running config stays (`main.go:85-104`).
+- SIGHUP is caught in `main`. The log files are reopened first, then the config is reloaded; a config that fails to parse or validate is logged and the running config stays. SIGUSR1 only reopens the log files, for logrotate (`main.go:87-121`, `core/logging/reopen.go`).
 - The reload is all-or-nothing for new L7 bind addresses: each is probe-bound before anything changes (`core/engine.go:366-401`, `core/engine.go:476-501`).
 - Kept backends keep their balancer (least-conn counts), sticky store and breaker, and only swap the server list. Removed backends have their goroutines stopped (`core/engine.go:784-858`).
 - Kept bind groups swap their site set atomically, so in-flight requests finish on the old site. Removed groups drain for up to 10 s in the background (`core/engine.go:505-562`, `core/httpproxy/bindgroup.go:276-317`).
 - Certificates are re-read for every site. A file that fails to load keeps the previous cert (`core/httpproxy/bindgroup.go:494-551`). This is how cert-sync rotates public-gw certs without a restart (`tf-infra/ansible/inventory/prod/group_vars/public-gw/cert_sync.yaml:34-35`).
-- Not reloaded, so they need a restart: L4 TCP, TLS and UDP listeners and their per-listener settings, listener `rate_limit`, logging, admin and metrics (`core/engine.go:128-135`, `core/engine.go:226-273`, `main.go:59-65`). The Ansible role restarts on any listener, backend or main-config change and only reloads on cert changes (`tf-infra/ansible/roles/nvelox/tasks/main.yml:155-222`).
+- Not reloaded, so they need a restart: L4 TCP, TLS and UDP listeners and their per-listener settings, listener `rate_limit`, logging settings (the files themselves are reopened), admin and metrics (`core/engine.go:128-135`, `core/engine.go:226-273`, `main.go:59-65`). The Ansible role restarts on any listener, backend or main-config change and only reloads on cert changes (`tf-infra/ansible/roles/nvelox/tasks/main.yml:155-222`).
 
 The in-cluster Ingress controller writes its rendered fragment atomically, then sends SIGHUP to the nvelox process it finds by pid file or `/proc` (`nvelox-ingress-controller/internal/reloader/reloader.go:54-127`).
 
@@ -262,8 +262,8 @@ sequenceDiagram
   S->>A: re-push active blocks every 5m
 ```
 
-- The admin API checks loopback-only access when bound to loopback, a per-IP lockout (10 failures in 10 min locks for 15 min) and a constant-time `X-API-Key` comparison (`core/admin/api.go:21-25`, `core/admin/api.go:92-128`).
-- `POST` takes `{ip, ttl_seconds}` (TTL 0 or less never expires), `DELETE` takes `?cidr=` or `{ip}`, and `GET` lists live entries (`core/admin/api.go:271-325`).
+- The admin API requires `api_key` (load error without it, `config/controlplane.go`). Every request passes, in order: loopback-only peers when bound to loopback, a `Host` header naming the bind address (DNS rebinding), Go's cross-origin protection (`Sec-Fetch-Site` / `Origin`), a constant-time `X-API-Key` comparison, then `Content-Type: application/json` on state-changing requests. A valid key is always served; 10 failures from one IP in 10 min make that IP's further failures return 429 for 15 min, and the failure table is capped at 4096 IPs and pruned (`core/admin/api.go:30-48`, `core/admin/api.go:162-357`).
+- `POST` takes `{ip, ttl_seconds}` (TTL 0 or less never expires; ranges wider than an IPv4 /8 or IPv6 /16, including `::ffff:0:0/96`, are refused), `DELETE` takes `?cidr=` or `{ip}`, and `GET` lists live entries (`core/admin/api.go:446-507`, `core/denylist/denylist.go:30-58`).
 - Single hosts are stored in a map, ranges in a scanned list. Expired entries stop matching at once, and a sweeper removes them every minute (`core/denylist/denylist.go:76-131`, `core/engine.go:142-148`).
 - The HTTP path checks every request against the resolved client IP (`core/httpproxy/server.go:424-429`). L4 checks at accept time, and checks a UDP client behind a trusted relay once its header is parsed (`core/handler.go:149-153`, `core/handler.go:270-298`).
 - sentinel reports success only if every endpoint returned 200 (`ngris-sentinel/worker/enforce.go:66-92`). Its endpoint list holds public-gw, eu-fin and us-east (`deploy/helm/ngris-sentinel/values.yaml:302`), but not de-central, whose admin API listens on its WireGuard IP 10.10.0.3 (`tf-infra/ansible/inventory/prod/host_vars/ngris-unigate-de-central.yml:30`).
@@ -293,9 +293,9 @@ Command line: `-config` (default `nvelox.yaml`) and `-version` (`main.go:41-51`)
 | Key | Meaning and default |
 |---|---|
 | `server.gateway_id` | Written as `gw=` on HTTP access lines. Default is the hostname (`core/logging/logger.go:78-85`). ngris sets the inventory host name (`tf-infra/ansible/roles/nvelox/templates/nvelox.conf.j2:8`) |
-| `logging.level`, `access_log`, `error_log` | Level default `info` (`config/config.go:559-561`). An empty path means stdout for access and stderr for errors (`core/logging/logger.go:113-138`). Opened once at start |
-| `admin.enabled`, `bind`, `api_key` | REST API. An empty key means no auth, with a warning (`core/admin/api.go:110-122`, `core/admin/api.go:182-185`) |
-| `metrics.enabled`, `bind`, `path` | Prometheus endpoint, path default `/metrics` (`core/engine.go:150-168`). Not enabled on the ngris gateways (`tf-infra/ansible/roles/nvelox/templates/nvelox.conf.j2:1-25`) |
+| `logging.level`, `access_log`, `error_log` | Level default `info` (`config/config.go:559-561`). An empty path means stdout for access and stderr for errors (`core/logging/logger.go:130-193`). Files are created `0640` in `0750` directories and an existing file is tightened to `0640`; reopened on SIGHUP and SIGUSR1 (`core/logging/reopen.go`) |
+| `admin.enabled`, `bind`, `api_key` | REST API. The key is required when enabled (load error, `config/controlplane.go`); an empty bind means `127.0.0.1:9091` (`core/admin/api.go:27`) |
+| `metrics.enabled`, `bind`, `path` | Prometheus endpoint, path default `/metrics`, an empty bind means `127.0.0.1:9090` (`core/engine.go:152-167`, `core/controlplane.go`). Not enabled on the ngris gateways (`tf-infra/ansible/roles/nvelox/templates/nvelox.conf.j2:1-25`) |
 | `listeners[].protocol`, `bind` | `tcp` (default), `udp`, `http` or `https`. A bind like `:17000-17100` expands to one listener per port named `<name>-<port>` (`config/config.go:563-566`, `core/engine.go:637-645`) |
 | `listeners[].backend` | Pool name. `default_backend` is the deprecated alias, and setting both is an error (`config/config.go:567-577`) |
 | `server_names`, `default_server` | Multi-site per port. Rules: one protocol per socket, at most one default, every non-default site has names, names are unique, no mix of `sni_routes` and `https` (`config/config.go:800-898`) |
@@ -345,7 +345,8 @@ All fields are sanitised against CRLF, and the User-Agent is cut to 512 bytes (`
 | HTTP header, read, write, idle | 10 s, 60 s, 60 s, 120 s | `core/httpproxy/bindgroup.go:137-142` |
 | Backend pool | 1024 idle conns, 256 per host, 90 s idle, 10 s TLS handshake | `core/httpproxy/server.go:197-206` |
 | WebSocket backend dial | 10 s | `core/httpproxy/server.go:1065` |
-| Admin API | 10 s read and write, 4 KiB body | `core/admin/api.go:76-83`, `core/admin/api.go:291` |
+| Admin API | 5 s headers, 10 s read and write, 30 s idle, 8 KiB headers, 4 KiB body | `core/admin/api.go:145-153`, `core/admin/api.go:48` |
+| Metrics endpoint | 5 s headers, 10 s read and write, 30 s idle, 8 KiB headers | `core/controlplane.go` |
 | Shutdown | admin 5 s, each bind group 10 s, L4 drain 30 s | `core/engine.go:286-340` |
 
 **Failure modes**
@@ -380,7 +381,7 @@ All fields are sanitised against CRLF, and the User-Agent is cut to 512 bytes (`
 | Real client IP and forwarded headers | `core/httpproxy/server.go:856-961` |
 | X-Request-ID policy | `core/httpproxy/requestid.go:69-85` |
 | Access-log format (keep in sync with sentinel's parser) | `core/logging/logger.go:225-271`, `ngris-sentinel/worker/parser.go:103-108` |
-| Denylist store and admin API | `core/denylist/denylist.go:76-228`, `core/admin/api.go:61-325` |
+| Denylist store and admin API | `core/denylist/denylist.go:30-260`, `core/admin/api.go:121-517` |
 | Load-balancing algorithms | `lb/lb.go:35-383` |
 | Metrics | `core/metrics/metrics.go:94-197`, `core/engine.go:426-432` |
 | Release pipeline | `.goreleaser.yaml:1-69`, `.github/workflows/release.yml:1-60` |

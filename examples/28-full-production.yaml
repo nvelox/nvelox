@@ -11,14 +11,17 @@ logging:
   access_log: "/tmp/nvelox-access.log"
   error_log: "/tmp/nvelox-error.log"
 
+# Loopback only; bind a private IP and firewall the port to scrape remotely.
 metrics:
   enabled: true
-  bind: ":9090"
+  bind: "127.0.0.1:9090"
   path: "/metrics"
 
+# api_key is required (startup error without it); see 22-admin-api.yaml.
 admin:
   enabled: true
   bind: "127.0.0.1:9091"
+  api_key: "replace-with-the-output-of-openssl-rand-hex-32"
 
 listeners:
   # HTTP → redirect to HTTPS

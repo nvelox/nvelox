@@ -141,7 +141,9 @@ func (e *Engine) Start(ctx context.Context) error {
 	// 1e. Start admin API
 	if e.Config.Admin.Enabled {
 		e.AdminServer = admin.NewServer(e.Config.Admin.Bind, e.Config.Admin.APIKey, e.Balancers, denylist.Default)
-		e.AdminServer.Start()
+		if err := e.AdminServer.Start(); err != nil {
+			return err
+		}
 		// Evict expired dynamic-denylist entries periodically (admin API is the
 		// only mutator, so the sweeper only matters when admin is enabled).
 		denylist.Default.StartSweeper(time.Minute)
@@ -155,16 +157,13 @@ func (e *Engine) Start(ctx context.Context) error {
 		}
 		mux := http.NewServeMux()
 		mux.Handle(metricsPath, e.Metrics.Handler())
-		e.metricsServer = &http.Server{
-			Addr:    e.Config.Metrics.Bind,
-			Handler: mux,
-		}
+		e.metricsServer = newMetricsServer(e.Config.Metrics.Bind, mux)
 		go func() {
 			if err := e.metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				logging.Error("[METRICS] Server error: %v", err)
 			}
 		}()
-		logging.Info("Metrics endpoint started on %s%s", e.Config.Metrics.Bind, metricsPath)
+		logging.Info("Metrics endpoint started on %s%s", e.metricsServer.Addr, metricsPath)
 	}
 
 	// 1d. Start HTTP/HTTPS listeners (L7), grouped by bind address.
