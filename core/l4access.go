@@ -5,6 +5,7 @@ import (
 	"net"
 
 	"nvelox/config"
+	"nvelox/core/acl"
 	"nvelox/core/denylist"
 	"nvelox/core/tlsutil"
 )
@@ -37,27 +38,18 @@ type l4ACLRule struct {
 	allow bool
 }
 
-// parseIPNets parses IPs / CIDRs strictly: unlike acl.ParseCIDRList it fails
-// on a bad entry instead of dropping it (a dropped entry can empty an
-// allowlist, or turn an ACL rule into a match-all).
+// parseIPNets parses a client list (ip_denylist, ip_allowlist, an ACL rule's
+// source_ip) the way the HTTP path does — acl.ParseIPMatchList: surrounding
+// spaces ignored, "0.0.0.0/0" also matches IPv6 clients — but fails on a bad
+// entry instead of dropping it (a dropped entry can empty an allowlist, or
+// turn an ACL rule into a match-all).
 func parseIPNets(list []string) ([]*net.IPNet, error) {
-	var out []*net.IPNet
 	for _, s := range list {
-		if _, n, err := net.ParseCIDR(s); err == nil {
-			out = append(out, n)
-			continue
-		}
-		ip := net.ParseIP(s)
-		if ip == nil {
+		if acl.ParseCIDR(s) == nil {
 			return nil, fmt.Errorf("%q is not an IP address or CIDR", s)
 		}
-		bits := 128
-		if ip4 := ip.To4(); ip4 != nil {
-			ip, bits = ip4, 32
-		}
-		out = append(out, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
 	}
-	return out, nil
+	return acl.ParseIPMatchList(list), nil
 }
 
 func newL4Access(denyList, allowList []string, rules []config.ACLRule) (*l4Access, error) {

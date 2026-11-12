@@ -740,16 +740,8 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("listener %s: %v", l.Name, err)
 		}
 
-		// IP lists and ACL source_ip entries are enforced on every protocol.
-		// A typo must fail the load: a dropped allowlist entry can empty the
-		// list (= allow everyone) and a dropped ACL source_ip turns the rule
-		// into a match-all.
-		if err := validateIPList(l.IPAllowlist); err != nil {
-			return fmt.Errorf("listener %s: ip_allowlist: %v", l.Name, err)
-		}
-		if err := validateIPList(l.IPDenylist); err != nil {
-			return fmt.Errorf("listener %s: ip_denylist: %v", l.Name, err)
-		}
+		// IP list and ACL source_ip entries are checked for every protocol
+		// by validateAddrLists below.
 		if err := validateACL(l.ACL, l4); err != nil {
 			return fmt.Errorf("listener %s: %v", l.Name, err)
 		}
@@ -938,24 +930,11 @@ func LoadCertPool(path string) (*x509.CertPool, error) {
 	return pool, nil
 }
 
-// validateIPList checks that every entry is an IP address or a CIDR.
-func validateIPList(list []string) error {
-	for _, s := range list {
-		if _, _, err := net.ParseCIDR(s); err == nil {
-			continue
-		}
-		if net.ParseIP(s) == nil {
-			return fmt.Errorf("%q is not an IP address or CIDR", s)
-		}
-	}
-	return nil
-}
-
 // validateACL checks ACL rules: known action, sane deny status, compilable
-// path_regex, valid source_ip entries. A bad rule must fail startup rather
-// than silently never match (or match everyone). On tcp/udp listeners (l4)
-// a rule can only match the client IP: path, method and header matchers need
-// an HTTP request and are refused.
+// path_regex (validateAddrLists checks source_ip). A bad rule must fail
+// startup rather than silently never match (or match everyone). On tcp/udp
+// listeners (l4) a rule can only match the client IP: path, method and header
+// matchers need an HTTP request and are refused.
 func validateACL(rules []ACLRule, l4 bool) error {
 	for i, a := range rules {
 		if a.Action != "allow" && a.Action != "deny" {
@@ -971,9 +950,6 @@ func validateACL(rules []ACLRule, l4 bool) error {
 			if _, err := regexp.Compile(a.Match.PathRegex); err != nil {
 				return fmt.Errorf("acl %d: invalid path_regex: %v", i, err)
 			}
-		}
-		if err := validateIPList(a.Match.SourceIP); err != nil {
-			return fmt.Errorf("acl %d: source_ip: %v", i, err)
 		}
 		if l4 {
 			var httpOnly []string

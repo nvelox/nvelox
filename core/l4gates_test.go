@@ -376,3 +376,21 @@ func TestL4MaxConnections_UDP(t *testing.T) {
 		t.Fatalf("conn limiter over-released %d times", n)
 	}
 }
+
+// The L4 lists parse like the HTTP path's: surrounding spaces are ignored and
+// "0.0.0.0/0" also matches IPv6 clients; a bad entry fails instead of being
+// dropped.
+func TestL4AccessListSemantics(t *testing.T) {
+	a, err := newL4Access([]string{" 0.0.0.0/0 "}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ip := range []string{"192.0.2.1", "2001:db8::1"} {
+		if ok, status := a.check(net.ParseIP(ip), nil); ok || status != l4StatusRefused {
+			t.Errorf("ip_denylist 0.0.0.0/0: %s allowed=%v status=%q, want refused", ip, ok, status)
+		}
+	}
+	if _, err := newL4Access(nil, []string{"10.0.0.0/33"}, nil); err == nil {
+		t.Error("ip_allowlist 10.0.0.0/33 parsed, want an error")
+	}
+}
