@@ -165,3 +165,97 @@ func TestPath_RouteMatchesCanonicalPath(t *testing.T) {
 		t.Fatalf("/static/../api/x routed to %q, want api", secBody(resp))
 	}
 }
+
+// secURIBackend records the request-target each request reached the backend
+// with.
+func secURIBackend(t *testing.T) (*httptest.Server, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var seen []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r.RequestURI)
+		mu.Unlock()
+		io.WriteString(w, "URI="+r.RequestURI)
+	}))
+	t.Cleanup(ts.Close)
+	return ts, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), seen...)
+	}
+}
+
+// TestPath_EncodingKeptWhenCanonical: a path that is already canonical
+// reaches the backend exactly as the client encoded it — an encoded slash,
+// semicolon or plus inside a segment is not decoded on the way.
+func TestPath_EncodingKeptWhenCanonical(t *testing.T) {
+	backend, seen := secURIBackend(t)
+	_, addr := secSite(t, &ListenerConfig{}, []string{secHost(backend)}, secOpts{})
+	for _, p := range []string{
+		"/api/x%2Fy",
+		"/api/projects/group%2Fproject/issues",
+		"/a%3Bb",
+		"/c%2Bd",
+		"/e%20f/",
+		"/%41bc?q=%2F",
+	} {
+		resp, _ := secRaw(t, addr, secGet(p, ""), 2*time.Second)
+		if !strings.HasPrefix(secStatus(resp), "HTTP/1.1 200") {
+			t.Fatalf("%s -> %q", p, secStatus(resp))
+		}
+		got := seen()
+		if got[len(got)-1] != p {
+			t.Errorf("backend got %q for %q, want it unchanged", got[len(got)-1], p)
+		}
+	}
+}
+
+// TestPath_NonCanonicalRewritten: a path canonicalization changes reaches
+// the backend as the canonical path.
+func TestPath_NonCanonicalRewritten(t *testing.T) {
+	backend, seen := secURIBackend(t)
+	_, addr := secSite(t, &ListenerConfig{}, []string{secHost(backend)}, secOpts{})
+	for in, want := range map[string]string{
+		"/a/./b//c":           "/a/b/c",
+		"//a":                 "/a",
+		"/x/%2e%2e/y":         "/y",
+		"/x%2F..%2Fy":         "/y",
+		"/d/../e%2Ff":         "/e/f", // re-encoded from the canonical path
+		"/g/./h?q=%2F&r=1;s":  "/g/h?q=%2F&r=1;s",
+		"/sp%20ace/./x%3By/.": "/sp%20ace/x;y/",
+	} {
+		resp, _ := secRaw(t, addr, secGet(in, ""), 2*time.Second)
+		if !strings.HasPrefix(secStatus(resp), "HTTP/1.1 200") {
+			t.Fatalf("%s -> %q", in, secStatus(resp))
+		}
+		got := seen()
+		if got[len(got)-1] != want {
+			t.Errorf("backend got %q for %q, want %q", got[len(got)-1], in, want)
+		}
+	}
+}
+
+// TestACL_EncodedSpellingsDenied: the ACL matches the decoded canonical
+// path, so neither an encoded slash nor encoded dot segments get past a
+// deny rule for /admin.
+func TestACL_EncodedSpellingsDenied(t *testing.T) {
+	backend, seen := secURIBackend(t)
+	l := &ListenerConfig{ACL: []config.ACLRule{{Match: config.ACLMatch{PathRegex: "^/admin(/|$)"}, Action: "deny", Status: http.StatusNotFound}}}
+	_, addr := secSite(t, l, []string{secHost(backend)}, secOpts{})
+	for _, p := range []string{
+		"/admin%2Fsecret",
+		"/x/%2e%2e/admin/secret",
+		"/x%2F..%2Fadmin%2Fsecret",
+		"/%61dmin/secret",
+		"/admin%2F",
+	} {
+		resp, _ := secRaw(t, addr, secGet(p, ""), 2*time.Second)
+		if !strings.HasPrefix(secStatus(resp), "HTTP/1.1 404") {
+			t.Errorf("%s -> %q, want 404", p, secStatus(resp))
+		}
+	}
+	if got := seen(); len(got) != 0 {
+		t.Fatalf("backend served %q", got)
+	}
+}

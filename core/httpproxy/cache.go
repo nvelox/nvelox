@@ -142,6 +142,10 @@ func entrySize(key string, e *CacheEntry) int64 {
 
 // CacheKey generates a cache key from the request.
 //
+// The path is the escaped path the request is sent upstream with, so two
+// requests the backend may answer differently ("/a%2Fb" and "/a/b") never
+// share an entry.
+//
 // Accept-Encoding is part of the key: without it, a gzipped response cached
 // from a gzip-capable client would be served to an identity-only client,
 // who'd see garbage. Normalized to "gzip" / "identity" (presence-based) so
@@ -152,7 +156,7 @@ func CacheKey(r *http.Request) string {
 	if ae := r.Header.Get("Accept-Encoding"); strings.Contains(ae, "gzip") {
 		enc = "gzip"
 	}
-	return r.Method + "|" + r.Host + "|" + r.URL.Path + "|" + r.URL.RawQuery + "|" + enc
+	return r.Method + "|" + r.Host + "|" + r.URL.EscapedPath() + "|" + r.URL.RawQuery + "|" + enc
 }
 
 // conditionalRequestHeaders make a request partial or conditional. Its

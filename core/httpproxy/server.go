@@ -11,6 +11,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -422,14 +423,19 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rec := &statusRecorder{ResponseWriter: w}
 	w = rec
 
-	// One canonical path (dot segments resolved, duplicate slashes merged;
-	// see httppath.Canonical) for every decision below — ACL, routing, cache
-	// key — for the access log and for the upstream request. RawPath is
-	// dropped so the backend receives exactly the path that was checked.
-	if p := httppath.Canonical(r.URL.Path); strings.HasPrefix(p, "/") {
+	// Every decision below (IP lists, ACL, routing) matches the decoded path
+	// in canonical form (dot segments resolved, duplicate slashes merged;
+	// see httppath.Canonical) — the conservative view: decoding "%2F" can
+	// only add separators. When canonicalizing changed the path, the
+	// upstream request gets the canonical path (re-encoded), so the backend
+	// acts on exactly the path that was checked; otherwise it gets the path
+	// as the client encoded it ("/repo/a%2Fb" keeps its "%2F").
+	if p := httppath.Canonical(r.URL.Path); strings.HasPrefix(p, "/") && p != r.URL.Path {
 		r.URL.Path, r.URL.RawPath = p, ""
 	}
-	logPath := r.URL.EscapedPath()
+	// The access log shows the path the decisions saw, escaped: one spelling
+	// per path whatever the client's encoding ("/%2Eenv" is "/.env").
+	logPath := (&url.URL{Path: r.URL.Path}).EscapedPath()
 
 	// Security headers on all responses
 	w.Header().Set("X-Content-Type-Options", "nosniff")

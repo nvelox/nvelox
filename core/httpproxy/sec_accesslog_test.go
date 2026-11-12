@@ -183,3 +183,26 @@ func TestAccessLog_FieldInjection(t *testing.T) {
 		t.Fatalf("tail tokens wrong: %q", line)
 	}
 }
+
+// TestAccessLog_NormalizedPath: the logged path is the decoded canonical
+// path the decisions saw, escaped — the same line whatever the client's
+// encoding, so "/%2Eenv" cannot hide from a match on "/.env".
+func TestAccessLog_NormalizedPath(t *testing.T) {
+	path := secAccessLog(t)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) }))
+	defer backend.Close()
+	_, addr := secSite(t, &ListenerConfig{}, []string{secHost(backend)}, secOpts{})
+	for _, p := range []string{"/%2Eenv", "/api/x%2Fy", "/a/./b//c", "/%7Euser/caf%C3%A9"} {
+		secRaw(t, addr, secGet(p, ""), 2*time.Second)
+	}
+	lines := secLogLines(t, path, 4)
+	want := []string{`"GET /.env HTTP/1.1"`, `"GET /api/x/y HTTP/1.1"`, `"GET /a/b/c HTTP/1.1"`, `"GET /~user/caf%C3%A9 HTTP/1.1"`}
+	if len(lines) != len(want) {
+		t.Fatalf("lines %q", lines)
+	}
+	for i, w := range want {
+		if !strings.Contains(lines[i], w) {
+			t.Errorf("line %d = %q, want %s", i, lines[i], w)
+		}
+	}
+}

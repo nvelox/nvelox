@@ -296,3 +296,25 @@ func TestCompression_PartialContentNotCompressed(t *testing.T) {
 		t.Fatalf("206: status=%d Content-Encoding=%q body=%q, want 206 identity \"234\"", resp.StatusCode, resp.Header.Get("Content-Encoding"), body)
 	}
 }
+
+// TestCache_EncodedSlashNotAliased: "/k%2Fv" and "/k/v" reach the backend as
+// different request-targets, so they are cached under different keys — one
+// must never be answered with the other's response.
+func TestCache_EncodedSlashNotAliased(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "URI="+r.RequestURI)
+	}))
+	defer backend.Close()
+	s, addr := secCacheSite(t, &ListenerConfig{}, backend)
+	for i := 0; i < 2; i++ { // second round: cache hits
+		for _, p := range []string{"/k%2Fv", "/k/v"} {
+			resp, _ := secRaw(t, addr, secGet(p, ""), 2*time.Second)
+			if got := secBody(resp); got != "URI="+p {
+				t.Fatalf("round %d: %s answered with %q", i, p, got)
+			}
+		}
+	}
+	if n := s.ResponseCache.Len(); n != 2 {
+		t.Fatalf("cache entries = %d, want 2", n)
+	}
+}
