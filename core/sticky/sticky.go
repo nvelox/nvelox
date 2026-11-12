@@ -136,18 +136,78 @@ func (s *Store) evict() {
 	}
 }
 
-// KeyFromCookie extracts the sticky key from a request cookie.
+// tokenLen is the length of a ServerToToken value: 8 bytes, hex-encoded.
+const tokenLen = 16
+
+// isToken reports whether v has the exact shape ServerToToken produces.
+func isToken(v string) bool {
+	if len(v) != tokenLen {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// KeyFromCookie returns the server token carried by the sticky cookie, or ""
+// when the cookie is absent or is not a token ServerToToken could have
+// produced. The value is client input: it is only ever compared against the
+// tokens of the pool's own servers (ServerForToken), never stored.
 func KeyFromCookie(r *http.Request, cookieName string) string {
 	c, err := r.Cookie(cookieName)
-	if err != nil {
+	if err != nil || !isToken(c.Value) {
 		return ""
 	}
 	return c.Value
 }
 
-// KeyFromHeader extracts the sticky key from a request header.
+// ServerForToken returns the server of servers whose ServerToToken is token,
+// or "" if none is.
+func ServerForToken(token string, servers []string) string {
+	if !isToken(token) {
+		return ""
+	}
+	for _, s := range servers {
+		if ServerToToken(s) == token {
+			return s
+		}
+	}
+	return ""
+}
+
+// NewCookie builds the sticky cookie that pins a client to server: the
+// server's token, HttpOnly, SameSite=Lax, Path=/, and Secure when the
+// request came in over TLS.
+func NewCookie(name, server string, secure bool) *http.Cookie {
+	return &http.Cookie{
+		Name:     name,
+		Value:    ServerToToken(server),
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+	}
+}
+
+// MaxHeaderKeyLen bounds the header value used as a sticky key; a longer
+// value is ignored (no stickiness for that request).
+const MaxHeaderKeyLen = 256
+
+// KeyFromHeader returns the sticky key for header-based stickiness: the
+// SHA-256 of the header value (hex), so a store key has a fixed size
+// whatever the client sends, or "" when the header is absent or longer than
+// MaxHeaderKeyLen.
 func KeyFromHeader(r *http.Request, headerName string) string {
-	return r.Header.Get(headerName)
+	v := r.Header.Get(headerName)
+	if v == "" || len(v) > MaxHeaderKeyLen {
+		return ""
+	}
+	h := sha256.Sum256([]byte(v))
+	return hex.EncodeToString(h[:])
 }
 
 // KeyFromIPHash returns a hash of the client IP for IP-hash stickiness.

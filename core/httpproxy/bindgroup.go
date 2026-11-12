@@ -332,12 +332,15 @@ func (g *BindGroup) pickSite(ss *siteSet, host string) *HTTPServer {
 // captured that pointer and run to completion. New requests see the
 // new siteSet via atomic.Load.
 //
-// Sites that disappear from the new list have Close() called on them
-// to stop their cleanup goroutines (ResponseCache, IPRateLimiter).
-// Note: Close is called immediately — any request currently inside
-// the dropped site still holds references to those collaborators, but
-// neither cache eviction nor IP-rate-limit pruning is critical for an
-// in-flight request to finish, so stopping their tickers is safe.
+// Every old site instance that is not in the new list — a dropped site,
+// and the old instance of a site that is rebuilt under the same name — has
+// Close() called on it: that stops its cleanup goroutines (ResponseCache,
+// IPRateLimiter) and closes its upgraded (WebSocket) connections, so no
+// tunnel keeps running under the configuration it was opened with.
+// Note: Close is called immediately — a plain request currently inside an
+// old site still holds references to those collaborators, but neither
+// cache eviction nor IP-rate-limit pruning is critical for an in-flight
+// request to finish, so stopping their tickers is safe.
 //
 // ReplaceSites also rebuilds the TLS cert snapshot, in case site
 // server_names or cert paths changed. Failures during cert load follow
@@ -347,15 +350,6 @@ func (g *BindGroup) ReplaceSites(newSites []*HTTPServer) error {
 		return fmt.Errorf("bind group %s: ReplaceSites called with empty site list", g.addr)
 	}
 	oldSet := g.sites.Load()
-
-	// Index old sites by listener name so we can identify which were
-	// dropped and need Close().
-	oldByName := make(map[string]*HTTPServer)
-	if oldSet != nil {
-		for _, s := range oldSet.all {
-			oldByName[s.Listener.Name] = s
-		}
-	}
 
 	// Publish the new site set BEFORE closing dropped sites — in-flight
 	// requests should see the new set, and dropped sites' Close stops
@@ -373,16 +367,17 @@ func (g *BindGroup) ReplaceSites(newSites []*HTTPServer) error {
 		}
 	}
 
-	// Close dropped sites (in old, not in new).
-	newByName := make(map[string]struct{}, len(newSites))
-	for _, s := range newSites {
-		newByName[s.Listener.Name] = struct{}{}
-	}
-	for name, old := range oldByName {
-		if _, kept := newByName[name]; kept {
-			continue
+	// Close every old instance that is not part of the new list.
+	if oldSet != nil {
+		kept := make(map[*HTTPServer]struct{}, len(newSites))
+		for _, s := range newSites {
+			kept[s] = struct{}{}
 		}
-		old.Close()
+		for _, old := range oldSet.all {
+			if _, ok := kept[old]; !ok {
+				old.Close()
+			}
+		}
 	}
 	return nil
 }
@@ -742,13 +737,19 @@ func (g *BindGroup) pickSiteCert(sni string) *siteCert {
 	return state.defaultCert
 }
 
-// Stop gracefully shuts the group's HTTP and HTTP/3 listeners.
+// Stop gracefully shuts the group's HTTP and HTTP/3 listeners, then closes
+// its sites: http.Server.Shutdown neither waits for nor closes hijacked
+// (WebSocket) connections, so the sites close their tunnels.
 func (g *BindGroup) Stop(ctx context.Context) error {
 	if g.http3Server != nil {
 		g.http3Server.Close()
 	}
+	var err error
 	if g.httpServer != nil {
-		return g.httpServer.Shutdown(ctx)
+		err = g.httpServer.Shutdown(ctx)
 	}
-	return nil
+	for _, s := range g.siteList() {
+		s.Close()
+	}
+	return err
 }

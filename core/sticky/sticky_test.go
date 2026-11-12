@@ -58,11 +58,12 @@ func TestStore_Refresh(t *testing.T) {
 }
 
 func TestKeyFromCookie(t *testing.T) {
+	tok := ServerToToken("10.0.0.1:80")
 	r := httptest.NewRequest("GET", "/", nil)
-	r.AddCookie(&http.Cookie{Name: "SRV", Value: "abc123"})
+	r.AddCookie(&http.Cookie{Name: "SRV", Value: tok})
 
-	if got := KeyFromCookie(r, "SRV"); got != "abc123" {
-		t.Errorf("expected abc123, got %s", got)
+	if got := KeyFromCookie(r, "SRV"); got != tok {
+		t.Errorf("expected %s, got %s", tok, got)
 	}
 	if got := KeyFromCookie(r, "MISSING"); got != "" {
 		t.Errorf("expected empty for missing cookie, got %s", got)

@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -49,10 +50,34 @@ func newCompressWriter(w http.ResponseWriter, cfg config.CompressionConfig) *com
 }
 
 func (w *compressWriter) WriteHeader(code int) {
+	// 1xx informational responses (100 Continue, 103 Early Hints) precede
+	// the response: pass them on without deciding anything.
+	if code >= 100 && code < 200 {
+		w.ResponseWriter.WriteHeader(code)
+		return
+	}
 	if w.wroteHeader {
 		return
 	}
 	w.wroteHeader = true
+
+	// No body to compress, or a byte range of the uncompressed body (its
+	// Content-Range would not match a compressed one).
+	if code == http.StatusNoContent || code == http.StatusNotModified || code == http.StatusPartialContent {
+		w.ResponseWriter.WriteHeader(code)
+		return
+	}
+
+	// compression.min_length: like nginx's gzip_min_length, decided from the
+	// Content-Length header; a response without one is compressed.
+	if w.cfg.MinLength > 0 {
+		if cl := w.ResponseWriter.Header().Get("Content-Length"); cl != "" {
+			if n, err := strconv.ParseInt(cl, 10, 64); err == nil && n < int64(w.cfg.MinLength) {
+				w.ResponseWriter.WriteHeader(code)
+				return
+			}
+		}
+	}
 
 	// Check if content type is compressible
 	ct := w.ResponseWriter.Header().Get("Content-Type")
@@ -79,6 +104,11 @@ func (w *compressWriter) WriteHeader(code int) {
 		w.compressed = true
 		w.ResponseWriter.Header().Set("Content-Encoding", "gzip")
 		w.ResponseWriter.Header().Del("Content-Length") // length changes with compression
+		// The encoding depends on the request's Accept-Encoding: say so to
+		// any cache downstream.
+		if !headerHasToken(w.ResponseWriter.Header(), "Vary", "accept-encoding") {
+			w.ResponseWriter.Header().Add("Vary", "Accept-Encoding")
+		}
 		gw := gzipWriterPool.Get().(*gzip.Writer)
 		gw.Reset(w.ResponseWriter)
 		w.gw = gw
@@ -109,9 +139,23 @@ func (w *compressWriter) Flush() {
 	if w.gw != nil {
 		w.gw.Flush()
 	}
-	if f, ok := w.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+// Unwrap lets http.ResponseController reach the writers below.
+func (w *compressWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// headerHasToken reports whether a comma-separated header lists token
+// (case-insensitively).
+func headerHasToken(h http.Header, name, token string) bool {
+	for _, v := range h.Values(name) {
+		for _, t := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(t), token) {
+				return true
+			}
+		}
 	}
+	return false
 }
 
 // shouldCompress checks if the request accepts gzip encoding.

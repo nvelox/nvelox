@@ -33,6 +33,12 @@ type Breaker struct {
 	halfOpenMax int
 	halfOpenCnt int64
 	lastFail    time.Time
+	// lastProbe is when the most recent half-open probe slot was handed out.
+	// A probe whose request never reports back (RecordSuccess / RecordFailure
+	// / Release) would otherwise hold its slot forever and wedge the breaker
+	// in half-open; Allow frees the slots once no probe was handed out for
+	// a whole timeout.
+	lastProbe time.Time
 }
 
 // New creates a circuit breaker.
@@ -71,18 +77,43 @@ func (b *Breaker) Allow() bool {
 			// seed halfOpenCnt=1 BEFORE flipping state — under the mutex no
 			// concurrent Allow() can observe the new state with the old count.
 			b.halfOpenCnt = 1
+			b.lastProbe = time.Now()
 			b.state.Store(StateHalfOpen)
 			return true
 		}
 		return false
 	case StateHalfOpen:
+		// Watchdog: every slot is taken but no probe was handed out for a
+		// whole timeout, so the probes holding them never reported back
+		// (a caller path that neither recorded nor released). Reclaim them
+		// rather than refusing every request from now on.
+		if b.halfOpenCnt >= int64(b.halfOpenMax) && time.Since(b.lastProbe) > b.timeout {
+			b.halfOpenCnt = 0
+		}
 		if b.halfOpenCnt < int64(b.halfOpenMax) {
 			b.halfOpenCnt++
+			b.lastProbe = time.Now()
 			return true
 		}
 		return false
 	}
 	return true
+}
+
+// Release gives back an Allow() that ended without a backend outcome: the
+// request was never sent, or it failed for a reason that says nothing about
+// the backend (the client went away, its body was too large, ...). In
+// half-open it frees the probe slot so another request can probe; in the
+// other states there is nothing to give back.
+func (b *Breaker) Release() {
+	if b.state.Load() != StateHalfOpen {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state.Load() == StateHalfOpen && b.halfOpenCnt > 0 {
+		b.halfOpenCnt--
+	}
 }
 
 // RecordSuccess records a successful request.
