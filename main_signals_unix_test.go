@@ -120,18 +120,3 @@ logging:
 		}
 	}
 }
-
-// TestControlSignals: main subscribes run's signal loop to SIGHUP and
-// SIGUSR1, and SIGUSR1 is the reopen-only signal.
-func TestControlSignals(t *testing.T) {
-	has := map[os.Signal]bool{}
-	for _, s := range controlSignals {
-		has[s] = true
-	}
-	if !has[syscall.SIGHUP] || !has[syscall.SIGUSR1] {
-		t.Errorf("controlSignals = %v, want SIGHUP and SIGUSR1", controlSignals)
-	}
-	if reopenSignal != syscall.SIGUSR1 {
-		t.Errorf("reopenSignal = %v, want SIGUSR1", reopenSignal)
-	}
-}

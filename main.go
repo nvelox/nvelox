@@ -12,6 +12,7 @@ import (
 	"nvelox/config"
 	"nvelox/core"
 	"nvelox/core/logging"
+	"nvelox/core/procsignal"
 )
 
 var (
@@ -29,7 +30,7 @@ func main() {
 	// SIGHUP: reopen the log files and reload the config.
 	// SIGUSR1: reopen the log files (logrotate postrotate).
 	reloadCh := make(chan os.Signal, 4)
-	signal.Notify(reloadCh, controlSignals...)
+	signal.Notify(reloadCh, procsignal.Control...)
 
 	if err := run(os.Args, ctx, reloadCh); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
@@ -106,7 +107,7 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 					if reopenErr != nil {
 						logging.Error("Log reopen failed: %v — still writing to the previous log files", reopenErr)
 					}
-					if reopenSignal != nil && sig == reopenSignal {
+					if procsignal.Reopen != nil && sig == procsignal.Reopen {
 						if reopenErr == nil {
 							logging.Info("Received SIGUSR1, log files reopened")
 						}

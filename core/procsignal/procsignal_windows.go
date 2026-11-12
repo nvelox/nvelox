@@ -1,6 +1,6 @@
 //go:build windows
 
-package main
+package procsignal
 
 import (
 	"os"
@@ -8,6 +8,6 @@ import (
 )
 
 // Windows has no SIGUSR1: log files are reopened on SIGHUP only.
-var reopenSignal os.Signal
+var Reopen os.Signal
 
-var controlSignals = []os.Signal{syscall.SIGHUP}
+var Control = []os.Signal{syscall.SIGHUP}
