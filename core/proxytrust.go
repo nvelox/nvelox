@@ -14,8 +14,12 @@ import (
 // inbound PROXY-protocol-v2 header and use its source as the real client. Only
 // peers whose address falls in one of the configured `accept_proxy_from` CIDRs
 // are trusted; everyone else (direct clients, attackers) has any inbound PROXY
-// header IGNORED, so a forged header can never spoof a source IP. Empty list =>
-// trust nobody => behaves exactly as before (no inbound PROXY acceptance).
+// header IGNORED. Over TCP the handshake proves the peer address, so only a
+// listed peer can name a client. Over UDP the source address of a datagram
+// can be forged: a UDP relay may be listed only where the network drops
+// packets that claim its address from anywhere else (see accept_proxy_from in
+// nvelox.example.yaml). Empty list => trust nobody => behaves exactly as
+// before (no inbound PROXY acceptance).
 //
 // This is the receiving half of cross-region client-IP preservation: a peer
 // region's relay prepends a PROXY-v2 header carrying the real client; the

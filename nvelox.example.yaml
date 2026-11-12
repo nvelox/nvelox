@@ -133,15 +133,21 @@ listeners:
     #   makes every IP-based control forgeable; prefer externalTrafficPolicy:
     #   Local and/or firewall the listener to the proxy.
     # accept_proxy_from: ["10.50.0.0/16"]
-    #   L4 inbound PROXY-protocol-v2 trust (tcp / https-passthrough listeners).
-    #   For connections from these CIDRs, nvelox parses the inbound PROXY-v2
-    #   header and uses its source as the real client (then forwards it via
-    #   send_proxy_v2 to the backend). Peers OUTSIDE the list have any inbound
-    #   PROXY header IGNORED — the real TCP peer is used — so a direct client
-    #   cannot spoof its source. Non-PROXY clients (browsers) pass through
-    #   unchanged. Empty (default) = trust nobody. Use this on a region's edge
-    #   to accept the PROXY-v2 header that a PEER region's tunnel-server relay
-    #   prepends, preserving the real client IP across a cross-region hop.
+    #   L4 inbound PROXY-protocol-v2 trust (tcp, https-passthrough and udp
+    #   listeners). For peers in these CIDRs, nvelox parses the inbound
+    #   PROXY-v2 header and uses its source as the real client (then forwards
+    #   it via send_proxy_v2 to the backend). Peers OUTSIDE the list have any
+    #   inbound PROXY header IGNORED and are the client themselves. Empty
+    #   (default) = trust nobody. Use this on a region's edge to accept the
+    #   PROXY-v2 header that a PEER region's tunnel-server relay prepends,
+    #   preserving the real client IP across a cross-region hop.
+    #   TCP: the handshake proves the peer's address, so only a listed peer
+    #   can supply a header. UDP: a datagram's source address can be forged,
+    #   so anyone who can send packets claiming a listed address can name any
+    #   client. List a UDP relay only where the network drops such packets
+    #   before they reach this host: the relay reaches it over a private
+    #   network or WireGuard, and the public side drops those source
+    #   addresses (provider/firewall anti-spoofing, strict rp_filter).
 
     # Timeouts (HTTP/HTTPS listeners). All values accept Go duration
     # strings ("30s", "5m", "1h"). An explicit "0" means unlimited.
