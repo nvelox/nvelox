@@ -247,18 +247,50 @@ func SanitizeLogField(s string) string {
 	return string(b)
 }
 
+// escapeQuoted escapes the two bytes that could end or bend a quoted
+// access-log field: '"' becomes \x22 and '\' becomes \x5C (nginx's
+// escaping), so a value can never close its quotes and forge the fields that
+// follow. Control characters are left to SanitizeLogField, which runs after
+// this and so cannot be confused with an escaped backslash.
+func escapeQuoted(s string) string {
+	if !strings.ContainsAny(s, "\"\\") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '"':
+			b.WriteString(`\x22`)
+		case '\\':
+			b.WriteString(`\x5C`)
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
+}
+
 // AccessHTTP logs an HTTP request in CLF-like format. Every variable field is
 // sanitized against CRLF log injection. clientIP comes from the server's
 // trusted-proxy-aware resolver (always a validated IP — the real client behind
 // a trusted proxy, else the connection peer), so sanitizing it is normally a
 // no-op; we do it anyway as defense-in-depth against future callers passing a
 // less-validated value. host is the requested vhost (r.Host); an empty host is
-// logged as "-". fetchSite / fetchDest are the request's Sec-Fetch-Site /
-// Sec-Fetch-Dest headers ("" when absent) and tls whether it arrived over TLS
-// (HTTPS, including HTTP/3).
+// logged as "-". path is the request path as the server's callers pass it
+// (the escaped canonical path, so a decoded '"' or space never reaches the
+// line); like the User-Agent it additionally has '"' and '\' escaped (see
+// escapeQuoted). An empty backend (the request was answered without an
+// upstream: a deny, a redirect, a cache hit, ...) is logged as "-".
+// fetchSite / fetchDest are the request's Sec-Fetch-Site / Sec-Fetch-Dest
+// headers ("" when absent) and tls whether it arrived over TLS (HTTPS,
+// including HTTP/3).
 func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes int64, duration float64, backend, userAgent, fetchSite, fetchDest string, tls bool, requestID, site string) {
 	if host == "" {
 		host = "-"
+	}
+	if backend == "" {
+		backend = "-"
 	}
 	if requestID == "" {
 		requestID = "-"
@@ -282,11 +314,11 @@ func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes in
 		SanitizeLogField(clientIP),
 		SanitizeLogField(host),
 		SanitizeLogField(method),
-		SanitizeLogField(path),
+		SanitizeLogField(escapeQuoted(path)),
 		SanitizeLogField(proto),
 		status, bytes, duration,
 		SanitizeLogField(backend),
-		SanitizeLogField(clipUA(userAgent)),
+		SanitizeLogField(escapeQuoted(clipUA(userAgent))),
 		fetchMetaToken(fetchSite),
 		fetchMetaToken(fetchDest),
 		scheme,
