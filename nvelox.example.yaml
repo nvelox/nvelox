@@ -11,31 +11,50 @@ server:
   workers: 0  # SO_REUSEPORT workers (0 = single process)
 
 # ─── Logging ───────────────────────────────────────────────
+# Log files are created 0640 in 0750 directories (an existing file is
+# tightened to 0640). After logrotate moves them away, send SIGUSR1
+# (`kill -USR1 <pid>`, or `systemctl kill -s USR1 nvelox` under systemd)
+# and nvelox reopens both; SIGHUP reopens them too, then reloads.
 logging:
   level: "info"  # debug, info, warning, error
   access_log: "/var/log/nvelox/access.log"  # Per-request CLF format
   error_log: "/var/log/nvelox/error.log"
 
 # ─── Prometheus Metrics ───────────────────────────────────
+# No authentication. Loopback only by default (an empty bind means
+# 127.0.0.1:9090). To scrape from another host, bind a private interface IP
+# and firewall the port to your Prometheus servers — never a public
+# address. In a container, loopback is unreachable from outside: bind
+# "0.0.0.0:9090" there and publish the port to trusted networks only.
 metrics:
   enabled: true
-  bind: ":9090"
+  bind: "127.0.0.1:9090"
   path: "/metrics"
 
 # ─── Admin API ─────────────────────────────────────────────
 admin:
-  enabled: true
-  bind: "127.0.0.1:9091"
-  # api_key required when the API is reachable from anything other than
-  # loopback. Checked with constant-time compare; brute-force protection
-  # locks the source IP after 10 failed attempts in a 10m window.
+  enabled: false
+  bind: "127.0.0.1:9091"  # empty = 127.0.0.1:9091 (loopback only)
+  # api_key is REQUIRED when enabled: nvelox refuses to start without it.
+  # Sent as the X-API-Key header and compared in constant time. Use a long
+  # random value (`openssl rand -hex 32`): a valid key is always served, and
+  # 10 failed attempts from one IP in 10m only throttle that IP's further
+  # failures (429) for 15m.
   # api_key: "set-from-env-or-vault"
+  # Requests must name the bind address in the Host header, POST needs
+  # "Content-Type: application/json", and browser cross-site requests are
+  # refused. On a non-loopback bind, firewall the port to the managing hosts.
   # Endpoints:
-  #   GET  /api/v1/stats
-  #   GET  /api/v1/backends
-  #   POST /api/v1/backends/{name}/drain?server=addr
-  #   POST /api/v1/backends/{name}/enable?server=addr
-  #   POST /api/v1/backends/{name}/disable?server=addr
+  #   GET    /api/v1/stats
+  #   GET    /api/v1/backends
+  #   POST   /api/v1/backends/{name}/drain?server=addr
+  #   POST   /api/v1/backends/{name}/enable?server=addr
+  #   POST   /api/v1/backends/{name}/disable?server=addr
+  #   GET    /api/v1/denylist
+  #   POST   /api/v1/denylist {"ip": "<ip or cidr>", "ttl_seconds": N}
+  #          (ttl <= 0 = until restart; ranges wider than /8 IPv4 or
+  #          /16 IPv6 are refused)
+  #   DELETE /api/v1/denylist?cidr=<ip or cidr>
 
 # Hot reload: `kill -HUP $(pidof nvelox)` (or `systemctl reload nvelox`)
 # applies the current contents of this file without dropping connections.

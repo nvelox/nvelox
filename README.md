@@ -229,10 +229,11 @@ listeners:
 version: "2"
 metrics:
   enabled: true
-  bind: ":9090"
+  bind: "127.0.0.1:9090"   # no auth: bind a private IP + firewall it to scrape remotely
 admin:
   enabled: true
   bind: "127.0.0.1:9091"
+  api_key: "<output of: openssl rand -hex 32>"   # required
 logging:
   level: "info"
   access_log: "/var/log/nvelox/access.log"
@@ -280,6 +281,58 @@ backends:
     servers:
       - "10.0.1.1:8080"
 ```
+
+## Admin API, Metrics and Log Files
+
+### Admin API
+- `admin.api_key` is **required** when `admin.enabled` is true: nvelox refuses to start without it. Clients send it as the `X-API-Key` header; it is compared in constant time. Use a long random key (`openssl rand -hex 32`).
+- An empty `admin.bind` means `127.0.0.1:9091`. On a loopback bind only loopback clients are served. On any other bind, firewall the port to the hosts that manage nvelox.
+- Call the API by its bind address: a request whose `Host` header is not the bind IP (or hostname) is refused with 403, so a DNS-rebinding web page cannot reach it. `localhost` also works on a loopback bind; a wildcard bind (`:9091`) accepts any IP literal.
+- `POST` requests need `Content-Type: application/json` (the body-less backend actions too), and browser cross-site requests (`Sec-Fetch-Site` / `Origin`) are refused with 403.
+- A valid key is always served. After 10 failed attempts from one IP within 10 minutes, that IP's further *failures* get `429` (with `Retry-After`) for 15 minutes.
+- The denylist refuses ranges wider than an IPv4 `/8` or an IPv6 `/16` (`0.0.0.0/0`, `::/0`, `::ffff:0:0/96`, …). `ttl_seconds` ≤ 0 keeps an entry until restart.
+
+```bash
+KEY=...   # admin.api_key
+curl -H "X-API-Key: $KEY" http://127.0.0.1:9091/api/v1/stats
+curl -X POST -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  "http://127.0.0.1:9091/api/v1/backends/web/drain?server=10.0.0.1:8080"
+curl -X POST -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"ip":"203.0.113.7","ttl_seconds":3600}' http://127.0.0.1:9091/api/v1/denylist
+curl -X DELETE -H "X-API-Key: $KEY" "http://127.0.0.1:9091/api/v1/denylist?cidr=203.0.113.7"
+```
+
+### Metrics
+The `/metrics` endpoint has no authentication. An empty `metrics.bind` means `127.0.0.1:9090`. To scrape from another host, bind a private interface IP and firewall the port to your Prometheus servers; never bind it to a public address. Inside a container loopback is unreachable from outside, so bind `0.0.0.0:9090` there and publish the port to trusted networks only. Slow or oversized requests are cut off (5 s header / 10 s read and write timeouts, 8 KiB of headers).
+
+### Signals and log rotation
+
+| Signal | Effect |
+|--------|--------|
+| `SIGHUP` | Reopen the log files, then reload the config and TLS certificates |
+| `SIGUSR1` | Reopen the log files |
+| `SIGINT`, `SIGTERM` | Graceful shutdown |
+
+Log files are created with mode `0640` (directories `0750`); an existing file is tightened to `0640` when nvelox opens it. After logrotate renames the files, signal nvelox so it writes to the new ones:
+
+```
+/var/log/nvelox/*.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640
+    sharedscripts
+    postrotate
+        systemctl kill -s USR1 nvelox.service 2>/dev/null || true
+        # without systemd: kill -USR1 $(pidof nvelox)
+    endscript
+}
+```
+
+Only the files nvelox opens itself are reopened. If a service manager appends nvelox's stdout/stderr to the same files, send that output to the journal instead.
 
 ## Examples
 

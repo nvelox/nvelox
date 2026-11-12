@@ -341,23 +341,34 @@ go run examples/http_backend.go :8082 "backend-2" &
 
 ./nvelox -config examples/22-admin-api.yaml
 
+# Every request carries the key (admin.api_key in the config).
+KEY=replace-with-the-output-of-openssl-rand-hex-32
+
 # Stats
-curl http://127.0.0.1:9091/api/v1/stats
+curl -H "X-API-Key: $KEY" http://127.0.0.1:9091/api/v1/stats
 # Expected: {"uptime":"...","backends":1}
 
 # List backends
-curl http://127.0.0.1:9091/api/v1/backends
+curl -H "X-API-Key: $KEY" http://127.0.0.1:9091/api/v1/backends
 # Expected: [{"name":"pool"}]
 
-# Drain a server
-curl -X POST "http://127.0.0.1:9091/api/v1/backends/pool/drain?server=127.0.0.1:8081"
+# Drain a server (POST needs Content-Type: application/json)
+curl -X POST -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  "http://127.0.0.1:9091/api/v1/backends/pool/drain?server=127.0.0.1:8081"
 # Expected: server marked as draining
 
 # Verify traffic goes only to backend-2
 curl http://127.0.0.1:9000/
 
 # Re-enable
-curl -X POST "http://127.0.0.1:9091/api/v1/backends/pool/enable?server=127.0.0.1:8081"
+curl -X POST -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  "http://127.0.0.1:9091/api/v1/backends/pool/enable?server=127.0.0.1:8081"
+
+# Without the key → 401; without the JSON Content-Type → 415;
+# called by another name than the bind address → 403
+curl -i http://127.0.0.1:9091/api/v1/stats
+curl -i -X POST -H "X-API-Key: $KEY" "http://127.0.0.1:9091/api/v1/backends/pool/drain?server=127.0.0.1:8081"
+curl -i -H "X-API-Key: $KEY" -H 'Host: attacker.example' http://127.0.0.1:9091/api/v1/stats
 ```
 
 ## 23 — Configurable Timeouts
@@ -465,8 +476,8 @@ curl -k https://127.0.0.1:9443/api/users
 # Test metrics
 curl http://127.0.0.1:9090/metrics
 
-# Test admin API
-curl http://127.0.0.1:9091/api/v1/stats
+# Test admin API (key = admin.api_key in the config)
+curl -H "X-API-Key: replace-with-the-output-of-openssl-rand-hex-32" http://127.0.0.1:9091/api/v1/stats
 
 # Test TCP port range
 echo "game-data" | nc 127.0.0.1 9100
@@ -699,6 +710,7 @@ What's covered:
 | Add a new HTTP/3 listener | `Alt-Svc` advertisement turns on for the affected site. |
 | Port conflict on a new bind | Reload aborts pre-flight; existing config keeps running. |
 | Invalid YAML / config | `config.Load` rejects; existing config keeps running. |
+| Log files rotated away | Reopened at the configured paths before the reload (also on `SIGUSR1`, which only reopens the logs — use it in logrotate's `postrotate`). Changing `logging:` settings still needs a restart. |
 
 Reload is serialized — concurrent SIGHUPs queue rather than racing.
 
