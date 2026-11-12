@@ -755,6 +755,11 @@ func validate(cfg *Config) error {
 		}
 	}
 
+	// Every IP / CIDR list entry must parse (it used to be dropped silently).
+	if err := validateAddrLists(cfg.Listeners); err != nil {
+		return err
+	}
+
 	// Cross-listener bind-group rules (nginx-style multi-server-per-port).
 	if err := validateBindGroups(cfg.Listeners); err != nil {
 		return err
