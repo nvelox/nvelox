@@ -212,6 +212,7 @@ rotate:
 			t.Fatalf("Reopen %d: %v", r, err)
 		}
 	}
+	<-done
 
 	seen := make(map[string]bool, writers*lines)
 	files, _ := filepath.Glob(access + "*")
