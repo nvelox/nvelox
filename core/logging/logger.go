@@ -5,7 +5,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"unicode/utf8"
@@ -82,6 +81,11 @@ type loggerState struct {
 	accessLog *log.Logger
 	errorLog  *log.Logger
 	level     Level
+	// accessFile / errorFile are the files behind accessLog / errorLog (nil
+	// when that log goes to stdout / stderr). Reopen swaps the open file
+	// inside them (log rotation).
+	accessFile *logFile
+	errorFile  *logFile
 }
 
 // current holds the active logger state. Init swaps a fresh state in
@@ -123,9 +127,14 @@ func gateway() string {
 	return ""
 }
 
-// Init initializes the logger with config.
+// Init initializes the logger with config. Log files are opened for
+// appending with mode 0640 (directories 0750); an existing file is tightened
+// to at most 0640. Reopen re-opens them after log rotation.
 func Init(logLevel string, accessPath, errorPath string) error {
+	fileMu.Lock()
+	defer fileMu.Unlock()
 	next := &loggerState{}
+	var warnings []string
 
 	// Parse Level
 	switch strings.ToLower(logLevel) {
@@ -144,34 +153,42 @@ func Init(logLevel string, accessPath, errorPath string) error {
 	// Setup Error Log
 	var errWriter io.Writer = os.Stderr
 	if errorPath != "" {
-		if err := os.MkdirAll(filepath.Dir(errorPath), 0755); err != nil {
-			return fmt.Errorf("failed to create log dir: %w", err)
-		}
-		f, err := os.OpenFile(errorPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		f, warn, err := openLogFile(errorPath)
 		if err != nil {
 			return fmt.Errorf("failed to open error log: %w", err)
 		}
-		errWriter = f
+		if warn != "" {
+			warnings = append(warnings, warn)
+		}
+		next.errorFile = &logFile{path: errorPath, f: f}
+		errWriter = next.errorFile
 	}
 	next.errorLog = log.New(errWriter, "", log.LstdFlags) // Prefix handled in helpers
 
 	// Setup Access Log
 	var accessWriter io.Writer = os.Stdout
 	if accessPath != "" {
-		if err := os.MkdirAll(filepath.Dir(accessPath), 0755); err != nil {
-			return fmt.Errorf("failed to create log dir: %w", err)
-		}
-		f, err := os.OpenFile(accessPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		f, warn, err := openLogFile(accessPath)
 		if err != nil {
+			if next.errorFile != nil {
+				next.errorFile.f.Close()
+			}
 			return fmt.Errorf("failed to open access log: %w", err)
 		}
-		accessWriter = f // Access log usually file only or stdout
+		if warn != "" {
+			warnings = append(warnings, warn)
+		}
+		next.accessFile = &logFile{path: accessPath, f: f}
+		accessWriter = next.accessFile // Access log usually file only or stdout
 	}
 	next.accessLog = log.New(accessWriter, "", 0) // Raw format
 
 	// Atomic swap: concurrent readers see either the old or the new
 	// state in full — never a torn mix.
 	current.Store(next)
+	for _, w := range warnings {
+		Warn("%s", w)
+	}
 	return nil
 }
 
