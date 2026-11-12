@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -355,67 +356,126 @@ func TestAdminAPI_Denylist(t *testing.T) {
 	}
 }
 
-// TestAdminAPI_SentinelClientCompat replays ngris-sentinel's exact client
-// calls (worker/enforce.go Block/Unblock, worker/apiserver.go pingGateway)
-// over real HTTP/1.1 against an admin API configured like the gateways:
-// bound to a private IP with an API key, reached by that IP.
-func TestAdminAPI_SentinelClientCompat(t *testing.T) {
-	srv := NewServer("10.0.0.130:9091", testAPIKey, map[string]lb.Balancer{}, denylist.New())
-	ts := httptest.NewServer(srv.httpServer.Handler)
-	defer ts.Close()
-	// Every dial goes to the test server; the URL (and so the Host header)
-	// stays the gateway's http://10.0.0.130:9091, as in sentinel's config.
-	tr := &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, network, ts.Listener.Addr().String())
-	}}
-	defer tr.CloseIdleConnections()
-	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
-	const base = "http://10.0.0.130:9091"
-
-	do := func(req *http.Request, key string) int {
-		t.Helper()
-		if key != "" {
-			req.Header.Set("X-API-Key", key)
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			t.Fatalf("%s %s: %v", req.Method, req.URL, err)
-		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		return resp.StatusCode
-	}
-
-	// Block (enforce.go Block).
-	payload, _ := json.Marshal(map[string]interface{}{"ip": "198.51.100.23", "ttl_seconds": 3600})
+// sentinelBlock, sentinelUnblock and sentinelPing build exactly the requests
+// ngris-sentinel sends (worker/enforce.go Block and Unblock,
+// worker/apiserver.go pingGateway). With apiKey "" no X-API-Key header is
+// set, as sentinel does when it has no key configured.
+func sentinelBlock(base, apiKey, ip string, ttlSec int) *http.Request {
+	payload, _ := json.Marshal(map[string]interface{}{"ip": ip, "ttl_seconds": ttlSec})
 	req, _ := http.NewRequest(http.MethodPost, base+"/api/v1/denylist", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
-	if code := do(req, testAPIKey); code != http.StatusOK {
-		t.Fatalf("sentinel Block: status %d", code)
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
 	}
-	if !srv.dynDeny.Blocked(net.ParseIP("198.51.100.23")) {
-		t.Fatal("sentinel Block did not block")
-	}
+	return req
+}
 
-	// Gateway ping (apiserver.go pingGateway).
-	req, _ = http.NewRequest(http.MethodGet, base+"/api/v1/denylist", nil)
-	if code := do(req, testAPIKey); code != http.StatusOK {
-		t.Fatalf("sentinel ping: status %d", code)
+func sentinelUnblock(base, apiKey, ip string) *http.Request {
+	req, _ := http.NewRequest(http.MethodDelete, base+"/api/v1/denylist?cidr="+url.QueryEscape(ip), nil)
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
 	}
+	return req
+}
 
-	// Unblock (enforce.go Unblock): DELETE ?cidr=, no body, no Content-Type.
-	req, _ = http.NewRequest(http.MethodDelete, base+"/api/v1/denylist?cidr="+url.QueryEscape("198.51.100.23"), nil)
-	if code := do(req, testAPIKey); code != http.StatusOK {
-		t.Fatalf("sentinel Unblock: status %d", code)
+func sentinelPing(base, apiKey string) *http.Request {
+	req, _ := http.NewRequest(http.MethodGet, base+"/api/v1/denylist", nil)
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
 	}
-	if srv.dynDeny.Blocked(net.ParseIP("198.51.100.23")) {
-		t.Fatal("sentinel Unblock did not unblock")
-	}
+	return req
+}
 
-	// Wrong key → 401.
-	req, _ = http.NewRequest(http.MethodGet, base+"/api/v1/denylist", nil)
-	if code := do(req, "not-the-key"); code != http.StatusUnauthorized {
-		t.Errorf("wrong key: status %d, want 401", code)
+// TestAdminAPI_SentinelClientCompat replays ngris-sentinel's three calls —
+// Block (POST JSON), Unblock (DELETE ?cidr=, no body, no Content-Type) and
+// the gateway ping (GET) — over real HTTP/1.1 against an admin API set up
+// like each gateway: bound to its private or WireGuard IP with an API key
+// and called by that IP, as sentinel's URLs do. Each call succeeds with the
+// key and is refused (401, nothing changes) without it or with a wrong one.
+func TestAdminAPI_SentinelClientCompat(t *testing.T) {
+	for _, bind := range []string{
+		"10.0.0.130:9091", "10.0.0.140:9091", // private-network gateways
+		"10.2.0.130:9091", "10.2.0.131:9091", "10.2.0.140:9091",
+		"10.10.0.2:9091", "10.10.0.3:9091", // edges: their WireGuard IP
+	} {
+		t.Run(bind, func(t *testing.T) {
+			srv := NewServer(bind, testAPIKey, map[string]lb.Balancer{}, denylist.New())
+			type seen struct {
+				host, ctype string
+				length      int64
+			}
+			var mu sync.Mutex
+			var last seen
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				last = seen{r.Host, r.Header.Get("Content-Type"), r.ContentLength}
+				mu.Unlock()
+				srv.httpServer.Handler.ServeHTTP(w, r)
+			}))
+			defer ts.Close()
+			// Every dial goes to the test server; the URL, and so the Host
+			// header, stays the gateway's http://<bind>.
+			tr := &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, ts.Listener.Addr().String())
+			}}
+			defer tr.CloseIdleConnections()
+			client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+			base := "http://" + bind
+
+			do := func(req *http.Request) (int, seen) {
+				t.Helper()
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Fatalf("%s %s: %v", req.Method, req.URL, err)
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				mu.Lock()
+				defer mu.Unlock()
+				return resp.StatusCode, last
+			}
+			const ip = "198.51.100.23"
+			blocked := func() bool { return srv.dynDeny.Blocked(net.ParseIP(ip)) }
+
+			for _, key := range []string{"", "not-the-key"} {
+				if code, _ := do(sentinelBlock(base, key, ip, 3600)); code != http.StatusUnauthorized {
+					t.Errorf("Block with key %q: status %d, want 401", key, code)
+				}
+				if code, _ := do(sentinelPing(base, key)); code != http.StatusUnauthorized {
+					t.Errorf("ping with key %q: status %d, want 401", key, code)
+				}
+			}
+			if blocked() {
+				t.Fatal("an unauthenticated Block changed the denylist")
+			}
+
+			code, req := do(sentinelBlock(base, testAPIKey, ip, 3600))
+			if code != http.StatusOK || !blocked() {
+				t.Fatalf("Block with the key: status %d, blocked=%v", code, blocked())
+			}
+			if req.host != bind || req.ctype != "application/json" {
+				t.Errorf("Block arrived as Host %q, Content-Type %q", req.host, req.ctype)
+			}
+			if code, _ := do(sentinelPing(base, testAPIKey)); code != http.StatusOK {
+				t.Fatalf("ping with the key: status %d", code)
+			}
+
+			for _, key := range []string{"", "not-the-key"} {
+				if code, _ := do(sentinelUnblock(base, key, ip)); code != http.StatusUnauthorized {
+					t.Errorf("Unblock with key %q: status %d, want 401", key, code)
+				}
+			}
+			if !blocked() {
+				t.Fatal("an unauthenticated Unblock changed the denylist")
+			}
+			code, req = do(sentinelUnblock(base, testAPIKey, ip))
+			if code != http.StatusOK || blocked() {
+				t.Fatalf("Unblock with the key: status %d, still blocked=%v", code, blocked())
+			}
+			if req.host != bind || req.ctype != "" || req.length != 0 {
+				t.Errorf("Unblock arrived as Host %q, Content-Type %q, length %d; want the bind, none, 0", req.host, req.ctype, req.length)
+			}
+		})
 	}
 }
 
