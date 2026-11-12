@@ -47,6 +47,10 @@ version: "2"
 listeners:
   - name: "test"
     bind: ":8080"
+    backend: "be"
+backends:
+  - name: "be"
+    servers: ["10.0.0.1:80"]
 `
 	tmp, _ := os.CreateTemp("", "nvelox_test_*.yaml")
 	defer os.Remove(tmp.Name())
@@ -294,7 +298,8 @@ func TestValidation_BindAddress(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := &Config{
 				Version:   "2",
-				Listeners: []Listener{{Name: "l1", Bind: tt.bind}},
+				Backends:  []Backend{{Name: "be", Servers: []string{"10.0.0.1:80"}}},
+				Listeners: []Listener{{Name: "l1", Bind: tt.bind, Backend: "be"}},
 			}
 			err := validate(cfg)
 			if (err != nil) != tt.wantErr {
@@ -402,11 +407,13 @@ func TestValidation_TLS(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := &Config{
-				Version: "2",
+				Version:  "2",
+				Backends: []Backend{{Name: "be", Servers: []string{"10.0.0.1:80"}}},
 				Listeners: []Listener{{
-					Name: "l1",
-					Bind: ":443",
-					TLS:  TLSConfig{Cert: tt.cert, Key: tt.key},
+					Name:    "l1",
+					Bind:    ":443",
+					Backend: "be",
+					TLS:     TLSConfig{Cert: tt.cert, Key: tt.key},
 				}},
 			}
 			err := validate(cfg)

@@ -65,6 +65,12 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 	logging.SetGateway(cfg.Server.GatewayID)
 	logging.Info("Nvelox Server %s starting...", Version)
 	logging.Info("Loaded configuration from %s", *configPath)
+	// server.user / group / pid_file / workers are parsed but not implemented
+	// (no privilege drop, no pid file, one process). Say so loudly on stderr
+	// (the error log under systemd) whatever the log level.
+	for _, w := range config.ServerWarnings(cfg.Server) {
+		fmt.Fprintf(os.Stderr, "[CONFIG] WARNING: %s\n", w)
+	}
 
 	// Expand port ranges in listeners.
 	expandedListeners, err := core.ExpandListeners(cfg.Listeners)

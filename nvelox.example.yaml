@@ -5,10 +5,14 @@ version: "2"
 
 # ─── Server Settings ───────────────────────────────────────
 server:
-  user: "nvelox"
-  group: "nvelox"
-  pid_file: "/var/run/nvelox.pid"
-  workers: 0  # SO_REUSEPORT workers (0 = single process)
+  # gateway_id: "gw-1"  # gw=<id> on HTTP access-log lines (default: hostname)
+  # user / group / pid_file / workers are accepted but NOT implemented:
+  # nvelox never drops privileges, writes no pid file and runs one process.
+  # When set (and the process is not already that user/group) nvelox prints a
+  # WARNING at startup. Run it under systemd User=/Group= with
+  # AmbientCapabilities=CAP_NET_BIND_SERVICE to bind ports below 1024.
+  # user: "nvelox"
+  # group: "nvelox"
 
 # ─── Logging ───────────────────────────────────────────────
 logging:
@@ -84,9 +88,14 @@ listeners:
     tls:
       cert: "/etc/ssl/certs/server.pem"
       key: "/etc/ssl/private/server.key"
-      # ocsp_stapling: true
-      # client_auth: "require"         # mTLS: "require", "request", "none"
-      # client_ca: "/etc/ssl/ca.pem"
+      # client_auth: "require"         # mTLS: "require" (verified cert needed),
+      #                                #   "request" (asked, not required), "none"
+      # client_ca: "/etc/ssl/ca.pem"   # PEM CA bundle; required by "require".
+      #   Per site when several https listeners share a bind (chosen by SNI);
+      #   a request whose Host names a client_auth site over a connection
+      #   whose SNI chose another site gets 421. Also applies to http3 and to
+      #   TLS-terminating tcp listeners. A missing / unparseable CA fails the
+      #   load. (ocsp_stapling is not implemented and is rejected.)
       # min_version: "1.2"             # "1.2" or "1.3" (defaults 1.2)
       # max_version: "1.3"             # defaults 1.3
       # cipher_suites:                 # TLS 1.2 only; TLS 1.3 suites are
@@ -141,7 +150,9 @@ listeners:
       requests_per_second: 50
       burst: 20
 
-    # Security
+    # Security (ip_denylist / ip_allowlist / acl also work on tcp and udp
+    # listeners, per connection / UDP session; there an acl rule may only
+    # match source_ip). Entries must be valid IPs or CIDRs.
     ip_denylist: ["192.168.100.0/24"]
     # ip_allowlist: ["10.0.0.0/8"]  # If set, only listed CIDRs allowed
     max_body_size: "10MB"
@@ -228,13 +239,8 @@ listeners:
           pass: "127.0.0.1:9000"
           document_root: "/var/www/html"
 
-      # Lua scripting hook
-      # - match:
-      #     path_prefix: "/custom"
-      #   backend: "web-cluster"
-      #   scripts:
-      #     request_script: "/etc/nvelox/scripts/auth.lua"
-      #     response_script: "/etc/nvelox/scripts/transform.lua"
+      # (routes[].scripts — Lua hooks — are not implemented; a route that
+      # sets them is rejected at load.)
 
   # ─── TCP L4 proxy (gaming/tunneling) ───────────────────
   # L4 TCP sessions follow standard half-close semantics: when either side
@@ -275,15 +281,10 @@ listeners:
   #     servers: ["10.1.0.5:17999"]  # explicit mux port → all range ports land here
   #     send_proxy_v2: true
 
-  # ─── TLS passthrough with SNI routing ──────────────────
-  # - name: "tls-passthrough"
-  #   bind: ":8443"
-  #   protocol: "tcp"
-  #   sni_routes:
-  #     - server_name: "api.example.com"
-  #       backend: "api-servers"
-  #     - server_name: "*.example.com"
-  #       backend: "web-cluster"
+  # ─── TLS passthrough ───────────────────────────────────
+  # A tcp listener without a tls block forwards TLS untouched to its one
+  # backend. (sni_routes — routing passthrough by SNI — is not implemented;
+  # a listener that sets it is rejected at load.)
 
   # ─── Multi-server-per-port (nginx-style) ───────────────
   # Multiple HTTPS listeners may share the same `bind:`. Each is its own
@@ -305,6 +306,11 @@ listeners:
   #   backend: "web-cluster"
 
   # ─── UDP proxy ─────────────────────────────────────────
+  # Each client source ip:port is one session (own backend socket). Fixed
+  # limits: 16384 sessions per process, 512 per client IP; a session ends
+  # 10s after its first datagram if the backend never answered, else 60s
+  # after the backend's last reply. With accept_proxy_from, every datagram
+  # from a trusted relay must carry a PROXY v2 header (others are dropped).
   - name: "dns-proxy"
     bind: ":5353"
     protocol: "udp"
@@ -338,7 +344,7 @@ listeners:
 backends:
   - name: "web-cluster"
     balance: "roundrobin"  # roundrobin, leastconn, random
-    max_connections: 200
+    max_connections: 200   # concurrent HTTP requests / TCP conns / UDP sessions
     # send_proxy_v2 prepends a PROXY protocol v2 header so the backend
     # sees the real client address.
     #   - TCP backends: header sent once per connection (STREAM variant).
@@ -379,10 +385,13 @@ backends:
       timeout: "30s"           # Time before half-open probe
       half_open_max: 2         # Probe requests in half-open state
 
-    # Backend TLS (connect to upstream via TLS — L7 only). Defaults are
-    # secure: InsecureSkipVerify=false, system roots, MinVersion=TLS1.2.
-    # Setting `insecure: true` explicitly opts out of cert verification
-    # and is logged at WARN on startup.
+    # Backend TLS (connect to upstream via TLS — http/https listeners only;
+    # a tcp/udp listener on a backend_tls backend is rejected at load).
+    # Defaults are secure: InsecureSkipVerify=false, system roots,
+    # MinVersion=TLS1.2. Setting `insecure: true` explicitly opts out of cert
+    # verification and is logged at WARN on startup. A ca_cert or client
+    # key pair that cannot be loaded fails the load / reload — nvelox never
+    # falls back to plaintext.
     # backend_tls:
     #   enabled: true
     #   ca_cert: "/etc/ssl/ca.pem"

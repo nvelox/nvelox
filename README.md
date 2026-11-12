@@ -22,7 +22,7 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 ## Features
 
 ### Core Proxy
-- **L4 TCP/UDP Proxy** — TCP relay with standard half-close semantics (back-pressured; when either side closes first, everything already read is delivered before the FIN is passed on), UDP via the nbio event loop
+- **L4 TCP/UDP Proxy** — TCP relay with standard half-close semantics (back-pressured; when either side closes first, everything already read is delivered before the FIN is passed on), UDP via the nbio event loop with bounded sessions (at most 16,384, and 512 per client IP; a session its backend never answers ends after 10 s)
 - **L7 HTTP Reverse Proxy** — `httputil.ReverseProxy` with shared connection pool
 - **HTTP/1.1 + HTTP/2** — automatic HTTP/2 via ALPN on HTTPS listeners
 - **HTTP/3 (QUIC)** — via quic-go with Alt-Svc header advertisement
@@ -35,7 +35,7 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 - **Random** — random server selection
 - **Sticky Sessions** — cookie, header, or IP-hash based session persistence
 - **Connection Draining** — mark servers as draining (no new connections, existing continue)
-- **Max Connections** — per-backend connection limit with 503 when full
+- **Max Connections** — per-backend concurrency limit: 503 on HTTP when full, new TCP connections / UDP sessions refused
 
 ### Routing (L7)
 - **Multi-server-per-port** — multiple HTTPS sites share one bind address (nginx-style); each picks its own TLS cert via SNI and dispatches by Host header. `server_names` + `default_server` control matching, leftmost wildcards (`*.foo.com`) supported.
@@ -53,14 +53,13 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 
 ### Security
 - **TLS Termination** — on any TCP or HTTPS listener
-- **OCSP Stapling** — automatic OCSP response fetching and refresh
-- **Client Certificate Auth (mTLS)** — require/request client certs with CA verification
-- **ACLs** — match by source IP/CIDR, HTTP method, headers; allow/deny actions
-- **IP Allowlist/Denylist** — CIDR-based per-listener filtering
+- **Client Certificate Auth (mTLS)** — `client_auth: require` / `request` with `client_ca` verification on TLS-terminating TCP, HTTPS and HTTP/3 listeners; per site (by SNI) when sites share a port
+- **ACLs** — match by source IP/CIDR, HTTP method, path, headers; allow/deny actions (TCP/UDP listeners: source IP only)
+- **IP Allowlist/Denylist** — CIDR-based per-listener filtering on HTTP, TCP and UDP listeners (behind a trusted PROXY v2 relay, on the client it names)
 - **Per-IP Rate Limiting** — token bucket per client IP with LRU cleanup
 - **Per-Listener Rate Limiting** — global connection rate limit
 - **Request Body Size Limit** — reject oversized request bodies
-- **SSL to Backend** — TLS when connecting to upstream servers (mTLS supported)
+- **SSL to Backend** — TLS when connecting to upstream servers from HTTP/HTTPS listeners (mTLS supported); a broken `backend_tls` config fails startup / the reload, never falls back to plaintext
 
 ### Resilience
 - **Active Health Checks** — TCP connect or HTTP GET with configurable interval/timeout
@@ -83,15 +82,12 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 - **Prometheus Metrics** — `/metrics` endpoint with counters, gauges, histograms
 - **Admin REST API** — runtime stats, drain/enable/disable servers
 - **Hot Reload** — SIGHUP reloads the whole config without dropping in-flight connections: backends (with sticky / CB / LeastConn state preserved on rename), per-listener routes / ACL / headers / error pages, TLS certs (Let's Encrypt rotation), and bind addresses (added or removed with 10s graceful drain). Pre-flight port-availability check ensures all-or-nothing apply.
-- **Bandwidth Throttling** — per-connection read/write rate limiting
 
 ### Extensibility
-- **Lua Scripting** — embedded Lua 5.1 VM with `nvelox.*` API for request/response hooks
-- **PROXY Protocol v2** — pass client IP to backends in HAProxy format
+- **PROXY Protocol v2** — pass client IP to backends in HAProxy format; accept it from trusted relays (`accept_proxy_from`)
 - **DNS Service Discovery** — periodic hostname resolution with auto-update
-- **SNI Routing** — TLS passthrough based on server name (wildcard support)
 - **Modular Config** — split configs via `include` glob patterns
-- **Config Validation** — comprehensive validation at load time
+- **Config Validation** — comprehensive validation at load time; keys that are parsed but not implemented (`sni_routes`, `throttle`, `tls.ocsp_stapling`, `routes[].scripts`) are rejected with an error naming the key, and `server.user` / `group` / `pid_file` / `workers` print a startup warning (nvelox does not drop privileges: run it under systemd `User=` with `CAP_NET_BIND_SERVICE`)
 
 ## Architecture
 
@@ -125,7 +121,7 @@ graph TD
 | **FastCGI (PHP)** | Yes | No | Yes |
 | **Static Files** | Yes | No | Yes |
 | **try_files** | Yes | No | Yes |
-| **Lua Scripting** | Yes | Yes (SPOE) | Yes |
+| **Lua Scripting** | No | Yes (SPOE) | Yes |
 | **Port Ranges** | `:10000-20000` | Individual | Individual |
 | **Config Format** | YAML | Custom | Directives |
 | **Binary** | Static (Go) | Dynamic (C) | Dynamic (C) |
@@ -352,11 +348,11 @@ core/
   health/            — Active health checks
   metrics/           — Prometheus metrics
   middleware/        — Per-IP rate limiting
-  scripting/         — Lua VM pool
-  sni/               — SNI-based TLS routing
+  scripting/         — Lua VM pool (not wired into the engine)
+  sni/               — SNI-based TLS routing (not wired into the engine)
   sticky/            — Sticky session store
-  throttle/          — Bandwidth throttling
-  tlsutil/           — OCSP, client cert auth
+  throttle/          — Bandwidth throttling (not wired into the engine)
+  tlsutil/           — TLS versions/ciphers, client cert auth, SNI matching
 config/              — YAML config parsing + validation
 lb/                  — Load balancing algorithms
 proxy/               — PROXY Protocol v2

@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
 	"nvelox/config"
-	"nvelox/core/denylist"
 	"nvelox/core/logging"
 	"nvelox/lb"
 	"nvelox/proxy"
@@ -23,6 +23,8 @@ type ProxyEventHandler struct {
 	engine      *Engine
 	listenerMap map[string]*ListenerConfig
 	sessions    sync.Map // *nbio.Conn -> *ConnContext (thread-safe session storage)
+	udpSessions *udpSessionLimiter
+	udpDrops    *udpDrops
 }
 
 func NewProxyEventHandler(e *Engine) *ProxyEventHandler {
@@ -39,6 +41,8 @@ func NewProxyEventHandler(e *Engine) *ProxyEventHandler {
 	return &ProxyEventHandler{
 		engine:      e,
 		listenerMap: lm,
+		udpSessions: newUDPSessionLimiter(e.udpMaxSessions, e.udpMaxSessionsPerIP),
+		udpDrops:    newUDPDrops(e.Metrics),
 	}
 }
 
@@ -79,6 +83,21 @@ type ConnContext struct {
 	SendProxyV2  bool
 	LocalAddr    net.Addr
 	Mu           sync.Mutex
+
+	// UDP session bookkeeping, released by OnClose. listener is the session's
+	// listener (OnData admits a relayed client against it). sessionIP is the
+	// client IP the session is charged to in the per-IP limit (zero until a
+	// trusted relay's client is known). limiter is the backend
+	// max_connections slot the session holds, if any. resolvedSrc is the
+	// client a trusted relay's first header named. refused is the access-log
+	// status when the session was refused after OnOpen. closed is set by
+	// OnClose so a late OnData cannot charge a released session.
+	listener    *ListenerConfig
+	sessionIP   netip.Addr
+	limiter     *ConnLimiter
+	resolvedSrc net.Addr
+	refused     string
+	closed      bool
 }
 
 func (h *ProxyEventHandler) setCtx(c *nbio.Conn, ctx *ConnContext) {
@@ -98,6 +117,11 @@ func (h *ProxyEventHandler) deleteCtx(c *nbio.Conn) {
 	h.sessions.Delete(c)
 }
 
+// OnOpen admits a new UDP session (one client source ip:port on a listener).
+// Order: listener rate limit -> access policy on the client (direct peers;
+// a trusted relay's client is admitted in OnData once its PROXY header names
+// it) -> session limits -> backend max_connections -> backend socket.
+// Every refusal closes through closeOnOpen, never synchronously.
 func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 	// Backend connections from DialAsync already have session set in callback
 	if h.getCtx(c) != nil {
@@ -133,23 +157,51 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 			// For a trusted relay the real client is unknowable here (no header parsed
 			// yet), so emitting would misattribute the relay — suppress it.
 			if !peerTrusted {
-				logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, "ratelimited", 0, 0, 0)
+				logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, l4StatusRateLimited, 0, 0, 0)
 			}
 			closeOnOpen(c)
 			return
 		}
 	}
 
-	// Dynamic denylist (sentinel-pushed runtime blocks): honor on the L4 accept
-	// path the same blocks the HTTP plane enforces (httpproxy Blocked() gate), so
-	// TCP and UDP drop blocked clients too. Enforced on the immediate peer only
-	// when it IS the client (untrusted/direct) — for a trusted relay the peer is
-	// infra and the real client isn't known until OnData parses PROXY-v2 (gated
-	// there). Mirrors the rate-limiter's peer-scoped enforcement above.
-	if h.l4Denied(c.RemoteAddr(), peerTrusted) {
-		logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, "denylisted", 0, 0, 0)
+	// Access policy (ip_denylist, the dynamic sentinel-pushed denylist,
+	// ip_allowlist, acl) on the immediate peer when it IS the client
+	// (untrusted/direct). For a trusted relay the peer is infra and the real
+	// client isn't known until OnData parses its PROXY-v2 header (gated there).
+	var sessionIP netip.Addr
+	if !peerTrusted {
+		ip := ipOf(c.RemoteAddr())
+		if ok, status := h.l4Admit(l, ip); !ok {
+			logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, status, 0, 0, 0)
+			closeOnOpen(c)
+			return
+		}
+		sessionIP = addrKey(ip)
+	}
+
+	// Session limits: a global cap and a per-client-IP cap (a trusted relay's
+	// client is charged in OnData).
+	if reason := h.udpSessions.acquire(sessionIP); reason != "" {
+		h.udpDrops.note(reason, l.Name, c.RemoteAddr())
+		if reason == udpDropSourceLimit && !peerTrusted {
+			logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, l4StatusRateLimited, 0, 0, 0)
+		}
 		closeOnOpen(c)
 		return
+	}
+	// Backend max_connections: one slot per UDP session, released in OnClose.
+	var limiter *ConnLimiter
+	if cl, ok := h.engine.ConnLimiters[l.Backend]; ok {
+		if !cl.Acquire() {
+			h.udpSessions.release(sessionIP)
+			logging.Warn("[CONN] listener %s: backend %s at max_connections — refusing %s", l.Name, l.Backend, c.RemoteAddr())
+			if !peerTrusted {
+				logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, l4StatusRateLimited, 0, 0, 0)
+			}
+			closeOnOpen(c)
+			return
+		}
+		limiter = cl
 	}
 
 	logging.Info("[CONN] New %s client %s -> :%d", l.Protocol, c.RemoteAddr(), dstPort)
@@ -163,36 +215,27 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 		DstPort:      dstPort,
 		RealClientIP: ipStrOf(c.RemoteAddr()), // upgraded to the PROXY-v2 client if a trusted header resolves
 		PeerTrusted:  peerTrusted,
+		listener:     l,
+		sessionIP:    sessionIP,
+		limiter:      limiter,
 	}
 	h.setCtx(c, clientCtx)
 
 	h.connectBackend(c, l)
 }
 
-// l4Denied reports whether an L4 (TCP/UDP) connection from addr must be dropped
-// by the dynamic denylist. Only the immediate peer is consulted, and only when
-// it is the real client (untrusted/direct): a trusted relay's peer IS infra, so
-// blocking it would sever cross-region traffic — the real client behind such a
-// relay is enforced in OnData once PROXY-v2 resolves it.
-func (h *ProxyEventHandler) l4Denied(addr net.Addr, peerTrusted bool) bool {
-	if peerTrusted || addr == nil {
-		return false
-	}
-	ip := ipOf(addr)
-	return ip != nil && denylist.Default.Blocked(ip)
-}
-
-// closeOnOpen closes a connection being REJECTED from OnOpen (rate-limit or
-// denylist). It must NOT close synchronously: nbio's addConn calls OnOpen and
-// only AFTER it returns registers the fd with the poller (addRead). A synchronous
-// close makes that addRead fail with EBADF ("addConn [fd] failed: bad file
-// descriptor") and, under fd reuse, orphans the reused fd — a leaked connection
-// that lingers until timeout. Conn.Execute is NOT a fix here: nvelox runs nbio
-// with the default (inline) Engine.Execute, which runs the job synchronously in
-// place. A real goroutine is genuinely deferred — OnOpen returns and addConn
-// finishes registering the fd (nanoseconds) long before the Go scheduler can
-// dispatch this goroutine, so addRead always succeeds and the close then runs
-// through nbio's normal, fd-registered path.
+// closeOnOpen closes a UDP session being REJECTED from OnOpen (or failing
+// inside it). It must NOT close synchronously: nbio calls OnOpen from the
+// poller while it holds the UDP listener's (parent) conn mutex
+// (ReadAndGetConn -> readUDP -> getConn -> onOpen), and closing a child conn
+// takes that same mutex to remove itself from the parent's table
+// (udpConn.Close). A synchronous Close therefore deadlocks the poller
+// goroutine, and every UDP listener on that poller stops until a restart.
+// Conn.Execute is NOT a fix here: nvelox runs nbio with the default (inline)
+// Engine.Execute, which runs the job synchronously in place. A real goroutine
+// blocks on the mutex until OnOpen returns and the poller releases it, then
+// closes through nbio's normal path (OnClose included). (OnData runs after
+// the poller released the mutex, so closing there is synchronous-safe.)
 func closeOnOpen(c *nbio.Conn) {
 	go func() { _ = c.Close() }()
 }
@@ -214,7 +257,11 @@ func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
 	realClientIP := ctx.RealClientIP
 	peerTrusted := ctx.PeerTrusted
 	clientResolved := ctx.ClientResolved
+	refused := ctx.refused
+	sessionIP, limiter := ctx.sessionIP, ctx.limiter
 	ctx.PeerConn = nil // prevent double-close
+	ctx.closed = true  // a late OnData must not charge the released session
+	ctx.limiter = nil
 	ctx.Mu.Unlock()
 
 	if peer != nil {
@@ -227,17 +274,26 @@ func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
 	}
 
 	if !isBackend {
+		h.udpSessions.release(sessionIP)
+		if limiter != nil {
+			limiter.Release()
+		}
 		logging.Info("[CONN] Closed %s (Dur: %v, Err: %v)", c.RemoteAddr(), time.Since(ctx.StartTime), err)
 		// L4 access record (mirrors AccessHTTP for HTTP). A backend was linked iff
 		// peer!=nil at close → "ok"; otherwise the connection never reached a backend
-		// → "no_route" (the L4 analogue of a 404). Bytes are not accumulated in v1.
+		// → "no_route" (the L4 analogue of a 404). A session refused after OnOpen
+		// (a relayed client denied in OnData) records that refusal instead. Bytes
+		// are not accumulated in v1.
 		// SUPPRESS when the peer is a trusted relay whose real client we never resolved
 		// (connection died before its inbound PROXY-v2 header was read): attributing the
 		// record to the relay could get a peer-region relay scored/blocked. A direct
 		// (untrusted) peer IS the client, so it always emits.
 		if !peerTrusted || clientResolved {
 			status := "no_route"
-			if peer != nil {
+			switch {
+			case refused != "":
+				status = refused
+			case peer != nil:
 				status = "ok"
 			}
 			durMs := float64(time.Since(ctx.StartTime).Nanoseconds()) / 1e6
@@ -263,41 +319,65 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 	stripInbound := ctx.StripInbound
 	sendProxyV2 := ctx.SendProxyV2
 	localAddr := ctx.LocalAddr
-	proto := ctx.Proto
-	dstPort := ctx.DstPort
+	l := ctx.listener
 	ctx.Mu.Unlock()
 	if stripInbound {
-		if src, consumed, isProxy := parseInboundProxyV2Datagram(data); isProxy {
-			data = data[consumed:]
-			if src != nil {
-				resolvedBlocked := false
-				ctx.Mu.Lock()
-				if !ctx.ClientResolved { // set-once: the real UDP client (not the relay) for the L4 access record
-					ctx.RealClientIP = ipStrOf(src)
-					ctx.ClientResolved = true
-					// Dynamic denylist on the REAL client behind a trusted relay
-					// (cross-region UDP): the OnOpen peer gate only saw the relay,
-					// so enforce here, once, when the client is first resolved.
-					if ip := ipOf(src); ip != nil {
-						resolvedBlocked = denylist.Default.Blocked(ip)
-					}
-				}
-				if sendProxyV2 && ctx.ProxyHeader == nil {
-					var buf bytes.Buffer
-					if err := proxy.WriteProxyHeaderV2(&buf, src, localAddr); err == nil {
-						ctx.ProxyHeader = buf.Bytes()
-					} else {
-						logging.Warn("[UDP] inbound PROXY v2 rebuild failed: %v", err)
-					}
-				}
-				ctx.Mu.Unlock()
-				if resolvedBlocked {
-					logging.AccessL4(ipStrOf(src), proto, dstPort, "denylisted", 0, 0, 0)
-					c.Close()
-					return
+		src, consumed, isProxy := parseInboundProxyV2Datagram(data)
+		if !isProxy || src == nil {
+			// A trusted relay must name the client in EVERY datagram. One
+			// without a (valid, non-LOCAL) header would be forwarded with no
+			// client to check against the access policy or to attribute in
+			// the access log: drop it.
+			h.udpDrops.note(udpDropNoProxyHeader, listenerName(l), c.RemoteAddr())
+			return
+		}
+		data = data[consumed:]
+		ctx.Mu.Lock()
+		if ctx.closed {
+			ctx.Mu.Unlock()
+			return
+		}
+		if !ctx.ClientResolved {
+			// First datagram: the real UDP client (not the relay) is known.
+			// Admit it like a direct client — access policy (static lists, ACL,
+			// dynamic denylist; the OnOpen gate only saw the relay) and its
+			// per-client session limit — and record it for the access log.
+			ctx.RealClientIP = ipStrOf(src)
+			ctx.ClientResolved = true
+			ctx.resolvedSrc = src
+			ip := ipOf(src)
+			ok, status := h.l4Admit(l, ip)
+			if ok {
+				if key := addrKey(ip); key.IsValid() && h.udpSessions.chargeIP(key) {
+					ctx.sessionIP = key
+				} else {
+					ok, status = false, l4StatusRateLimited
+					h.udpDrops.note(udpDropSourceLimit, listenerName(l), src)
 				}
 			}
+			if !ok {
+				ctx.refused = status
+				ctx.Mu.Unlock()
+				c.Close()
+				return
+			}
+			if sendProxyV2 && ctx.ProxyHeader == nil {
+				var buf bytes.Buffer
+				if err := proxy.WriteProxyHeaderV2(&buf, src, localAddr); err == nil {
+					ctx.ProxyHeader = buf.Bytes()
+				} else {
+					logging.Warn("[UDP] inbound PROXY v2 rebuild failed: %v", err)
+				}
+			}
+		} else if !sameUDPClient(ctx.resolvedSrc, src) {
+			// The session was admitted (and is attributed) for the client
+			// its first header named; a datagram naming another client must
+			// not ride on that admission.
+			ctx.Mu.Unlock()
+			h.udpDrops.note(udpDropClientChanged, listenerName(l), c.RemoteAddr())
+			return
 		}
+		ctx.Mu.Unlock()
 	}
 
 	ctx.Mu.Lock()
@@ -323,21 +403,50 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 	}
 }
 
+// sameUDPClient reports whether two PROXY-v2 sources name the same client
+// (IP and port).
+func sameUDPClient(a, b net.Addr) bool {
+	ua, ok1 := a.(*net.UDPAddr)
+	ub, ok2 := b.(*net.UDPAddr)
+	if ok1 && ok2 {
+		return ua.Port == ub.Port && ua.IP.Equal(ub.IP)
+	}
+	return a != nil && b != nil && a.String() == b.String()
+}
+
+func listenerName(l *ListenerConfig) string {
+	if l == nil {
+		return ""
+	}
+	return l.Name
+}
+
 func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerConfig) {
+	// Runs inside OnOpen: every failure closes through closeOnOpen (a
+	// synchronous Close deadlocks the nbio poller — see closeOnOpen).
 	balancer, ok := h.engine.Balancers[l.Backend]
 	if !ok {
 		logging.Error("Balancer '%s' not found for listener '%s'", l.Backend, l.Name)
-		clientConn.Close()
+		closeOnOpen(clientConn)
 		return
 	}
 
 	// Get backend config to check SendProxyV2
 	backend := h.engine.Backends[l.Backend]
+	if backend != nil && backend.BackendTLS.Enabled {
+		// backend_tls is implemented on the HTTP path only; never send
+		// plaintext to a backend configured for TLS (config load refuses
+		// this pairing; a reload can still change a backend under a running
+		// L4 listener).
+		logging.Error("[CONN] listener %s: backend %s has backend_tls enabled, which L4 listeners do not implement — refusing %s", l.Name, l.Backend, clientConn.RemoteAddr())
+		closeOnOpen(clientConn)
+		return
+	}
 
 	target, err := balancer.Next()
 	if err != nil {
 		logging.Error("Balancer '%s' error: %v", l.Backend, err)
-		clientConn.Close()
+		closeOnOpen(clientConn)
 		return
 	}
 
@@ -421,6 +530,7 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 		return
 	}
 
+	noReply := h.engine.udpNoReplyTimeout
 	go func() {
 		// Resolve and dial UDP
 		raddr, err := net.ResolveUDPAddr("udp", target)
@@ -439,7 +549,25 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 		// DF off: the PROXY v2 header can push a full-size datagram over a later
 		// hop's MTU (a 1,450 B VXLAN pod network); fragment it, don't drop it.
 		setUDPNoDF(backendConn)
+		reader, err := newUDPBackendReader(backendConn)
+		if err != nil {
+			logging.Error("UDP backend socket: %v", err)
+			backendConn.Close()
+			clientConn.Close()
+			return
+		}
 
+		// Link client to backend — unless the session already ended while we
+		// dialed (OnClose ran: e.g. a relayed client refused on its first
+		// datagram). Then the socket is dropped now, not after the TTL, and
+		// never reaches the pool. Checked and linked under the session lock,
+		// so OnClose either sees PeerConn and closes it or we see closed.
+		clientCtx.Mu.Lock()
+		if clientCtx.closed {
+			clientCtx.Mu.Unlock()
+			backendConn.Close()
+			return
+		}
 		// Store in pool for session affinity
 		session := &UDPSession{
 			BackendConn: backendConn,
@@ -447,9 +575,6 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 			LastActive:  time.Now(),
 		}
 		h.engine.UDPPool.Put(poolKey, session)
-
-		// Link client to backend
-		clientCtx.Mu.Lock()
 		clientCtx.PeerConn = backendConn
 		if !acceptInbound {
 			clientCtx.ProxyHeader = proxyHdr // else OnData builds it from the real client
@@ -474,26 +599,24 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 		}
 		clientCtx.Mu.Unlock()
 
-		// Read from backend and write to client. 65535 = max UDP payload; a
-		// 4096 buffer silently truncated any backend datagram >4 KB (the kernel
+		// Read from backend and write to client. Until the backend's first
+		// reply the session lives udpNoReplyTimeout (a one-datagram or spoofed
+		// source frees its slot quickly), then udpIdleTimeout after each reply.
+		// Replies up to 65535 B (the max UDP payload) are relayed whole: a 4096
+		// buffer silently truncated any backend datagram >4 KB (the kernel
 		// discards the remainder of that datagram) — large DNS/QUIC/jumbo
 		// responses lost data. (UDP cross-region MUX, task #77 / N3.)
-		buf := make([]byte, 65535)
+		timeout := noReply
+		var writeErr error
+		deliver := func(b []byte) { _, writeErr = clientConn.Write(b) }
 		for {
-			backendConn.SetReadDeadline(time.Now().Add(60 * time.Second))
-			n, err := backendConn.Read(buf)
-			if err != nil {
+			backendConn.SetReadDeadline(time.Now().Add(timeout))
+			if err := reader.read(deliver); err != nil || writeErr != nil {
 				h.engine.UDPPool.Remove(poolKey)
 				clientConn.Close()
 				return
 			}
-
-			_, err = clientConn.Write(buf[:n])
-			if err != nil {
-				h.engine.UDPPool.Remove(poolKey)
-				clientConn.Close()
-				return
-			}
+			timeout = udpIdleTimeout
 
 			// Update session activity
 			session.mu.Lock()
