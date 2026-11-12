@@ -3,6 +3,7 @@ package httpproxy
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
@@ -39,6 +40,11 @@ type BindGroup struct {
 	// Multi-cert SNI dispatch state. Same atomic-pointer pattern.
 	// ReloadCerts swaps without disturbing in-flight handshakes.
 	tlsState atomic.Pointer[tlsState]
+
+	// tlsBase is the group's shared server tls.Config (set by
+	// buildTLSConfig). Sites with client_auth get a clone of it carrying
+	// their client-certificate policy, chosen per handshake by SNI.
+	tlsBase *tls.Config
 }
 
 // siteSet is the immutable snapshot of sites the bind group dispatches to.
@@ -153,6 +159,10 @@ func (g *BindGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(ss.all) == 1 {
+		if !g.clientAuthOK(ss, ss.all[0], r) {
+			ss.all[0].serveError(w, http.StatusMisdirectedRequest)
+			return
+		}
 		applySiteDeadlines(w, ss.all[0])
 		ss.all[0].ServeHTTP(w, r)
 		return
@@ -170,8 +180,67 @@ func (g *BindGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	site := g.pickSite(ss, host)
+	if !g.clientAuthOK(ss, site, r) {
+		site.serveError(w, http.StatusMisdirectedRequest)
+		return
+	}
 	applySiteDeadlines(w, site)
 	site.ServeHTTP(w, r)
+}
+
+// clientAuthOK enforces a site's client_auth on the request, not only on the
+// handshake. The certificate check ran under the policy of the site the
+// connection's SNI selected; a request whose Host names a site with
+// client_auth must therefore have come in on a connection whose SNI selected
+// that same site — otherwise a client could handshake as a site without
+// client_auth and then ask for the mTLS site by Host (answered 421 Misdirected
+// Request, which tells a browser to retry on a new connection). For
+// "require" the connection must also carry a verified client certificate.
+func (g *BindGroup) clientAuthOK(ss *siteSet, site *HTTPServer, r *http.Request) bool {
+	ca := site.Listener.ClientAuth
+	if ca == nil && site.Listener.TLS != nil && clientAuthConfigured(site.Listener.TLS.ClientAuth) {
+		// A site not built by the engine: its policy lives in the TLS
+		// snapshot. Configured but not found there = refuse (fail closed).
+		if ca = g.siteClientAuth(site); ca == nil {
+			return r.TLS == nil
+		}
+	}
+	if ca == nil || r.TLS == nil {
+		return true
+	}
+	if g.pickSite(ss, r.TLS.ServerName) != site {
+		return false
+	}
+	if ca.Requires() && len(r.TLS.VerifiedChains) == 0 {
+		return false
+	}
+	return true
+}
+
+// clientAuthConfigured reports whether a tls.client_auth value turns client
+// authentication on.
+func clientAuthConfigured(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "none":
+		return false
+	}
+	return true
+}
+
+// siteClientAuth returns the client-certificate policy of a site whose
+// Listener.ClientAuth was left nil (sites not built by the engine), from the
+// current TLS snapshot.
+func (g *BindGroup) siteClientAuth(site *HTTPServer) *tlsutil.ClientAuth {
+	state := g.tlsState.Load()
+	if state == nil {
+		return nil
+	}
+	for i := range state.certs {
+		if state.certs[i].site == site {
+			return state.certs[i].clientAuth
+		}
+	}
+	return nil
 }
 
 // applySiteDeadlines sets per-request read/write deadlines based on the
@@ -407,6 +476,12 @@ type siteCert struct {
 	patterns []string
 	cert     *tls.Certificate
 	site     *HTTPServer
+	// clientAuth / clientCfg: the site's client-certificate policy and the
+	// handshake config carrying it (a clone of the group's tlsBase), served
+	// by GetConfigForClient when the SNI selects this site. nil = no client
+	// certificate requested (the shared config is used).
+	clientAuth *tlsutil.ClientAuth
+	clientCfg  *tls.Config
 }
 
 // buildTLSConfig constructs the shared *tls.Config for the group and
@@ -414,31 +489,69 @@ type siteCert struct {
 // reloads can swap the snapshot atomically without rebuilding tls.Config.
 //
 // GetCertificate uses tlsState.Load — lock-free on the handshake hot path.
+// GetConfigForClient hands a site with client_auth its own config (the
+// shared one plus that site's client-certificate policy), chosen by SNI like
+// the certificate; other sites use the shared config (no client cert asked).
 // MinVersion / MaxVersion / CipherSuites come from the PRIMARY site
 // (same TLS profile across sites in a group). NextProtos forces h2 +
 // http/1.1 ALPN on every site.
 func (g *BindGroup) buildTLSConfig() (*tls.Config, error) {
-	state, err := g.loadCertState()
-	if err != nil {
-		return nil, err
-	}
-	g.tlsState.Store(state)
-
 	tlsCfg := &tls.Config{
 		NextProtos: []string{"h2", "http/1.1"},
-		// Set Certificates to a single-element slice so callers/tooling that
-		// inspect c.Certificates see something sensible. The actual cert
-		// served at handshake time comes from GetCertificate below.
-		Certificates: []tls.Certificate{*state.defaultCert.cert},
 		GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			return g.pickCert(chi.ServerName), nil
+		},
+		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+			if sc := g.pickSiteCert(chi.ServerName); sc != nil && sc.clientCfg != nil {
+				return sc.clientCfg, nil
+			}
+			return nil, nil
 		},
 	}
 	if err := tlsutil.ApplyTLSVersionAndCiphers(tlsCfg, *g.primary.Listener.TLS); err != nil {
 		return nil, fmt.Errorf("TLS bind group %s: %v", g.addr, err)
 	}
+	g.tlsBase = tlsCfg
+
+	state, err := g.loadCertState()
+	if err != nil {
+		return nil, err
+	}
+	g.tlsState.Store(state)
+	// Set Certificates to a single-element slice so callers/tooling that
+	// inspect c.Certificates see something sensible. The actual cert
+	// served at handshake time comes from GetCertificate.
+	tlsCfg.Certificates = []tls.Certificate{*state.defaultCert.cert}
 	return tlsCfg, nil
 }
+
+// siteClientConfig returns the handshake config for a site with client
+// authentication: a clone of the group's shared config carrying the site's
+// policy (nil when the site has none).
+func (g *BindGroup) siteClientConfig(ca *tlsutil.ClientAuth) *tls.Config {
+	if ca == nil || g.tlsBase == nil {
+		return nil
+	}
+	c := g.tlsBase.Clone()
+	c.GetConfigForClient = nil
+	c.Certificates = nil // always pick by SNI (GetCertificate), like the site
+	ca.Apply(c)
+	return c
+}
+
+// loadSiteClientAuth returns a site's client-certificate policy: the one the
+// engine parsed (Listener.ClientAuth), else parsed here from its TLS config.
+func loadSiteClientAuth(s *HTTPServer) (*tlsutil.ClientAuth, error) {
+	if s.Listener.ClientAuth != nil || s.Listener.TLS == nil {
+		return s.Listener.ClientAuth, nil
+	}
+	return tlsutil.LoadClientAuth(*s.Listener.TLS)
+}
+
+// failClosedClientAuth is used for a site whose client CA could not be
+// loaded on a reload: every certificate is refused (empty CA pool) rather
+// than the site being served without its client check.
+var failClosedClientAuth = &tlsutil.ClientAuth{Mode: tls.RequireAndVerifyClientCert, CAs: x509.NewCertPool()}
 
 // loadCertState walks the group's sites and reads each TLS cert/key from
 // disk. Returns a fresh tlsState ready to publish, or an error if any
@@ -463,10 +576,16 @@ func (g *BindGroup) loadCertState() (*tlsState, error) {
 		if err != nil {
 			return nil, fmt.Errorf("site %s: failed to load TLS cert/key: %v", s.Listener.Name, err)
 		}
+		ca, err := loadSiteClientAuth(s)
+		if err != nil {
+			return nil, fmt.Errorf("site %s: tls client_auth: %v", s.Listener.Name, err)
+		}
 		certs = append(certs, siteCert{
-			patterns: s.Listener.ServerNames,
-			cert:     &cert,
-			site:     s,
+			patterns:   s.Listener.ServerNames,
+			cert:       &cert,
+			site:       s,
+			clientAuth: ca,
+			clientCfg:  g.siteClientConfig(ca),
 		})
 		if s.Listener.DefaultServer || defaultCert == nil {
 			c := certs[len(certs)-1]
@@ -515,6 +634,15 @@ func (g *BindGroup) ReloadCerts() (int, error) {
 			continue
 		}
 		warnIfKeyWorldReadable(s.Listener.TLS.Key)
+		// The site's client-certificate policy always follows its NEW config,
+		// even when its cert falls back to the previous one. A policy that
+		// cannot be loaded fails closed (no certificate verifies).
+		ca, caErr := loadSiteClientAuth(s)
+		if caErr != nil {
+			logging.Error("[TLS] site %s: client_auth reload failed, refusing every client certificate until fixed: %v",
+				s.Listener.Name, caErr)
+			ca = failClosedClientAuth
+		}
 		cert, err := tls.LoadX509KeyPair(s.Listener.TLS.Cert, s.Listener.TLS.Key)
 		if err != nil {
 			old, ok := prevByName[s.Listener.Name]
@@ -524,7 +652,13 @@ func (g *BindGroup) ReloadCerts() (int, error) {
 			}
 			logging.Warn("[TLS] site %s: cert reload failed, keeping previous cert: %v",
 				s.Listener.Name, err)
-			certs = append(certs, old)
+			certs = append(certs, siteCert{
+				patterns:   s.Listener.ServerNames,
+				cert:       old.cert,
+				site:       s,
+				clientAuth: ca,
+				clientCfg:  g.siteClientConfig(ca),
+			})
 		} else {
 			if old, ok := prevByName[s.Listener.Name]; ok && !certBytesEqual(old.cert, &cert) {
 				rotated++
@@ -532,9 +666,11 @@ func (g *BindGroup) ReloadCerts() (int, error) {
 				rotated++ // new site since last load
 			}
 			certs = append(certs, siteCert{
-				patterns: s.Listener.ServerNames,
-				cert:     &cert,
-				site:     s,
+				patterns:   s.Listener.ServerNames,
+				cert:       &cert,
+				site:       s,
+				clientAuth: ca,
+				clientCfg:  g.siteClientConfig(ca),
 			})
 		}
 		if s.Listener.DefaultServer || defaultCert == nil {
@@ -576,30 +712,34 @@ func certBytesEqual(a, b *tls.Certificate) bool {
 // IP-only TLS connect with no SNI), we still return the default — same
 // as nginx and any L7 proxy.
 func (g *BindGroup) pickCert(sni string) *tls.Certificate {
+	if sc := g.pickSiteCert(sni); sc != nil {
+		return sc.cert
+	}
+	return nil
+}
+
+// pickSiteCert resolves an SNI hostname to the site entry (cert and
+// client-certificate policy) that handles the handshake: exact match >
+// wildcard > the default site.
+func (g *BindGroup) pickSiteCert(sni string) *siteCert {
 	state := g.tlsState.Load()
 	if state == nil {
 		return nil
 	}
 	if sni == "" {
-		if state.defaultCert != nil {
-			return state.defaultCert.cert
-		}
-		return nil
+		return state.defaultCert
 	}
-	entries := make([]tlsutil.SiteEntry[*tls.Certificate], 0, len(state.certs))
+	entries := make([]tlsutil.SiteEntry[*siteCert], 0, len(state.certs))
 	for i := range state.certs {
-		entries = append(entries, tlsutil.SiteEntry[*tls.Certificate]{
+		entries = append(entries, tlsutil.SiteEntry[*siteCert]{
 			Patterns: state.certs[i].patterns,
-			Payload:  state.certs[i].cert,
+			Payload:  &state.certs[i],
 		})
 	}
-	if cert, ok := tlsutil.MatchSite(sni, entries); ok {
-		return cert
+	if sc, ok := tlsutil.MatchSite(sni, entries); ok {
+		return sc
 	}
-	if state.defaultCert != nil {
-		return state.defaultCert.cert
-	}
-	return nil
+	return state.defaultCert
 }
 
 // Stop gracefully shuts the group's HTTP and HTTP/3 listeners.

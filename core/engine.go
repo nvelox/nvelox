@@ -58,6 +58,13 @@ type Engine struct {
 	runCtx          context.Context         // Start's ctx: cancels in-flight L4 backend dials on shutdown
 	reloadMu        sync.Mutex              // serializes concurrent SIGHUPs
 	configPath      string                  // path for reload
+
+	// UDP session limits (see udpsession.go). Set from code constants in
+	// NewEngine — deliberately not configurable; tests lower them.
+	udpMaxSessions      int
+	udpMaxSessionsPerIP int
+	udpNoReplyTimeout   time.Duration
+	l4Handler           *ProxyEventHandler // set by Start (under reloadMu)
 }
 
 type ListenerConfig struct {
@@ -89,6 +96,12 @@ type ListenerConfig struct {
 	Buffering       config.BufferingConfig
 	Cache           config.CacheConfig
 	RequestID       config.RequestIDConfig
+
+	// Derived by prepare(): the parsed L4 access policy (tcp/udp) and the
+	// client-certificate policy (tls). prepared marks them built.
+	access     *l4Access
+	clientAuth *tlsutil.ClientAuth
+	prepared   bool
 }
 
 func NewEngine(cfg *config.Config) *Engine {
@@ -105,8 +118,53 @@ func NewEngine(cfg *config.Config) *Engine {
 		CircuitBreakers: make(map[string]*circuitbreaker.Breaker),
 		DNSResolvers:    make(map[string]*discovery.DNSResolver),
 		Metrics:         metrics.Default,
+
+		udpMaxSessions:      maxUDPSessions,
+		udpMaxSessionsPerIP: maxUDPSessionsPerIP,
+		udpNoReplyTimeout:   udpNoReplyTimeout,
 	}
 	return e
+}
+
+// preflight checks what Start and Reload must refuse before touching any
+// state: every listener's derived state (access lists, client CA) builds,
+// every backend_tls config builds (no plaintext fallback), and no tcp/udp
+// listener forwards to a backend_tls backend (TLS to backends exists on the
+// HTTP path only). config.Load checks the same at load; this catches files
+// that changed since and hand-built configs.
+func preflight(listeners []*ListenerConfig, backends []config.Backend) error {
+	for _, l := range listeners {
+		if err := l.prepare(); err != nil {
+			return err
+		}
+	}
+	tlsBackends := make(map[string]bool)
+	for i := range backends {
+		be := &backends[i]
+		if !be.BackendTLS.Enabled {
+			continue
+		}
+		tlsBackends[be.Name] = true
+		if _, err := httpproxy.BuildBackendTLSConfig(be.BackendTLS); err != nil {
+			return fmt.Errorf("backend %s: backend_tls: %v", be.Name, err)
+		}
+	}
+	for _, l := range listeners {
+		if (l.Protocol == "tcp" || l.Protocol == "udp") && tlsBackends[l.Backend] {
+			return fmt.Errorf("listener %s: backend %s has backend_tls enabled, which is not implemented for %s listeners", l.Name, l.Backend, l.Protocol)
+		}
+	}
+	return nil
+}
+
+// warnInsecureBackendTLS logs, once per start / reload, every backend that
+// skips certificate verification (backend_tls.insecure).
+func warnInsecureBackendTLS(backends []config.Backend) {
+	for _, be := range backends {
+		if be.BackendTLS.Enabled && be.BackendTLS.Insecure {
+			logging.Warn("[HTTP] backend %s: backend_tls.insecure=true — certificate verification DISABLED", be.Name)
+		}
+	}
 }
 
 func (e *Engine) Start(ctx context.Context) error {
@@ -123,6 +181,14 @@ func (e *Engine) Start(ctx context.Context) error {
 			e.reloadMu.Unlock()
 		}
 	}()
+
+	// 0. Refuse to start on anything that would fail open: an unparseable
+	// access list or client CA, a backend_tls config that cannot be built,
+	// a tcp/udp listener on a backend_tls backend.
+	if err := preflight(e.Listeners, e.Config.Backends); err != nil {
+		return err
+	}
+	warnInsecureBackendTLS(e.Config.Backends)
 
 	// 1. Initialize Backends & Health Checkers
 	e.initBackends()
@@ -215,6 +281,7 @@ func (e *Engine) Start(ctx context.Context) error {
 
 	// 2. Setup Handler
 	handler := NewProxyEventHandler(e)
+	e.l4Handler = handler
 
 	e.runCtx = ctx
 
@@ -369,11 +436,17 @@ func (e *Engine) Reload(cfg *config.Config) error {
 	logging.Info("Reloading config...")
 	start := time.Now()
 
-	// Pre-flight 1: listener expansion must succeed.
+	// Pre-flight 1: listener expansion must succeed (it also parses every
+	// listener's access lists and client CA), and every backend_tls config
+	// must build: a reload never downgrades a backend to plaintext.
 	expanded, err := ExpandListeners(cfg.Listeners)
 	if err != nil {
 		e.recordReload("fail", start)
 		return fmt.Errorf("reload: listener expansion: %w", err)
+	}
+	if err := preflight(expanded, cfg.Backends); err != nil {
+		e.recordReload("fail", start)
+		return fmt.Errorf("reload: %w", err)
 	}
 
 	// Pre-flight 2: any NEW L7 bind addr must be bindable RIGHT NOW.
@@ -399,9 +472,10 @@ func (e *Engine) Reload(cfg *config.Config) error {
 	}
 
 	// Pre-flight passed — apply mutations.
+	warnInsecureBackendTLS(cfg.Backends)
 	e.Config = cfg
 	beAdded, beRemoved, beUpdated := e.reconcileBackends(cfg)
-	sitesSwapped, bgAdded, bgRemoved := e.reloadL7Sites(cfg)
+	sitesSwapped, bgAdded, bgRemoved := e.reloadL7Sites(expanded)
 
 	totalRotated := 0
 	for _, bg := range e.BindGroups {
@@ -443,14 +517,9 @@ func (e *Engine) recordReload(result string, start time.Time) {
 // Pre-existing bind groups are left running on failure.
 //
 // Returns the counts (sites swapped on existing groups, bind groups
-// added, bind groups removed).
-func (e *Engine) reloadL7Sites(cfg *config.Config) (swapped, added, removed int) {
-	expanded, err := ExpandListeners(cfg.Listeners)
-	if err != nil {
-		logging.Error("[RELOAD] listener expansion failed: %v — skipping L7 site swap", err)
-		return 0, 0, 0
-	}
-
+// added, bind groups removed). expanded is the new config's listener set as
+// Reload expanded (and pre-flighted) it.
+func (e *Engine) reloadL7Sites(expanded []*ListenerConfig) (swapped, added, removed int) {
 	bgByAddr := make(map[string]*httpproxy.BindGroup, len(e.BindGroups))
 	for _, bg := range e.BindGroups {
 		bgByAddr[bg.Addr()] = bg
@@ -584,6 +653,8 @@ func (e *Engine) initBackends() {
 // Used at startup by main.go and at SIGHUP reload by Engine.Reload so
 // the two paths can't drift. A bind like ":2000-2025" produces 26
 // listeners with Port set, each carrying the same per-listener config.
+// Each listener's derived state (access lists, client CA) is built here, once
+// per config entry, so a bad value fails the expansion.
 func ExpandListeners(listeners []config.Listener) ([]*ListenerConfig, error) {
 	expanded := make([]*ListenerConfig, 0, len(listeners))
 	for _, l := range listeners {
@@ -597,36 +668,41 @@ func ExpandListeners(listeners []config.Listener) ([]*ListenerConfig, error) {
 			tlsCfg = &tlsCfgCopy
 		}
 
+		base := ListenerConfig{
+			Name:            l.Name,
+			Protocol:        l.Protocol,
+			ZeroCopy:        l.ZeroCopy,
+			Backend:         l.Backend,
+			RateLimit:       l.RateLimit,
+			Timeouts:        l.Timeouts,
+			TLS:             tlsCfg,
+			HTTP3:           l.HTTP3,
+			Routes:          l.Routes,
+			Headers:         l.Headers,
+			IPAllowlist:     l.IPAllowlist,
+			IPDenylist:      l.IPDenylist,
+			MaxBodySize:     l.MaxBodySize,
+			IPRateLimit:     l.IPRateLimit,
+			ACL:             l.ACL,
+			TrustedProxies:  l.TrustedProxies,
+			AcceptProxyFrom: l.AcceptProxyFrom,
+			proxyTrust:      newProxyTrust(l.AcceptProxyFrom),
+			ServerNames:     l.ServerNames,
+			DefaultServer:   l.DefaultServer,
+			Compression:     l.Compression,
+			ErrorPages:      l.ErrorPages,
+			Buffering:       l.Buffering,
+			Cache:           l.Cache,
+			RequestID:       l.RequestID,
+		}
+		if err := base.prepare(); err != nil {
+			return nil, err
+		}
+
 		mk := func(name, addr string, port int) *ListenerConfig {
-			return &ListenerConfig{
-				Name:            name,
-				Addr:            addr,
-				Protocol:        l.Protocol,
-				ZeroCopy:        l.ZeroCopy,
-				Backend:         l.Backend,
-				RateLimit:       l.RateLimit,
-				Timeouts:        l.Timeouts,
-				TLS:             tlsCfg,
-				HTTP3:           l.HTTP3,
-				Routes:          l.Routes,
-				Headers:         l.Headers,
-				IPAllowlist:     l.IPAllowlist,
-				IPDenylist:      l.IPDenylist,
-				MaxBodySize:     l.MaxBodySize,
-				IPRateLimit:     l.IPRateLimit,
-				ACL:             l.ACL,
-				TrustedProxies:  l.TrustedProxies,
-				AcceptProxyFrom: l.AcceptProxyFrom,
-				proxyTrust:      newProxyTrust(l.AcceptProxyFrom),
-				ServerNames:     l.ServerNames,
-				DefaultServer:   l.DefaultServer,
-				Compression:     l.Compression,
-				ErrorPages:      l.ErrorPages,
-				Buffering:       l.Buffering,
-				Cache:           l.Cache,
-				RequestID:       l.RequestID,
-				Port:            port,
-			}
+			lc := base
+			lc.Name, lc.Addr, lc.Port = name, addr, port
+			return &lc
 		}
 
 		if strings.Contains(portStr, "-") {
@@ -688,6 +764,7 @@ func (e *Engine) buildL7Site(l *ListenerConfig) *httpproxy.HTTPServer {
 		Cache:          l.Cache,
 		RequestID:      l.RequestID,
 		Timeouts:       l.Timeouts,
+		ClientAuth:     l.clientAuth,
 	}
 	connLimiters := make(map[string]httpproxy.ConnLimiterI)
 	for k, v := range e.ConnLimiters {
@@ -940,31 +1017,40 @@ func (e *Engine) startTLSListener(l *ListenerConfig, handler *ProxyEventHandler)
 	if err := tlsutil.ApplyTLSVersionAndCiphers(tlsConfig, *l.TLS); err != nil {
 		return fmt.Errorf("TLS listener %s: %v", l.Name, err)
 	}
+	// Client-certificate policy (tls.client_auth / client_ca), parsed by
+	// prepare(). With "require" the handshake fails unless the client
+	// presents a certificate that verifies against client_ca.
+	if err := l.prepare(); err != nil {
+		return err
+	}
+	l.clientAuth.Apply(tlsConfig)
 
-	ln, err := tls.Listen("tcp", l.Addr, tlsConfig)
+	raw, err := net.Listen("tcp", l.Addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %v", l.Addr, err)
 	}
 
-	// Trusted inbound PROXY-v2 acceptance: when accept_proxy_from is set, wrap
-	// the listener so the PROXY header sent by a trusted peer (read off the raw
-	// TCP stream BEFORE the TLS handshake) sets conn.RemoteAddr() to the real
-	// client; untrusted peers have any header IGNORED (no spoofing) and
-	// non-PROXY clients (browsers) pass through unchanged.
-	var listener net.Listener = ln
+	// Trusted inbound PROXY-v2 acceptance: when accept_proxy_from is set, the
+	// RAW TCP listener is wrapped, so the PROXY header a trusted peer sends is
+	// read off the stream BEFORE the TLS handshake (as on the plain TCP path)
+	// and conn.RemoteAddr() becomes the real client. Untrusted peers have any
+	// header IGNORED (no spoofing); non-PROXY clients start the handshake at
+	// once (a ClientHello can never look like a PROXY signature).
+	var inner net.Listener = raw
 	if l.proxyTrust.enabled() {
 		pol, perr := l.proxyTrust.policy()
 		if perr != nil {
-			ln.Close()
+			raw.Close()
 			return fmt.Errorf("TLS listener %s accept_proxy_from: %v", l.Name, perr)
 		}
-		listener = &proxyproto.Listener{
-			Listener:          ln,
+		inner = &proxyproto.Listener{
+			Listener:          raw,
 			Policy:            pol,
-			ReadHeaderTimeout: 10 * time.Second,
+			ReadHeaderTimeout: tlsProxyHeaderTimeout,
 		}
 		logging.Info("TLS listener %s accepts inbound PROXY-v2 from %v", l.Name, l.AcceptProxyFrom)
 	}
+	listener := tls.NewListener(inner, tlsConfig)
 
 	e.tlsListeners = append(e.tlsListeners, listener)
 	logging.Info("TLS listener %s started on %s", l.Name, l.Addr)
@@ -974,19 +1060,78 @@ func (e *Engine) startTLSListener(l *ListenerConfig, handler *ProxyEventHandler)
 	return nil
 }
 
+// tlsProxyHeaderTimeout bounds how long a TLS-terminating listener waits for
+// an inbound PROXY-v2 header (and, for any peer, for the first byte).
+const tlsProxyHeaderTimeout = 10 * time.Second
+
+// l4TLSHandshakeTimeout bounds the TLS handshake on a TLS-terminating L4
+// listener. The handshake (and the client-certificate check) completes
+// before the backend is dialed, so an unauthenticated client never reaches it.
+const l4TLSHandshakeTimeout = 10 * time.Second
+
 func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *ProxyEventHandler) {
 	defer clientConn.Close()
+
+	// The raw TCP peer (a trusted relay or the client itself) and the port it
+	// dialed; reading them from the transport does not touch the PROXY header.
+	rawConn := transportOf(clientConn)
+	peer := rawConn.RemoteAddr()
+	dstPort := portOf(rawConn.LocalAddr())
+	peerTrusted := l.proxyTrust.trusts(peer)
 
 	// Check rate limit
 	if rl, ok := e.RateLimiters[l.Name]; ok {
 		if !rl.Allow() {
-			logging.Warn("[RATE] TLS connection from %s rejected (rate limit on %s)", clientConn.RemoteAddr(), l.Name)
+			logging.Warn("[RATE] TLS connection from %s rejected (rate limit on %s)", peer, l.Name)
+			if !peerTrusted {
+				logging.AccessL4(ipStrOf(peer), l.Protocol, dstPort, l4StatusRateLimited, 0, 0, 0)
+			}
 			return
 		}
 	}
 
-	logging.Info("[CONN] New tls client %s -> %s", clientConn.RemoteAddr(), clientConn.LocalAddr())
-	startTime := time.Now()
+	// The resolved client: the PROXY-v2 source when a trusted relay sent a
+	// header, else the peer itself (proxyproto reads the header here, bounded
+	// by tlsProxyHeaderTimeout).
+	client := clientConn.RemoteAddr()
+	start := time.Now()
+	status := "no_route"
+	defer func() {
+		// One L4 access record per connection, as on the plain TCP path. Not
+		// for a trusted relay whose header never named a client: the record
+		// would blame the relay (see serveTCP).
+		if peerTrusted && client.String() == peer.String() {
+			return
+		}
+		durMs := float64(time.Since(start).Nanoseconds()) / 1e6
+		logging.AccessL4(ipStrOf(client), l.Protocol, dstPort, status, 0, 0, durMs)
+	}()
+
+	// Access policy (static lists, ACL, dynamic denylist) on the resolved
+	// client, before the handshake: a refused client costs no crypto.
+	if ok, st := handler.l4Admit(l, ipOf(client)); !ok {
+		status = st
+		return
+	}
+
+	logging.Info("[CONN] New tls client %s -> %s", client, clientConn.LocalAddr())
+
+	// Complete the handshake (and the client-certificate check) before any
+	// backend is dialed.
+	if tc, ok := clientConn.(*tls.Conn); ok {
+		ctx := e.runCtx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		hctx, cancel := context.WithTimeout(ctx, l4TLSHandshakeTimeout)
+		err := tc.HandshakeContext(hctx)
+		cancel()
+		if err != nil {
+			logging.Debug("[CONN] TLS handshake with %s failed: %v", client, err)
+			status = "error"
+			return
+		}
+	}
 
 	// Select backend
 	balancer, ok := e.Balancers[l.Backend]
@@ -996,6 +1141,24 @@ func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *
 	}
 
 	backend := e.Backends[l.Backend]
+	if backend != nil && backend.BackendTLS.Enabled {
+		// backend_tls is implemented on the HTTP path only; never send
+		// plaintext to a backend configured for TLS (config load refuses
+		// this pairing; a reload can still change a backend under a running
+		// L4 listener).
+		logging.Error("[CONN] TLS listener %s: backend %s has backend_tls enabled, which L4 listeners do not implement — refusing %s", l.Name, l.Backend, client)
+		return
+	}
+
+	// Backend max_connections: one slot per session, held until it ends.
+	if cl, ok := e.ConnLimiters[l.Backend]; ok {
+		if !cl.Acquire() {
+			logging.Warn("[CONN] TLS listener %s: backend %s at max_connections — refusing %s", l.Name, l.Backend, client)
+			status = l4StatusRateLimited
+			return
+		}
+		defer cl.Release()
+	}
 
 	target, err := balancer.Next()
 	if err != nil {
@@ -1027,12 +1190,13 @@ func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *
 
 	// Send PROXY v2 if configured
 	if backend != nil && backend.SendProxyV2 {
-		header := proxyproto.HeaderProxyFromAddrs(2, clientConn.RemoteAddr(), backendConn.LocalAddr())
+		header := proxyproto.HeaderProxyFromAddrs(2, client, backendConn.LocalAddr())
 		if _, err := header.WriteTo(backendConn); err != nil {
 			logging.Error("Failed to write PROXY v2 header on TLS conn: %v", err)
 			return
 		}
 	}
+	status = "ok"
 
 	// Bidirectional relay with half-close semantics (relay.go): a backend that
 	// closes first gets its whole response delivered followed by close_notify
@@ -1041,7 +1205,7 @@ func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *
 	// had a default one.
 	res := relayL4(clientConn, backendConn, l.Timeouts.ParseIdle())
 	if res.Err != nil {
-		logging.Debug("[CONN] TLS %s ended with error: %v", clientConn.RemoteAddr(), res.Err)
+		logging.Debug("[CONN] TLS %s ended with error: %v", client, res.Err)
 	}
-	logging.Info("[CONN] Closed TLS %s (Dur: %v)", clientConn.RemoteAddr(), time.Since(startTime))
+	logging.Info("[CONN] Closed TLS %s (Dur: %v)", client, time.Since(start))
 }

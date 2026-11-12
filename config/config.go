@@ -1,9 +1,12 @@
 package config
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -48,7 +51,9 @@ type TracingConfig struct {
 	Service  string `yaml:"service"`  // service name
 }
 
-// ThrottleConfig defines bandwidth throttling settings.
+// ThrottleConfig defines bandwidth throttling settings. NOT IMPLEMENTED: a
+// listener that sets read_rate or write_rate is rejected at load (no code
+// path throttles traffic).
 type ThrottleConfig struct {
 	ReadRate  string `yaml:"read_rate,omitempty"`  // e.g., "10MB/s"
 	WriteRate string `yaml:"write_rate,omitempty"` // e.g., "10MB/s"
@@ -74,10 +79,13 @@ type RequestIDConfig struct {
 }
 
 type ServerConfig struct {
+	// User, Group, PidFile and Workers are accepted for config compatibility
+	// but NOT IMPLEMENTED: nvelox never drops privileges, writes no pid file
+	// and always runs one process. ServerWarnings reports them at startup.
 	User    string `yaml:"user"`
 	Group   string `yaml:"group"`
 	PidFile string `yaml:"pid_file"`
-	Workers int    `yaml:"workers,omitempty"` // SO_REUSEPORT workers (0 = single process)
+	Workers int    `yaml:"workers,omitempty"`
 	// GatewayID identifies THIS gateway on every HTTP access-log line as
 	// gw=<id>, so a request can be attributed to the gateway that first
 	// received it. Empty (default) → os.Hostname() is used at startup.
@@ -140,10 +148,15 @@ type Listener struct {
 	// TLS
 	TLS TLSConfig `yaml:"tls,omitempty"`
 
-	// SNI routing (TLS passthrough without termination)
+	// SNI routing (TLS passthrough without termination). NOT IMPLEMENTED: a
+	// listener with sni_routes is rejected at load.
 	SNIRoutes []SNIRoute `yaml:"sni_routes,omitempty"`
 
-	// Security
+	// Security. ip_allowlist, ip_denylist and acl apply to every protocol:
+	// on http/https per request (real client behind trusted_proxies), on
+	// tcp/udp per connection / UDP session (the PROXY-v2 client behind a
+	// trusted accept_proxy_from relay). On tcp/udp an acl rule may match
+	// source_ip only. Entries must be valid IPs or CIDRs.
 	IPAllowlist []string          `yaml:"ip_allowlist,omitempty"`  // CIDR allow list
 	IPDenylist  []string          `yaml:"ip_denylist,omitempty"`   // CIDR deny list
 	MaxBodySize string            `yaml:"max_body_size,omitempty"` // e.g., "10MB"
@@ -190,7 +203,7 @@ type Listener struct {
 	Buffering   BufferingConfig   `yaml:"buffering,omitempty"`
 	Cache       CacheConfig       `yaml:"cache,omitempty"`
 	GRPC        bool              `yaml:"grpc,omitempty"`       // Enable gRPC-aware proxying
-	Throttle    ThrottleConfig    `yaml:"throttle,omitempty"`   // Bandwidth throttling
+	Throttle    ThrottleConfig    `yaml:"throttle,omitempty"`   // NOT IMPLEMENTED: rejected at load when set
 	RequestID   RequestIDConfig   `yaml:"request_id,omitempty"` // Edge correlation-id (X-Request-ID)
 }
 
@@ -253,11 +266,21 @@ type RateLimitConfig struct {
 }
 
 // TLSConfig defines TLS certificate configuration.
+//
+// ClientAuth is the client-certificate (mTLS) policy of a TLS-terminating
+// listener (tcp with tls, https and its HTTP/3): "require" fails the handshake
+// unless the client presents a certificate that verifies against client_ca,
+// "request" asks for a certificate without requiring it, "none" / empty asks
+// for none. On a bind shared by several https sites the policy is per site
+// (chosen by SNI), and a request whose Host names a client_auth site on a
+// connection whose SNI selected another site is answered 421. ClientCA is a
+// PEM CA bundle: required by "require", only valid with client_auth set.
+// OCSPStapling is NOT IMPLEMENTED: true is rejected at load.
 type TLSConfig struct {
 	Cert         string `yaml:"cert"`
 	Key          string `yaml:"key"`
 	AutoCert     bool   `yaml:"auto_cert"`
-	OCSPStapling bool   `yaml:"ocsp_stapling,omitempty"` // Enable OCSP stapling
+	OCSPStapling bool   `yaml:"ocsp_stapling,omitempty"` // NOT IMPLEMENTED: rejected at load when true
 	ClientAuth   string `yaml:"client_auth,omitempty"`   // "require", "request", "none"
 	ClientCA     string `yaml:"client_ca,omitempty"`     // CA cert for client verification
 
@@ -281,7 +304,7 @@ type RouteConfig struct {
 	Headers  HeadersConfig  `yaml:"headers,omitempty"`
 	Rewrite  RewriteConfig  `yaml:"rewrite,omitempty"`
 	Redirect RedirectConfig `yaml:"redirect,omitempty"`
-	Scripts  ScriptsConfig  `yaml:"scripts,omitempty"`
+	Scripts  ScriptsConfig  `yaml:"scripts,omitempty"`   // NOT IMPLEMENTED (Lua hooks): rejected at load when set
 	Static   StaticConfig   `yaml:"static,omitempty"`    // Serve static files
 	TryFiles TryFilesConfig `yaml:"try_files,omitempty"` // try_files logic
 	Expires  string         `yaml:"expires,omitempty"`   // Cache-Control: "1y", "30d", "1h", "-1" (no cache)
@@ -311,7 +334,8 @@ type TryFilesConfig struct {
 	Fallback string   `yaml:"fallback"` // Fallback path or =status (e.g., "=404", "/fallback.html")
 }
 
-// ScriptsConfig defines Lua script hooks for a route.
+// ScriptsConfig defines Lua script hooks for a route. NOT IMPLEMENTED: no
+// code path runs them, so a route that sets either script is rejected at load.
 type ScriptsConfig struct {
 	RequestScript  string `yaml:"request_script,omitempty"`  // path to Lua file
 	ResponseScript string `yaml:"response_script,omitempty"` // path to Lua file
@@ -335,7 +359,8 @@ type RedirectConfig struct {
 	Code int    `yaml:"code,omitempty"` // 301 or 302 (default 302)
 }
 
-// SNIRoute defines TLS passthrough routing based on server name.
+// SNIRoute defines TLS passthrough routing based on server name. NOT
+// IMPLEMENTED: listeners[].sni_routes is rejected at load.
 type SNIRoute struct {
 	ServerName string `yaml:"server_name"` // hostname or *.example.com pattern
 	Backend    string `yaml:"backend"`
@@ -449,7 +474,7 @@ type Backend struct {
 	Balance        string   `yaml:"balance"`         // "roundrobin", "leastconn", "random"
 	SendProxyV2    bool     `yaml:"send_proxy_v2"`   // Send PROXY Protocol v2 header to backend
 	Servers        []string `yaml:"servers"`         // List of server addresses
-	MaxConnections int      `yaml:"max_connections"` // Max concurrent connections (0 = unlimited)
+	MaxConnections int      `yaml:"max_connections"` // Max concurrent HTTP requests / TCP connections / UDP sessions (0 = unlimited)
 
 	Timeouts        TimeoutConfig `yaml:"timeouts,omitempty"`
 	Retry           RetryConfig   `yaml:"retry,omitempty"`
@@ -474,6 +499,10 @@ type CBConfig struct {
 }
 
 // BackendTLSConfig defines TLS settings for connecting to backend servers.
+// Implemented for http/https listeners only: a backend with backend_tls
+// enabled cannot serve a tcp or udp listener (rejected at load). The CA and
+// client key pair are checked at load, and a backend whose TLS config cannot
+// be built fails startup / the reload — nvelox never falls back to plaintext.
 type BackendTLSConfig struct {
 	Enabled    bool   `yaml:"enabled"`
 	CACert     string `yaml:"ca_cert,omitempty"`
@@ -590,6 +619,7 @@ func validate(cfg *Config) error {
 	}
 
 	backendNames := make(map[string]bool)
+	backendTLS := make(map[string]bool) // backend name -> backend_tls enabled
 	validAlgorithms := map[string]bool{"": true, "roundrobin": true, "leastconn": true, "random": true}
 
 	for _, b := range cfg.Backends {
@@ -600,6 +630,11 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("duplicate backend name: %s", b.Name)
 		}
 		backendNames[b.Name] = true
+		backendTLS[b.Name] = b.BackendTLS.Enabled
+
+		if err := validateBackendTLS(b.BackendTLS); err != nil {
+			return fmt.Errorf("backend %s: backend_tls: %v", b.Name, err)
+		}
 
 		if len(b.Servers) == 0 {
 			return fmt.Errorf("backend %s must have at least one server", b.Name)
@@ -654,6 +689,13 @@ func validate(cfg *Config) error {
 		if l.Backend != "" && !backendNames[l.Backend] {
 			return fmt.Errorf("listener %s references unknown backend: %s", l.Name, l.Backend)
 		}
+		// Load defaults an empty protocol to tcp; validate() is also called
+		// on hand-built configs, so normalise here too.
+		proto := l.Protocol
+		if proto == "" {
+			proto = "tcp"
+		}
+		l4 := proto == "tcp" || proto == "udp"
 
 		// Validate bind address format
 		if err := validateBindAddress(l.Bind); err != nil {
@@ -669,6 +711,13 @@ func validate(cfg *Config) error {
 			}
 		}
 
+		// Keys that are parsed but have no implementation behind them. A
+		// security control that silently does nothing is worse than a startup
+		// error, so they are refused instead of ignored.
+		if err := rejectUnimplementedListenerKeys(l); err != nil {
+			return err
+		}
+
 		// Validate TLS config
 		if l.TLS.Cert != "" || l.TLS.Key != "" {
 			if l.TLS.Cert == "" {
@@ -682,6 +731,38 @@ func validate(cfg *Config) error {
 			}
 			if _, err := os.Stat(l.TLS.Key); err != nil {
 				return fmt.Errorf("listener %s: TLS key file not found: %v", l.Name, err)
+			}
+			if proto == "udp" {
+				return fmt.Errorf("listener %s: tls is not supported on udp listeners", l.Name)
+			}
+		}
+		if err := validateClientAuth(l.TLS); err != nil {
+			return fmt.Errorf("listener %s: %v", l.Name, err)
+		}
+
+		// IP lists and ACL source_ip entries are enforced on every protocol.
+		// A typo must fail the load: a dropped allowlist entry can empty the
+		// list (= allow everyone) and a dropped ACL source_ip turns the rule
+		// into a match-all.
+		if err := validateIPList(l.IPAllowlist); err != nil {
+			return fmt.Errorf("listener %s: ip_allowlist: %v", l.Name, err)
+		}
+		if err := validateIPList(l.IPDenylist); err != nil {
+			return fmt.Errorf("listener %s: ip_denylist: %v", l.Name, err)
+		}
+		if err := validateACL(l.ACL, l4); err != nil {
+			return fmt.Errorf("listener %s: %v", l.Name, err)
+		}
+
+		// L4 (tcp/udp) listeners forward every connection to one pool, and
+		// only plaintext: backend_tls is implemented on the HTTP path alone.
+		if l4 {
+			if l.Backend == "" {
+				return fmt.Errorf("listener %s: %s listener requires 'backend'", l.Name, proto)
+			}
+			if backendTLS[l.Backend] {
+				return fmt.Errorf("listener %s: backend %s has backend_tls enabled, which is not implemented for %s listeners (only http/https listeners connect to backends over TLS)",
+					l.Name, l.Backend, proto)
 			}
 		}
 
@@ -732,25 +813,6 @@ func validate(cfg *Config) error {
 					}
 				}
 			}
-			// Validate ACL rules: known action, sane deny status, and a
-			// compilable path_regex. A bad ACL regex must fail startup rather
-			// than silently letting a security rule never match.
-			for i, a := range l.ACL {
-				if a.Action != "allow" && a.Action != "deny" {
-					return fmt.Errorf("listener %s: acl %d: action must be 'allow' or 'deny', got %q", l.Name, i, a.Action)
-				}
-				if a.Status != 0 && (a.Status < 100 || a.Status > 599) {
-					return fmt.Errorf("listener %s: acl %d: status %d out of range (100-599)", l.Name, i, a.Status)
-				}
-				if a.Match.PathRegex != "" {
-					if len(a.Match.PathRegex) > 1024 {
-						return fmt.Errorf("listener %s: acl %d: path_regex too long", l.Name, i)
-					}
-					if _, err := regexp.Compile(a.Match.PathRegex); err != nil {
-						return fmt.Errorf("listener %s: acl %d: invalid path_regex: %v", l.Name, i, err)
-					}
-				}
-			}
 		}
 
 		// Validate HTTP3 requires HTTPS
@@ -778,6 +840,219 @@ func validate(cfg *Config) error {
 	}
 
 	return nil
+}
+
+// rejectUnimplementedListenerKeys refuses listener keys that are parsed but
+// have no implementation (sni_routes, throttle, tls.ocsp_stapling,
+// routes[].scripts). Each would otherwise be a control that silently does
+// nothing.
+func rejectUnimplementedListenerKeys(l Listener) error {
+	if len(l.SNIRoutes) > 0 {
+		return fmt.Errorf("listener %s: sni_routes is not implemented (no TLS passthrough routing by SNI would happen); remove it", l.Name)
+	}
+	if l.Throttle.ReadRate != "" || l.Throttle.WriteRate != "" {
+		return fmt.Errorf("listener %s: throttle is not implemented (no bandwidth limit would be applied); remove it", l.Name)
+	}
+	if l.TLS.OCSPStapling {
+		return fmt.Errorf("listener %s: tls.ocsp_stapling is not implemented (no OCSP response would be stapled); remove it", l.Name)
+	}
+	for i, r := range l.Routes {
+		if r.Scripts.RequestScript != "" || r.Scripts.ResponseScript != "" {
+			return fmt.Errorf("listener %s: route %d: scripts (Lua request/response hooks) are not implemented (no script would run); remove them", l.Name, i)
+		}
+	}
+	return nil
+}
+
+// validateClientAuth checks a listener's client-certificate (mTLS) settings:
+// a known client_auth value, a TLS-terminating listener to apply it to, a
+// client_ca for "require", and a client_ca file that holds at least one PEM
+// certificate. A client_ca without client_auth is refused too: it reads like
+// mTLS but would not ask for a certificate.
+func validateClientAuth(t TLSConfig) error {
+	mode := strings.ToLower(strings.TrimSpace(t.ClientAuth))
+	switch mode {
+	case "", "none":
+		if t.ClientCA != "" {
+			return fmt.Errorf("tls.client_ca is set but tls.client_auth is %q: set client_auth to \"require\" or \"request\", or remove client_ca", t.ClientAuth)
+		}
+		return nil
+	case "require", "request":
+	default:
+		return fmt.Errorf("tls.client_auth %q is invalid (must be require, request or none)", t.ClientAuth)
+	}
+	if t.Cert == "" {
+		return fmt.Errorf("tls.client_auth needs a TLS-terminating listener (tls.cert and tls.key)")
+	}
+	if mode == "require" && t.ClientCA == "" {
+		return fmt.Errorf("tls.client_auth \"require\" needs tls.client_ca to verify client certificates")
+	}
+	if t.ClientCA != "" {
+		if _, err := LoadCertPool(t.ClientCA); err != nil {
+			return fmt.Errorf("tls.client_ca: %v", err)
+		}
+	}
+	return nil
+}
+
+// validateBackendTLS checks an enabled backend_tls block at load: the CA file
+// parses and the client certificate / key form a usable pair. Startup and
+// reload build the same config again and fail instead of falling back to
+// plaintext.
+func validateBackendTLS(b BackendTLSConfig) error {
+	if !b.Enabled {
+		return nil
+	}
+	if (b.ClientCert != "") != (b.ClientKey != "") {
+		return fmt.Errorf("client_cert and client_key must both be set (mTLS to the backend) or both be empty")
+	}
+	if b.ClientCert != "" {
+		if _, err := tls.LoadX509KeyPair(b.ClientCert, b.ClientKey); err != nil {
+			return fmt.Errorf("client_cert/client_key: %v", err)
+		}
+	}
+	if b.CACert != "" {
+		if _, err := LoadCertPool(b.CACert); err != nil {
+			return fmt.Errorf("ca_cert: %v", err)
+		}
+	}
+	return nil
+}
+
+// LoadCertPool reads a PEM file and returns a pool of its certificates. It
+// fails when the file cannot be read or holds no PEM certificate.
+func LoadCertPool(path string) (*x509.CertPool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(data) {
+		return nil, fmt.Errorf("%s: no PEM certificate found", path)
+	}
+	return pool, nil
+}
+
+// validateIPList checks that every entry is an IP address or a CIDR.
+func validateIPList(list []string) error {
+	for _, s := range list {
+		if _, _, err := net.ParseCIDR(s); err == nil {
+			continue
+		}
+		if net.ParseIP(s) == nil {
+			return fmt.Errorf("%q is not an IP address or CIDR", s)
+		}
+	}
+	return nil
+}
+
+// validateACL checks ACL rules: known action, sane deny status, compilable
+// path_regex, valid source_ip entries. A bad rule must fail startup rather
+// than silently never match (or match everyone). On tcp/udp listeners (l4)
+// a rule can only match the client IP: path, method and header matchers need
+// an HTTP request and are refused.
+func validateACL(rules []ACLRule, l4 bool) error {
+	for i, a := range rules {
+		if a.Action != "allow" && a.Action != "deny" {
+			return fmt.Errorf("acl %d: action must be 'allow' or 'deny', got %q", i, a.Action)
+		}
+		if a.Status != 0 && (a.Status < 100 || a.Status > 599) {
+			return fmt.Errorf("acl %d: status %d out of range (100-599)", i, a.Status)
+		}
+		if a.Match.PathRegex != "" {
+			if len(a.Match.PathRegex) > 1024 {
+				return fmt.Errorf("acl %d: path_regex too long", i)
+			}
+			if _, err := regexp.Compile(a.Match.PathRegex); err != nil {
+				return fmt.Errorf("acl %d: invalid path_regex: %v", i, err)
+			}
+		}
+		if err := validateIPList(a.Match.SourceIP); err != nil {
+			return fmt.Errorf("acl %d: source_ip: %v", i, err)
+		}
+		if l4 {
+			var httpOnly []string
+			if a.Match.PathPrefix != "" {
+				httpOnly = append(httpOnly, "path_prefix")
+			}
+			if a.Match.PathRegex != "" {
+				httpOnly = append(httpOnly, "path_regex")
+			}
+			if len(a.Match.Method) > 0 {
+				httpOnly = append(httpOnly, "method")
+			}
+			if len(a.Match.Headers) > 0 {
+				httpOnly = append(httpOnly, "headers")
+			}
+			if len(httpOnly) > 0 {
+				return fmt.Errorf("acl %d: %s match HTTP requests and cannot be used on a tcp/udp listener (only source_ip)", i, strings.Join(httpOnly, ", "))
+			}
+		}
+	}
+	return nil
+}
+
+// ServerWarnings returns one warning per server.* key that is set but not
+// implemented. user / group are reported only when the process does not
+// already run as them (nvelox never drops privileges itself); pid_file and
+// workers whenever they are set. main prints these at startup. They are
+// warnings, not errors, because deployed configs carry these keys.
+func ServerWarnings(s ServerConfig) []string {
+	var out []string
+	if msg := privilegeDropWarning(s.User, s.Group, os.Getuid(), os.Getgid()); msg != "" {
+		out = append(out, msg)
+	}
+	if s.PidFile != "" {
+		out = append(out, fmt.Sprintf("server.pid_file (%q) is set but not implemented: nvelox does not write a pid file", s.PidFile))
+	}
+	if s.Workers > 0 {
+		out = append(out, fmt.Sprintf("server.workers (%d) is set but not implemented: nvelox always runs as one process", s.Workers))
+	}
+	return out
+}
+
+// privilegeDropWarning reports server.user / server.group values the process
+// (uid, gid) is not running as. A name that does not resolve counts as
+// different.
+func privilegeDropWarning(userName, groupName string, uid, gid int) string {
+	var set []string
+	if userName != "" {
+		if id, ok := lookupUID(userName); !ok || id != uid {
+			set = append(set, fmt.Sprintf("server.user=%q", userName))
+		}
+	}
+	if groupName != "" {
+		if id, ok := lookupGID(groupName); !ok || id != gid {
+			set = append(set, fmt.Sprintf("server.group=%q", groupName))
+		}
+	}
+	if len(set) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s set but privilege drop is not implemented: nvelox is running as uid %d gid %d. Run nvelox under systemd User=/Group= with CAP_NET_BIND_SERVICE (AmbientCapabilities) instead",
+		strings.Join(set, " and "), uid, gid)
+}
+
+func lookupUID(name string) (int, bool) {
+	u, err := user.Lookup(name)
+	if err != nil {
+		if u, err = user.LookupId(name); err != nil {
+			return 0, false
+		}
+	}
+	id, err := strconv.Atoi(u.Uid)
+	return id, err == nil
+}
+
+func lookupGID(name string) (int, bool) {
+	g, err := user.LookupGroup(name)
+	if err != nil {
+		if g, err = user.LookupGroupId(name); err != nil {
+			return 0, false
+		}
+	}
+	id, err := strconv.Atoi(g.Gid)
+	return id, err == nil
 }
 
 // validateServerName checks a server_names entry. Allows exact hostnames and

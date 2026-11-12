@@ -78,6 +78,11 @@ listeners:
   - name: range-listener
     bind: "127.0.0.1:3000-3001"
     protocol: tcp
+    backend: backend1
+backends:
+  - name: backend1
+    servers:
+      - "127.0.0.1:9090"
 `
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
 		t.Fatalf("failed to create config: %v", err)

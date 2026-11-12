@@ -2,9 +2,9 @@
 ## Combines multiple features: HTTPS, HTTP/3, routing, health checks,
 ## rate limiting, ACLs, compression, metrics, admin API.
 version: "2"
-server:
-  user: "nvelox"
-  group: "nvelox"
+# server.user / server.group are not implemented (nvelox does not drop
+# privileges; setting them only prints a startup warning). Run nvelox under
+# systemd User=/Group= with AmbientCapabilities=CAP_NET_BIND_SERVICE instead.
 
 logging:
   level: "info"

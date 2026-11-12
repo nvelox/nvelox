@@ -22,6 +22,7 @@ import (
 	"nvelox/core/logging"
 	"nvelox/core/middleware"
 	"nvelox/core/sticky"
+	"nvelox/core/tlsutil"
 	"nvelox/lb"
 )
 
@@ -136,6 +137,10 @@ type ListenerConfig struct {
 	// per-request in BindGroup.ServeHTTP via http.ResponseController and so
 	// can differ between sites sharing the same bind.
 	Timeouts config.TimeoutConfig
+	// ClientAuth is the site's parsed client-certificate policy (from
+	// TLS.ClientAuth / ClientCA), nil when off. The engine parses it once;
+	// a BindGroup loads it from TLS itself when a caller left it nil.
+	ClientAuth *tlsutil.ClientAuth
 }
 
 // NewHTTPServer creates an HTTP server for the given listener.
@@ -212,6 +217,9 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 
 	// Per-backend TLS transports: a backend with backend_tls.enabled=true gets
 	// its own Transport with a TLSClientConfig built from the backend config.
+	// The engine refuses to start / reload when one cannot be built; should it
+	// still fail here (a file changed in between) the backend gets NO
+	// transport and every request to it is answered 502 — never plaintext.
 	s.backendTransports = make(map[string]*http.Transport)
 	s.backendSchemes = make(map[string]string)
 	s.backendTLSConfigs = make(map[string]*tls.Config)
@@ -221,7 +229,7 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 		}
 		tlsCfg, err := buildBackendTLSConfig(be.BackendTLS)
 		if err != nil {
-			logging.Error("[HTTP] backend %q: backend_tls invalid: %v — falling back to plaintext transport", name, err)
+			logging.Error("[HTTP] backend %q: backend_tls invalid: %v — requests to it fail with 502 (never sent in plaintext)", name, err)
 			continue
 		}
 		s.backendTransports[name] = &http.Transport{
@@ -334,11 +342,18 @@ func warnIfKeyWorldReadable(keyPath string) {
 	}
 }
 
+// BuildBackendTLSConfig builds a backend_tls client config; the engine calls
+// it at startup and reload pre-flight so a broken one aborts them.
+func BuildBackendTLSConfig(cfg config.BackendTLSConfig) (*tls.Config, error) {
+	return buildBackendTLSConfig(cfg)
+}
+
 // buildBackendTLSConfig turns a BackendTLSConfig into a *tls.Config suitable
 // for use as Transport.TLSClientConfig.
 //
 // Security defaults: InsecureSkipVerify is OFF unless the operator explicitly
-// sets backend_tls.insecure: true. System CA pool is used when no ca_cert is
+// sets backend_tls.insecure: true (the engine logs a warning per such backend
+// at startup and reload). System CA pool is used when no ca_cert is
 // provided. Client cert/key are both required if either is set (mTLS).
 func buildBackendTLSConfig(cfg config.BackendTLSConfig) (*tls.Config, error) {
 	t := &tls.Config{
@@ -346,8 +361,6 @@ func buildBackendTLSConfig(cfg config.BackendTLSConfig) (*tls.Config, error) {
 	}
 
 	if cfg.Insecure {
-		// Operator opted out of verification explicitly. Document loudly.
-		logging.Warn("[HTTP] backend_tls.insecure=true — certificate verification DISABLED for backend")
 		t.InsecureSkipVerify = true
 	} else if cfg.CACert != "" {
 		pem, err := os.ReadFile(cfg.CACert)
@@ -661,6 +674,14 @@ dispatch:
 		defer cl.Release()
 	}
 
+	// backend_tls fails closed: a backend configured for TLS whose TLS
+	// transport could not be built is answered 502, never proxied in
+	// plaintext (HTTP and WebSocket alike).
+	if !s.backendTLSReady(backendName, backend) {
+		s.serveError(w, http.StatusBadGateway)
+		return
+	}
+
 	// WebSocket upgrade detection
 	if isWebSocketUpgrade(r) {
 		s.handleWebSocket(w, r, balancer, backendName, clientIP)
@@ -840,6 +861,21 @@ dispatch:
 	duration := float64(time.Since(start).Microseconds()) / 1000.0
 	logging.AccessHTTP(clientIP, r.Host, r.Method, r.URL.Path, r.Proto, rec.status, rec.bytes, duration, lastTarget, r.UserAgent(),
 		fetchSite, fetchDest, r.TLS != nil, reqID, s.Listener.Name)
+}
+
+// backendTLSReady reports whether a request may be proxied to backendName:
+// true unless the backend has backend_tls enabled and this site holds no TLS
+// transport for it (its config failed to build, or the backend was switched
+// to TLS by a reload that has not reached this site yet).
+func (s *HTTPServer) backendTLSReady(backendName string, backend *config.Backend) bool {
+	if backend == nil || !backend.BackendTLS.Enabled {
+		return true
+	}
+	if _, ok := s.backendTransports[backendName]; ok {
+		return true
+	}
+	logging.Error("[HTTP] backend %q: backend_tls is enabled but no TLS transport is available — refusing to proxy in plaintext", backendName)
+	return false
 }
 
 // getStickyKey returns the session key based on the sticky session config.
@@ -1115,8 +1151,13 @@ func (s *HTTPServer) handleWebSocket(w http.ResponseWriter, r *http.Request, bal
 	defer balancer.OnDisconnect(target)
 
 	// Dial backend. A backend_tls backend gets the TLS config its HTTP
-	// transport uses; the 10 s timeout covers the handshake too.
+	// transport uses; the 10 s timeout covers the handshake too. A backend
+	// configured for TLS without a TLS config is refused (no plaintext dial).
 	var backendConn net.Conn
+	if !s.backendTLSReady(backendName, s.Backends[backendName]) {
+		s.serveError(w, http.StatusBadGateway)
+		return
+	}
 	if tlsCfg, ok := s.backendTLSConfigs[backendName]; ok {
 		cfg := tlsCfg.Clone()
 		// As http.Transport does for an upgrade: verify the target's host

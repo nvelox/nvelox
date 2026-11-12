@@ -123,21 +123,21 @@ flowchart LR
 | `core/denylist` | Process-wide IP and CIDR denylist with TTL | `core/denylist/denylist.go:28-228` |
 | `core/admin` | REST API: stats, backends, drain or enable or disable, denylist | `core/admin/api.go:121-517` |
 | `core/acl`, `core/middleware` | ACL rules, CIDR lists, per-IP token buckets | `core/acl/acl.go:28-197`, `core/middleware/ipratelimit.go:24-138` |
-| `core/circuitbreaker`, `core/sticky`, `core/passivehealth.go`, `core/connlimit.go` | Per-backend breaker, sticky store, passive failure counting, concurrency cap. Used on the HTTP path only | `core/httpproxy/server.go:595-611`, `core/httpproxy/server.go:696-750` |
+| `core/circuitbreaker`, `core/sticky`, `core/passivehealth.go`, `core/connlimit.go` | Per-backend breaker, sticky store, passive failure counting, concurrency cap. The breaker, sticky store and passive health are used on the HTTP path only; the concurrency cap (`max_connections`) also bounds L4 TCP connections and UDP sessions | `core/httpproxy/server.go:595-611`, `core/httpproxy/server.go:696-750`, `core/l4tcp.go`, `core/handler.go` |
 | `core/logging` | Error log, HTTP and L4 access-log formats, log file modes and reopen | `core/logging/logger.go:95-288`, `core/logging/reopen.go` |
 | `core/metrics` | Small Prometheus text registry | `core/metrics/metrics.go:19-197` |
-| `core/tlsutil` | TLS version and cipher policy, SNI wildcard matching | `core/tlsutil/clientauth.go:105-128`, `core/tlsutil/sni.go:13-94` |
+| `core/tlsutil` | TLS version and cipher policy, client-certificate policy (`LoadClientAuth`), SNI wildcard matching | `core/tlsutil/clientauth.go`, `core/tlsutil/sni.go:13-94` |
 | `proxy` | PROXY v2 header writer for UDP datagrams | `proxy/proxy_protocol.go:26-105` |
 
-Present but not wired into the engine: `core/sni` (SNI passthrough router), `core/throttle`, `core/scripting` (Lua), `core/tlsutil/ocsp.go` and `ConfigureClientAuth` (`core/tlsutil/clientauth.go:14`). No non-test code imports these packages or calls these functions. The matching config keys are accepted and ignored (see Configuration).
+Present but not wired into the engine: `core/sni` (SNI passthrough router), `core/throttle`, `core/scripting` (Lua) and `core/tlsutil/ocsp.go`. No non-test code imports these packages or calls these functions. Their config keys (`sni_routes`, `throttle`, `routes[].scripts`, `tls.ocsp_stapling`) are rejected at load (see Configuration).
 
 ### Concurrency model
 
 | Plane | Model | Code |
 |---|---|---|
 | Plain L4 TCP | One `net.Listen` and one accept goroutine per (expanded) listener. One goroutine per connection, plus one more inside `relayL4` for the second direction. Blocking copies with pooled 16 KiB buffers give real back-pressure. Accept errors back off from 5 ms to 1 s | `core/engine.go:226-245`, `core/l4tcp.go:42-70`, `core/relay.go:45-50`, `core/relay.go:88-101` |
-| L4 TLS termination | `tcp` listener with `tls.cert`: `tls.Listen`, optionally wrapped by `proxyproto.Listener`. Same accept loop and relay | `core/engine.go:931-976`, `core/engine.go:978-1047` |
-| UDP | nbio event loop with `OnOpen`, `OnData` and `OnClose` callbacks. One goroutine per backend session reads replies. Sessions are kept in a mutex-guarded pool | `core/engine.go:254-272`, `core/handler.go:101-169`, `core/handler.go:424-500` |
+| L4 TLS termination | `tcp` listener with `tls.cert`: `net.Listen`, optionally wrapped by `proxyproto.Listener` (a trusted relay's PROXY header is read before the handshake), under `tls.NewListener`. The handshake, with any `client_auth` check, completes before the backend is dialed. Same accept loop and relay | `core/engine.go` |
+| UDP | nbio event loop with `OnOpen`, `OnData` and `OnClose` callbacks. One goroutine per backend session reads replies into a pooled 64 KiB buffer borrowed only while a reply is relayed. Sessions are capped (16,384 per process, 512 per client IP) and kept in a mutex-guarded pool. `OnOpen` runs under nbio's UDP listener mutex, so it never closes a conn synchronously (`closeOnOpen`) | `core/engine.go:254-272`, `core/handler.go`, `core/udpsession.go`, `core/udpread_unix.go` |
 | HTTP, HTTPS, HTTP/3 | Go `net/http` server per bind address (a goroutine per connection) and an optional `quic-go` server. Site set and certificates live behind `atomic.Pointer`, so requests never take a lock to find their site | `core/httpproxy/bindgroup.go:20-41`, `core/httpproxy/bindgroup.go:323-400` |
 | Background | Per-backend health checker and DNS resolver, sticky, cache and per-IP limiter cleanup loops, denylist sweeper (1 min), UDP pool sweeper (30 s) | `core/engine.go:712-776`, `core/engine.go:147`, `core/udppool.go:106-118` |
 | Reload and shutdown | `reloadMu` serialises SIGHUP reloads and is held through `Start` until listeners are up. Shutdown closes listeners, waits for accept loops, closes live L4 conns, then waits up to 30 s for `ActiveConns` | `core/engine.go:112-127`, `core/engine.go:276-340` |
@@ -150,33 +150,34 @@ Present but not wired into the engine: `core/sni` (SNI passthrough router), `cor
 sequenceDiagram
   participant C as Client or peer relay
   participant L as nvelox serveTCP
-  participant D as denylist
+  participant D as ip lists, acl, denylist
   participant B as balancer
   participant T as tunnel-server mux
   C->>L: TCP connect to :17042
   L->>L: listener rate limit
-  L->>D: Blocked(peer) when peer is untrusted
-  L->>B: Next()
-  B-->>L: 10.0.0.101:1027
-  L->>T: dial with connect timeout
   opt peer is in accept_proxy_from
     C->>L: inbound PROXY v2 header
     L->>L: parse real client, wait up to 5s
   end
+  L->>D: access policy on the resolved client
+  L->>L: backend max_connections slot
+  L->>B: Next()
+  B-->>L: 10.0.0.101:1027
+  L->>T: dial with connect timeout
   L->>T: PROXY v2 src=client dst=:17042
   L->>T: bytes read past the header
   C->>T: relayL4 both directions
   L->>L: AccessL4 record at close
 ```
 
-- The listener rate limiter runs first. The dynamic denylist is checked only when the immediate peer is the client, because a trusted relay's own IP is infrastructure (`core/l4tcp.go:106-121`, `core/handler.go:172-184`).
+- The listener rate limiter runs first. Then the access policy (`ip_denylist`, the dynamic denylist, `ip_allowlist`, source-IP `acl`, in that order) runs on the resolved client: the peer for a direct client; for a trusted relay, the client its PROXY v2 header names (read before anything is dialed), or the relay itself when it sent no header. A trusted relay's own IP is never checked for the clients it relays (`core/l4tcp.go`, `core/l4access.go`). Backend `max_connections` is taken next, one slot per session.
 - A server entry without a port gets the listener's port. The dial timeout is the backend's `timeouts.connect`, else the listener's, else 10 s (`core/l4tcp.go:146-172`, `config/config.go:362-371`).
 - For a trusted peer, nvelox reads the inbound v2 header off the stream (at most 5 s and 1 MiB) and forwards any payload read past it. A LOCAL, malformed or missing header falls back to the peer address (`core/l4tcp.go:25-29`, `core/l4tcp.go:174-182`, `core/l4tcp.go:221-247`, `core/proxytrust.go:96-128`).
 - The outbound header's destination is the address the client dialed, not nvelox's ephemeral source. That lets tunnel-server serve the whole `:17000-17100` range on one socket and demux by destination port (`core/l4tcp.go:184-197`, `tunnel-server/tunnel/tcp_mux_listener.go:75-85`).
 - `relayL4` forwards everything already read before half-closing the other side (TCP `CloseWrite`, or `close_notify` plus FIN for TLS). Only an RST, a failed write or the idle timeout (default 5 min) aborts both sides (`core/relay.go:16-41`, `core/relay.go:54-62`, `core/relay.go:108-131`, `core/relay.go:188-194`).
 - At close one L4 record is written: `ok` or `no_route`. Byte counts are always 0. No record is written for a trusted relay whose real client was never resolved (`core/l4tcp.go:126-143`, `core/logging/logger.go:256-271`).
 
-UDP follows the same rules on nbio. The outbound v2 header is built once per session and prepended to every datagram. Behind a trusted relay the inbound header is stripped from each datagram, and the real client is checked against the denylist once (`core/handler.go:362-422`, `core/handler.go:250-323`, `core/proxytrust.go:136-149`).
+UDP follows the same rules on nbio. The outbound v2 header is built once per session and prepended to every datagram. Behind a trusted relay every datagram must carry an inbound header naming the same client: it is stripped, the client is admitted (access policy and per-client session cap) on the session's first datagram, and datagrams without a valid header or naming another client are dropped (`core/handler.go`, `core/proxytrust.go:136-149`). TLS-terminating TCP listeners apply the same policy, reading a trusted relay's PROXY header off the raw stream before the handshake, and complete the handshake (and any `client_auth` check) before the backend is dialed (`core/engine.go`).
 
 ### HTTP request routed to a backend (public-gw)
 
@@ -265,7 +266,7 @@ sequenceDiagram
 - The admin API requires `api_key` (load error without it, `config/controlplane.go`). Every request passes, in order: loopback-only peers when bound to loopback, a `Host` header naming the bind address (DNS rebinding), Go's cross-origin protection (`Sec-Fetch-Site` / `Origin`), a constant-time `X-API-Key` comparison, then `Content-Type: application/json` on state-changing requests. A valid key is always served; 10 failures from one IP in 10 min make that IP's further failures return 429 for 15 min, and the failure table is capped at 4096 IPs and pruned (`core/admin/api.go:30-48`, `core/admin/api.go:162-357`).
 - `POST` takes `{ip, ttl_seconds}` (TTL 0 or less never expires; ranges wider than an IPv4 /8 or IPv6 /16, including `::ffff:0:0/96`, are refused), `DELETE` takes `?cidr=` or `{ip}`, and `GET` lists live entries (`core/admin/api.go:446-507`, `core/denylist/denylist.go:30-58`).
 - Single hosts are stored in a map, ranges in a scanned list. Expired entries stop matching at once, and a sweeper removes them every minute (`core/denylist/denylist.go:76-131`, `core/engine.go:142-148`).
-- The HTTP path checks every request against the resolved client IP (`core/httpproxy/server.go:424-429`). L4 checks at accept time, and checks a UDP client behind a trusted relay once its header is parsed (`core/handler.go:149-153`, `core/handler.go:270-298`).
+- The HTTP path checks every request against the resolved client IP (`core/httpproxy/server.go:424-429`). L4 checks every TCP / TLS connection and UDP session on the resolved client: at accept time for a direct client, once its PROXY v2 header is parsed for a client behind a trusted relay (`core/l4tcp.go`, `core/engine.go`, `core/handler.go`).
 - sentinel reports success only if every endpoint returned 200 (`ngris-sentinel/worker/enforce.go:66-92`). Its endpoint list holds public-gw, eu-fin and us-east (`deploy/helm/ngris-sentinel/values.yaml:302`), but not de-central, whose admin API listens on its WireGuard IP 10.10.0.3 (`tf-infra/ansible/inventory/prod/host_vars/ngris-unigate-de-central.yml:30`).
 - Entries live only in memory. sentinel re-pushes active blocks on a timer, every 5 min by default (`ngris-sentinel/worker/worker.go:1698-1721`, `ngris-sentinel/config/config.go:645`).
 
@@ -298,27 +299,27 @@ Command line: `-config` (default `nvelox.yaml`) and `-version` (`main.go:41-51`)
 | `metrics.enabled`, `bind`, `path` | Prometheus endpoint, path default `/metrics`, an empty bind means `127.0.0.1:9090` (`core/engine.go:152-167`, `core/controlplane.go`). Not enabled on the ngris gateways (`tf-infra/ansible/roles/nvelox/templates/nvelox.conf.j2:1-25`) |
 | `listeners[].protocol`, `bind` | `tcp` (default), `udp`, `http` or `https`. A bind like `:17000-17100` expands to one listener per port named `<name>-<port>` (`config/config.go:563-566`, `core/engine.go:637-645`) |
 | `listeners[].backend` | Pool name. `default_backend` is the deprecated alias, and setting both is an error (`config/config.go:567-577`) |
-| `server_names`, `default_server` | Multi-site per port. Rules: one protocol per socket, at most one default, every non-default site has names, names are unique, no mix of `sni_routes` and `https` (`config/config.go:800-898`) |
-| `tls` | `cert`, `key`, `min_version` (default 1.2), `max_version` (default 1.3), `cipher_suites`. Files must exist at load (`config/config.go:673-684`, `core/tlsutil/clientauth.go:105-128`) |
+| `server_names`, `default_server` | Multi-site per port. Rules: one protocol per socket, at most one default, every non-default site has names, names are unique (`config/config.go`) |
+| `tls` | `cert`, `key`, `min_version` (default 1.2), `max_version` (default 1.3), `cipher_suites`, `client_auth` (`require`, `request` or `none`) with `client_ca`. Files must exist at load; the client CA must parse. On a shared HTTPS bind the client-certificate policy is per site, chosen by SNI, and a request whose Host names a `client_auth` site over a connection whose SNI chose another site is answered 421 (`config/config.go`, `core/tlsutil/clientauth.go`, `core/httpproxy/bindgroup.go`) |
 | `trusted_proxies` | L7 trust for `X-Forwarded-For` and `X-Real-IP`. Empty means the headers are overwritten with the peer (`core/httpproxy/server.go:856-904`) |
 | `accept_proxy_from` | L4 trust for an inbound PROXY v2 header. Empty means trust nobody. CIDRs are validated at load (`config/config.go:663-670`) |
 | `rate_limit`, `ip_rate_limit` | Token buckets: per listener (connections on L4, requests on L7) and per client IP on L7 (`core/engine.go:128-135`, `core/httpproxy/server.go:439-452`) |
-| `ip_allowlist`, `ip_denylist`, `acl`, `max_body_size` | L7 static controls. ACL actions are `allow` or `deny` with `status` 100-599, and `path_regex` must compile (`config/config.go:723-742`) |
+| `ip_allowlist`, `ip_denylist`, `acl`, `max_body_size` | Static controls. The IP lists and ACL apply to HTTP requests and to TCP, TLS and UDP sessions; on tcp/udp listeners an ACL rule may match `source_ip` only. Entries must be valid IPs/CIDRs, ACL actions are `allow` or `deny` with `status` 100-599, and `path_regex` must compile (`config/config.go`) |
 | `timeouts` | `connect` (L4 dial, default 10 s). `read_header`, `read`, `write`, `idle` on HTTP (10 s, 60 s, 60 s, 120 s). `idle` on L4 TCP (5 min) (`core/httpproxy/bindgroup.go:137-142`, `core/relay.go:54-62`) |
 | `request_id.enabled`, `trust_inbound` | Mint or keep `X-Request-ID`. Inbound ids must be hex or dash and at most 128 chars (`core/httpproxy/requestid.go:42-85`) |
 | `routes[]` | `match` on `host`, `path_prefix` or `path_regex`, then `backend`, `redirect`, `rewrite`, `headers`, `static`, `try_files`, `fastcgi`, `expires` (`config/config.go:278-331`) |
 | `backends[].balance`, `servers` | `roundrobin` (default), `leastconn` or `random`. At least one server (`config/config.go:593-627`) |
 | `backends[].send_proxy_v2` | Prepend PROXY v2 on L4 TCP, L4 TLS and UDP. Ignored by the HTTP path (`core/l4tcp.go:186-197`, `core/engine.go:1029-1036`) |
-| `backends[].backend_tls` | HTTPS to backends with `ca_cert`, mTLS client cert, or `insecure` (`core/httpproxy/server.go:306-340`) |
+| `backends[].backend_tls` | HTTPS to backends with `ca_cert`, mTLS client cert, or `insecure`, from HTTP/HTTPS listeners only: a tcp/udp listener on such a backend is rejected at load. A CA or key pair that cannot be loaded fails the load, startup and reload; a request to a backend whose TLS config is missing gets 502, never plaintext (`core/httpproxy/server.go`, `core/engine.go`) |
 | `backends[].retry`, `health_check`, `circuit_breaker`, `sticky_session`, `max_connections`, `resolve_interval`, `allow_private_ips` | See Inside. Breaker timeout default 30 s, health probe timeout default 1 s (`core/engine.go:738-750`, `core/health/checker.go:83-87`) |
 
-Accepted but with no effect in this code: `server.user`, `group`, `pid_file`, `workers`, `tracing`, `zero_copy` (`config/config.go:107-110`), `sni_routes`, `tls.auto_cert`, `ocsp_stapling`, `client_auth`, `client_ca`, `grpc`, `throttle`, `routes[].scripts`, and backend `timeouts.read`. They are parsed, and `zero_copy` is copied into the engine's listener struct, but no code acts on them.
+Rejected at load because nothing implements them: `sni_routes`, `throttle`, `tls.ocsp_stapling: true` and `routes[].scripts`. Accepted with a startup WARNING on stderr: `server.user` and `group` (when the process does not already run as them: nvelox never drops privileges) and `pid_file` and `workers` (no pid file is written, one process runs). Accepted with no effect: `tracing`, `zero_copy` (`config/config.go:107-110`), `tls.auto_cert`, `grpc` and backend `timeouts.read`. tcp and udp listeners must name a `backend`.
 
 ## Operating it
 
 **Build, release and deploy.** CI runs `go build` and `go test` on pushes and PRs to `main` (`.github/workflows/test.yml:1-33`). A `v*` tag runs GoReleaser: linux amd64 and arm64 binaries with `main.Version` stamped, plus multi-arch images `ghcr.io/nvelox/nvelox:<tag>`, `<major>.<minor>` and `latest` (`.github/workflows/release.yml:1-60`, `.goreleaser.yaml:1-69`, `Dockerfile.goreleaser:1-10`). The gateways do not use these artifacts. The Ansible role clones `nvelox_version` (default `main`, public-gw pins `v1.1.1`), runs `go build` on the host and restarts when the source changes (`tf-infra/ansible/roles/nvelox/tasks/main.yml:80-136`, `tf-infra/ansible/inventory/prod/group_vars/gateways/nvelox.yaml:8`). That build passes no `-ldflags`, so `-version` prints `dev` (`main.go:22`). The unit has `Restart=on-failure` and `ExecReload` sending SIGHUP, and has no `User=` line, so the process runs as root (`tf-infra/ansible/roles/nvelox/templates/nvelox.service.j2:1-19`).
 
-**Health and metrics.** There is no health or readiness endpoint. `GET /api/v1/stats` on the admin API returns uptime and the backend count (`core/admin/api.go:200-207`). The metrics endpoint exports only `nvelox_reload_total{result}` and `nvelox_reload_duration_seconds` (`core/engine.go:426-432`). No traffic metrics are recorded.
+**Health and metrics.** There is no health or readiness endpoint. `GET /api/v1/stats` on the admin API returns uptime and the backend count (`core/admin/api.go:200-207`). The metrics endpoint exports only `nvelox_reload_total{result}`, `nvelox_reload_duration_seconds` (`core/engine.go:426-432`) and `nvelox_udp_dropped_total{reason}` (UDP sessions and datagrams refused by the session caps or the trusted-relay header rule, `core/udpsession.go`). No traffic metrics are recorded.
 
 **Logs.** The access log has no timestamp and two line shapes (`core/logging/logger.go:259-315`):
 - HTTP: `<client> - <host> "<method> <path> <proto>" <status> <bytes> <ms>ms -> <backend> "<UA>" fetch_site=<Sec-Fetch-Site> fetch_dest=<Sec-Fetch-Dest> scheme=<https|http> rid=<id> gw=<gw> site=<listener>`. `fetch_site` and `fetch_dest` are `-` when the header is absent; `scheme` is `https` when the request arrived over TLS (HTTP/3 included)
@@ -330,7 +331,7 @@ All fields are sanitised against CRLF, and the User-Agent is cut to 512 bytes (`
 - Requests answered before the proxy step are not access-logged, so sentinel never sees them. That covers denylist, allowlist, rate-limit and ACL rejections, cache hits, redirects, static files, FastCGI and WebSocket upgrades. `AccessHTTP` is only reached at the end of the proxy path (`core/httpproxy/server.go:416-626`, `core/httpproxy/server.go:789`).
 - When every proxy attempt fails, the client gets a 502 written to the raw writer, but the access line records the recorder's initial status 200 (`core/httpproxy/server.go:659`, `core/httpproxy/server.go:771-789`).
 - L7 backend dials have no nvelox timeout: the transport sets none, and backend `timeouts` are used only by L4 dials (`core/httpproxy/server.go:197-206`, `core/l4tcp.go:160-165`).
-- The TLS-terminating L4 path does not consult the denylist and writes no L4 access record. Its PROXY v2 destination is nvelox's own source address, not the dialed port (`core/engine.go:978-1047`).
+- The TLS-terminating L4 path's PROXY v2 destination is nvelox's own source address, not the dialed port (`core/engine.go`).
 - A WebSocket upgrade is forwarded before `X-Forwarded-*` are set, over plain TCP even when `backend_tls` is on (`core/httpproxy/server.go:613-616`, `core/httpproxy/server.go:1055-1080`).
 - Active health checks probe the server list the backend had when it was created. Reload does not update the checker, and a server-list change marks every server healthy again (`lb/lb.go:118-128`, `core/health/checker.go:70-80`, `core/engine.go:765-774`).
 
@@ -341,7 +342,8 @@ All fields are sanitised against CRLF, and the User-Agent is cut to 512 bytes (`
 | L4 dial | 10 s default | `config/config.go:362-371` |
 | L4 TCP idle (no bytes either way) | 5 min default, `0` disables | `core/relay.go:54-62` |
 | Inbound PROXY header wait, trusted peer | 5 s on plain TCP, 10 s on TLS L4 | `core/l4tcp.go:25`, `core/engine.go:962-966` |
-| UDP idle and pool TTL | 60 s, backend read deadline 60 s, 1 MiB pre-connect buffer | `core/engine.go:257-261`, `core/handler.go:314`, `core/handler.go:480` |
+| UDP sessions | 16,384 per process, 512 per client IP; a session ends 10 s after it opened if the backend never answered, else 60 s after the backend's last reply; 1 MiB pre-connect buffer. Refusals count in `nvelox_udp_dropped_total{reason}` | `core/udpsession.go`, `core/handler.go` |
+| L4 TLS handshake | 10 s, completed before the backend is dialed; trusted PROXY header wait 10 s | `core/engine.go` |
 | HTTP header, read, write, idle | 10 s, 60 s, 60 s, 120 s | `core/httpproxy/bindgroup.go:137-142` |
 | Backend pool | 1024 idle conns, 256 per host, 90 s idle, 10 s TLS handshake | `core/httpproxy/server.go:197-206` |
 | WebSocket backend dial | 10 s | `core/httpproxy/server.go:1065` |
@@ -360,7 +362,8 @@ All fields are sanitised against CRLF, and the User-Agent is cut to 512 bytes (`
 | Backend node down, no health checks | L4: dial fails and the client is closed with `no_route`. L7: 502, or a retry if `retry.attempts` is above 1 (`core/l4tcp.go:166-172`, `core/httpproxy/server.go:771-783`) |
 | All servers unhealthy | L4 closes the connection, L7 returns 503 (`lb/lb.go:76-86`, `core/httpproxy/server.go:666-675`) |
 | nvelox restart | Denylist empty (fails open) until sentinel's next reconcile. In-flight L4 sessions are closed (`core/engine.go:308-311`) |
-| Trusted peer sends no or bad PROXY header | Falls back to the peer address, so traffic still flows (`core/l4tcp.go:221-247`) |
+| Trusted peer sends no or bad PROXY header | TCP: falls back to the peer address, which is then the client the access policy checks (`core/l4tcp.go`). UDP: the datagram is dropped (`core/handler.go`) |
+| Backend has no healthy server (UDP) | The new session is refused through `closeOnOpen`; the UDP poller keeps serving (`core/handler.go`) |
 
 ## Code map
 
