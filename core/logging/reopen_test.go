@@ -196,9 +196,10 @@ func TestReopen_ConcurrentWritesLoseNothing(t *testing.T) {
 	}
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
-	// Rotate as fast as possible for as long as the writers run.
+	// Rotate as fast as possible while the writers run (at most 500 times,
+	// so a slow -race run does not pile up thousands of files).
 rotate:
-	for r := 1; ; r++ {
+	for r := 1; r <= 500; r++ {
 		select {
 		case <-done:
 			break rotate
