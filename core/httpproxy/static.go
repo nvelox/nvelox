@@ -207,8 +207,9 @@ func hasDotfileSegment(p string) bool {
 // names a file — then checked on disk under root. The first one that exists
 // is returned as its path, with isFallback false. Otherwise the expanded
 // fallback is returned unsplit with isFallback true (a "=code" status, or a
-// URI the caller turns into an internal redirect, splitting path and query
-// itself), or "" when no fallback is configured.
+// URI the caller serves from the same route or turns into an internal
+// redirect, splitting path and query itself), or "" when no fallback is
+// configured.
 func TryFiles(root string, r *http.Request, files []string, fallback string) (target string, isFallback bool) {
 	uri := r.URL.Path
 	args := r.URL.RawQuery

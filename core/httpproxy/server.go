@@ -300,13 +300,13 @@ func parseByteSize(s string) int64 {
 	return n * multiplier
 }
 
-// tryFilesRedirect turns a try_files fallback into an internal redirect, as
-// nginx does: the target is split at its first '?' into path and query (a
-// target without '?' keeps the request's query) and the new path goes
-// through the listener ACL again; the caller then routes it. A target path
+// tryFilesFallback points r at a try_files fallback target: the target is
+// split at its first '?' into path and query (a target without '?' keeps the
+// request's query) and the new path goes through the listener ACL again. The
+// caller serves it from the same route or routes it again. A target path
 // with a "." or ".." segment, a backslash or a NUL is refused with 400.
 // Returns false when the request has been answered.
-func (s *HTTPServer) tryFilesRedirect(w http.ResponseWriter, r *http.Request, target, clientIP string) bool {
+func (s *HTTPServer) tryFilesFallback(w http.ResponseWriter, r *http.Request, target, clientIP string) bool {
 	p, query, hasQuery := strings.Cut(target, "?")
 	if !strings.HasPrefix(p, "/") {
 		p = "/" + p
@@ -604,10 +604,10 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	routeResult := s.router.MatchFull(r.Host, r.URL.Path)
 	var backendName string
 	var routeHeaders *config.HeadersConfig
-	// A try_files fallback is an internal redirect (nginx semantics): the
-	// ACL and the router run again on the new path and dispatch restarts
-	// here, once — the route it lands on serves the target without
-	// try_files.
+	// A try_files fallback the route cannot serve itself is an internal
+	// redirect (nginx semantics): the ACL and the router run again on the
+	// new path and dispatch restarts here, once — the route it lands on
+	// serves the target without try_files.
 	tryFilesRedirected := false
 dispatch:
 	if routeResult != nil {
@@ -630,8 +630,13 @@ dispatch:
 
 		// Handle static file serving
 		if routeResult.Static.Root != "" {
-			// try_files: a candidate that exists is served by this route;
-			// the fallback is an internal redirect (see tryFilesRedirect).
+			// try_files: a candidate that exists is served by this route,
+			// and so is the fallback when this route's root has it (a file,
+			// or a directory with an index; a script only where this route
+			// runs FastCGI), as before v1.2.0: an SPA's fallback "/" is its
+			// own index even where "/" itself routes elsewhere. Any other
+			// fallback is an internal redirect (e.g. /index.php reaches the
+			// FastCGI route).
 			if len(routeResult.TryFiles.Files) > 0 && !tryFilesRedirected {
 				target, isFallback := TryFiles(routeResult.Static.Root, r, routeResult.TryFiles.Files, routeResult.TryFiles.Fallback)
 				switch {
@@ -642,12 +647,14 @@ dispatch:
 					s.serveError(w, code)
 					return
 				case isFallback:
-					if !s.tryFilesRedirect(w, r, target, clientIP) {
+					if !s.tryFilesFallback(w, r, target, clientIP) {
 						return
 					}
-					routeResult = s.router.MatchFull(r.Host, r.URL.Path)
-					tryFilesRedirected = true
-					goto dispatch
+					if _, ok := NewStaticHandler(routeResult.Static).Resolve(r.URL.Path, routeResult.FastCGI.Pass != ""); !ok {
+						routeResult = s.router.MatchFull(r.Host, r.URL.Path)
+						tryFilesRedirected = true
+						goto dispatch
+					}
 				case target != "" && target != r.URL.Path:
 					if !s.rewriteRequestPath(w, r, target, clientIP) {
 						return
