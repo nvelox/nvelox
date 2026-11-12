@@ -14,14 +14,15 @@ import (
 // directions of the relay go through it (the client's bytes are read from
 // it, the backend's are written to it), so it sees all of the tunnel's
 // traffic: it closes the tunnel after an idle period with no byte either way
-// and when its site is closed. Closing it also cancels the request context,
-// which makes ReverseProxy close the backend connection.
+// and when its bind group stops. A reload leaves it running. Closing it also
+// cancels the request context, which makes ReverseProxy close the backend
+// connection.
 //
 // It deliberately has no CloseWrite: when one side ends, ReverseProxy then
 // closes both instead of half-closing the client and waiting.
 type tunnelConn struct {
 	net.Conn
-	site    *HTTPServer
+	set     *tunnelSet
 	cancel  context.CancelFunc
 	idle    time.Duration
 	last    atomic.Int64 // UnixNano of the last byte in either direction
@@ -47,24 +48,76 @@ func (s *HTTPServer) tunnelIdleTimeout() time.Duration {
 	return defaultIdleTimeout
 }
 
-// trackTunnel wraps a hijacked client connection as a tunnel of s. cancel
-// cancels the upgrade request's context. If s is already closed, the tunnel
-// is closed at once.
-func (s *HTTPServer) trackTunnel(c net.Conn, cancel context.CancelFunc) *tunnelConn {
-	t := &tunnelConn{Conn: c, site: s, cancel: cancel, idle: s.tunnelIdleTimeout()}
-	t.last.Store(time.Now().UnixNano())
+// tunnelSet tracks open tunnels. All sites of a bind group share the group's
+// set (AddSite / ReplaceSites), so BindGroup.Stop finds every tunnel, also
+// those still open on site instances a reload replaced: a reload does not cut
+// a tunnel, it runs until it ends or goes idle. A site outside any bind group
+// uses its own set.
+type tunnelSet struct {
+	mu     sync.Mutex
+	m      map[*tunnelConn]struct{}
+	closed bool
+}
 
-	s.tunnelMu.Lock()
-	closed := s.tunnelsClosed
-	if !closed {
-		if s.tunnels == nil {
-			s.tunnels = make(map[*tunnelConn]struct{})
-		}
-		s.tunnels[t] = struct{}{}
+// add tracks t; false once the set is closed.
+func (ts *tunnelSet) add(t *tunnelConn) bool {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if ts.closed {
+		return false
 	}
-	s.tunnelMu.Unlock()
+	if ts.m == nil {
+		ts.m = make(map[*tunnelConn]struct{})
+	}
+	ts.m[t] = struct{}{}
+	return true
+}
 
-	if closed {
+func (ts *tunnelSet) remove(t *tunnelConn) {
+	ts.mu.Lock()
+	delete(ts.m, t)
+	ts.mu.Unlock()
+}
+
+// closeAll closes every tunnel of the set and any added after this.
+func (ts *tunnelSet) closeAll() {
+	ts.mu.Lock()
+	ts.closed = true
+	open := make([]*tunnelConn, 0, len(ts.m))
+	for t := range ts.m {
+		open = append(open, t)
+	}
+	ts.mu.Unlock()
+	for _, t := range open {
+		_ = t.Close()
+	}
+}
+
+// tunnelSet returns the set s tracks its tunnels in: its bind group's, else
+// its own.
+func (s *HTTPServer) tunnelSet() *tunnelSet {
+	s.tunnelsMu.Lock()
+	defer s.tunnelsMu.Unlock()
+	if s.tunnels == nil {
+		s.tunnels = &tunnelSet{}
+	}
+	return s.tunnels
+}
+
+// setTunnelSet points s at its bind group's set, before s serves traffic.
+func (s *HTTPServer) setTunnelSet(ts *tunnelSet) {
+	s.tunnelsMu.Lock()
+	s.tunnels = ts
+	s.tunnelsMu.Unlock()
+}
+
+// trackTunnel wraps a hijacked client connection as a tunnel of s. cancel
+// cancels the upgrade request's context. If the set is already closed (the
+// bind group stopped), the tunnel is closed at once.
+func (s *HTTPServer) trackTunnel(c net.Conn, cancel context.CancelFunc) *tunnelConn {
+	t := &tunnelConn{Conn: c, set: s.tunnelSet(), cancel: cancel, idle: s.tunnelIdleTimeout()}
+	t.last.Store(time.Now().UnixNano())
+	if !t.set.add(t) {
 		_ = t.Close()
 		return t
 	}
@@ -74,26 +127,6 @@ func (s *HTTPServer) trackTunnel(c net.Conn, cancel context.CancelFunc) *tunnelC
 	}
 	t.mu.Unlock()
 	return t
-}
-
-// closeTunnels closes every tunnel of s and any opened after this.
-func (s *HTTPServer) closeTunnels() {
-	s.tunnelMu.Lock()
-	s.tunnelsClosed = true
-	open := make([]*tunnelConn, 0, len(s.tunnels))
-	for t := range s.tunnels {
-		open = append(open, t)
-	}
-	s.tunnelMu.Unlock()
-	for _, t := range open {
-		_ = t.Close()
-	}
-}
-
-func (s *HTTPServer) untrackTunnel(t *tunnelConn) {
-	s.tunnelMu.Lock()
-	delete(s.tunnels, t)
-	s.tunnelMu.Unlock()
 }
 
 func (t *tunnelConn) Read(b []byte) (int, error) {
@@ -125,7 +158,7 @@ func (t *tunnelConn) Close() error {
 		t.mu.Unlock()
 		t.cancel()
 		t.closeErr = t.Conn.Close()
-		t.site.untrackTunnel(t)
+		t.set.remove(t)
 	})
 	return t.closeErr
 }

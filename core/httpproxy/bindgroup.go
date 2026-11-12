@@ -45,6 +45,11 @@ type BindGroup struct {
 	// buildTLSConfig). Sites with client_auth get a clone of it carrying
 	// their client-certificate policy, chosen per handshake by SNI.
 	tlsBase *tls.Config
+
+	// tunnels holds the open WebSocket tunnels of every site of the group,
+	// replaced site instances included (a reload leaves their tunnels
+	// running). Stop closes them.
+	tunnels tunnelSet
 }
 
 // siteSet is the immutable snapshot of sites the bind group dispatches to.
@@ -87,6 +92,7 @@ func (g *BindGroup) AddSite(s *HTTPServer) {
 	if g.primary == nil {
 		g.primary = s
 	}
+	s.setTunnelSet(&g.tunnels)
 	current := g.sites.Load()
 	var all []*HTTPServer
 	if current != nil {
@@ -335,9 +341,9 @@ func (g *BindGroup) pickSite(ss *siteSet, host string) *HTTPServer {
 // Every old site instance that is not in the new list — a dropped site,
 // and the old instance of a site that is rebuilt under the same name — has
 // Close() called on it: that stops its cleanup goroutines (ResponseCache,
-// IPRateLimiter) and closes its upgraded (WebSocket) connections, so no
-// tunnel keeps running under the configuration it was opened with.
-// Note: Close is called immediately — a plain request currently inside an
+// IPRateLimiter). Its upgraded (WebSocket) connections keep running until
+// they end or go idle; they stay in the group's tunnel set, so Stop closes
+// them. Note: Close is called immediately — a plain request currently inside an
 // old site still holds references to those collaborators, but neither
 // cache eviction nor IP-rate-limit pruning is critical for an in-flight
 // request to finish, so stopping their tickers is safe.
@@ -354,6 +360,9 @@ func (g *BindGroup) ReplaceSites(newSites []*HTTPServer) error {
 	// Publish the new site set BEFORE closing dropped sites — in-flight
 	// requests should see the new set, and dropped sites' Close stops
 	// background tickers but doesn't interrupt running handlers.
+	for _, s := range newSites {
+		s.setTunnelSet(&g.tunnels)
+	}
 	g.sites.Store(buildSiteSet(newSites))
 
 	// Primary tracks the first site; update so subsequent ReloadCerts
@@ -737,9 +746,10 @@ func (g *BindGroup) pickSiteCert(sni string) *siteCert {
 	return state.defaultCert
 }
 
-// Stop gracefully shuts the group's HTTP and HTTP/3 listeners, then closes
-// its sites: http.Server.Shutdown neither waits for nor closes hijacked
-// (WebSocket) connections, so the sites close their tunnels.
+// Stop gracefully shuts the group's HTTP and HTTP/3 listeners, closes its
+// sites, then closes every WebSocket tunnel of the group (replaced site
+// instances included): http.Server.Shutdown neither waits for nor closes
+// hijacked connections.
 func (g *BindGroup) Stop(ctx context.Context) error {
 	if g.http3Server != nil {
 		g.http3Server.Close()
@@ -751,5 +761,6 @@ func (g *BindGroup) Stop(ctx context.Context) error {
 	for _, s := range g.siteList() {
 		s.Close()
 	}
+	g.tunnels.closeAll()
 	return err
 }

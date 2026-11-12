@@ -1,6 +1,7 @@
 package httpproxy
 
 import (
+	"context"
 	"crypto/tls"
 	"io"
 	"net"
@@ -205,29 +206,39 @@ func TestWebSocket_TrafficKeepsTunnelOpen(t *testing.T) {
 	secExpectEOF(t, conn, br, 2*time.Second, "tunnel idle after the traffic stopped")
 }
 
-// TestWebSocket_SiteCloseClosesTunnels: closing a site closes its tunnels.
-func TestWebSocket_SiteCloseClosesTunnels(t *testing.T) {
+// TestWebSocket_StopClosesTunnels: stopping the bind group closes its
+// tunnels and the backend side with them (http.Server.Shutdown does not touch
+// hijacked connections).
+func TestWebSocket_StopClosesTunnels(t *testing.T) {
 	b := secStartWSBackend(t)
-	s, addr := secSite(t, &ListenerConfig{}, []string{b.addr}, secOpts{})
+	s := secNewSite(t, &ListenerConfig{}, []string{b.addr}, secOpts{})
+	g := NewBindGroup(":0", "http")
+	g.AddSite(s)
+	ts := httptest.NewServer(g)
+	defer ts.Close()
 
-	conn, br, resp := secUpgrade(t, addr, "")
+	conn, br, resp := secUpgrade(t, secHost(ts), "")
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		t.Fatalf("status = %d, want 101", resp.StatusCode)
 	}
 	assertEcho(t, conn, br)
-	s.Close()
-	secExpectEOF(t, conn, br, 2*time.Second, "tunnel of a closed site")
+	if err := g.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	secExpectEOF(t, conn, br, 2*time.Second, "tunnel of a stopped bind group")
 	select {
 	case <-b.closed:
 	case <-time.After(wsTestTimeout):
-		t.Fatal("backend side not closed with the site")
+		t.Fatal("backend side not closed with the bind group")
 	}
 }
 
-// TestWebSocket_ReloadClosesOldTunnels: a reload (ReplaceSites) replaces
-// every site instance, also the one rebuilt under the same name; the old
-// instance's tunnels are closed so none keeps running under the old config.
-func TestWebSocket_ReloadClosesOldTunnels(t *testing.T) {
+// TestWebSocket_ReloadKeepsTunnels: a reload (ReplaceSites) replaces every
+// site instance, also the one rebuilt under the same name, and leaves the
+// old instance's tunnels running (as before v1.2.0: an ingress reloads on
+// every endpoint change). Stop still closes them, including a tunnel the
+// replaced instance opens after the reload (an upgrade in flight across it).
+func TestWebSocket_ReloadKeepsTunnels(t *testing.T) {
 	b := secStartWSBackend(t)
 	old := secNewSite(t, &ListenerConfig{}, []string{b.addr}, secOpts{})
 	g := NewBindGroup(":0", "http")
@@ -243,7 +254,8 @@ func TestWebSocket_ReloadClosesOldTunnels(t *testing.T) {
 	if err := g.ReplaceSites([]*HTTPServer{secNewSite(t, &ListenerConfig{}, []string{b.addr}, secOpts{})}); err != nil {
 		t.Fatalf("ReplaceSites: %v", err)
 	}
-	secExpectEOF(t, conn, br, 2*time.Second, "tunnel of a replaced site")
+	time.Sleep(100 * time.Millisecond)
+	assertEcho(t, conn, br) // still open after the reload
 
 	// The new site serves upgrades.
 	conn2, br2, resp2 := secUpgrade(t, secHost(ts), "")
@@ -251,6 +263,23 @@ func TestWebSocket_ReloadClosesOldTunnels(t *testing.T) {
 		t.Fatalf("after reload: status = %d, want 101", resp2.StatusCode)
 	}
 	assertEcho(t, conn2, br2)
+
+	// A tunnel the replaced instance tracks after the reload.
+	late, lateClient := net.Pipe()
+	defer lateClient.Close()
+	lateTun := old.trackTunnel(late, func() {})
+
+	if err := g.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	secExpectEOF(t, conn, br, 2*time.Second, "pre-reload tunnel after Stop")
+	secExpectEOF(t, conn2, br2, 2*time.Second, "post-reload tunnel after Stop")
+	lateTun.mu.Lock()
+	closed := lateTun.closed
+	lateTun.mu.Unlock()
+	if !closed {
+		t.Fatal("tunnel opened on the replaced instance after the reload not closed by Stop")
+	}
 }
 
 // TestWebSocket_BreakerOutcomeRecorded (H4): an upgrade is an attempt like

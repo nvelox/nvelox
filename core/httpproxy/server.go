@@ -106,12 +106,10 @@ type HTTPServer struct {
 	altSvcHeader      string
 	closeOnce         sync.Once // guards Close() against double-invocation
 
-	// Upgraded (WebSocket) connections relayed through this site right now.
-	// Close closes them, so a reload or shutdown does not leave a tunnel
-	// running under the configuration it was opened with. See tunnel.go.
-	tunnelMu      sync.Mutex
-	tunnels       map[*tunnelConn]struct{}
-	tunnelsClosed bool
+	// Upgraded (WebSocket) connections relayed through this site, in the
+	// bind group's shared set (see tunnel.go).
+	tunnelsMu sync.Mutex
+	tunnels   *tunnelSet
 }
 
 // ListenerConfig mirrors core.ListenerConfig to avoid circular imports.
@@ -432,16 +430,16 @@ func (s *HTTPServer) Stop(ctx context.Context) error {
 }
 
 // Close stops every per-site background goroutine (response cache cleanup
-// loop, per-IP rate limiter cleanup loop) and closes the site's upgraded
-// (WebSocket) connections. Called by BindGroup.ReplaceSites for every site
-// instance a SIGHUP reload replaces, and by BindGroup.Stop.
+// loop, per-IP rate limiter cleanup loop). Called by BindGroup.ReplaceSites
+// for every site instance a SIGHUP reload replaces, and by BindGroup.Stop.
 //
 // Idempotent (sync.Once) — the underlying Cache.Stop / IPRateLimiter.Stop
 // close their stopCh channels, which would panic on second close.
 //
 // In-flight plain requests in the site's handlers complete normally;
-// stopping these tickers only disables background pruning. Tunnels are
-// closed: their clients reconnect and get the current configuration.
+// stopping these tickers only disables background pruning. Upgraded
+// (WebSocket) connections keep running until they end or go idle
+// (timeouts.idle); BindGroup.Stop closes them.
 func (s *HTTPServer) Close() {
 	s.closeOnce.Do(func() {
 		if s.ResponseCache != nil {
@@ -450,7 +448,6 @@ func (s *HTTPServer) Close() {
 		if s.IPRateLimiter != nil {
 			s.IPRateLimiter.Stop()
 		}
-		s.closeTunnels()
 	})
 }
 

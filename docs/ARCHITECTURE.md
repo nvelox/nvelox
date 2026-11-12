@@ -331,7 +331,7 @@ Every HTTP response gets exactly one line, written when the request ends (for a 
 **Behaviour to know about**
 - L7 backend dials time out after a fixed 10 s; backend `timeouts.connect` is used only by L4 dials (`core/httpproxy/server.go`, `core/l4tcp.go:160-165`).
 - The TLS-terminating L4 path's PROXY v2 destination is nvelox's own source address, not the dialed port (`core/engine.go`).
-- A WebSocket tunnel is closed after the site's `timeouts.idle` (120 s when unset) without a byte either way, and when the site is closed: every SIGHUP reload replaces the site instances, so open WebSocket connections are closed and their clients reconnect under the new config (`core/httpproxy/tunnel.go`).
+- A WebSocket tunnel is closed after the site's `timeouts.idle` (120 s when unset) without a byte either way, and when its listener stops. A SIGHUP reload leaves open tunnels running, with the config they were opened under, until they end or go idle: an ingress controller reloads on every endpoint change (`core/httpproxy/tunnel.go`).
 - Active health checks probe the server list the backend had when it was created. Reload does not update the checker, and a server-list change marks every server healthy again (`lb/lb.go:118-128`, `core/health/checker.go:70-80`, `core/engine.go:765-774`).
 
 **Timeouts and limits**
