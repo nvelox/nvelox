@@ -191,7 +191,7 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 	}
 	// Backend max_connections: one slot per UDP session, released in OnClose.
 	var limiter *ConnLimiter
-	if cl, ok := h.engine.ConnLimiters[l.Backend]; ok {
+	if cl, ok := h.engine.backends().ConnLimiters[l.Backend]; ok {
 		if !cl.Acquire() {
 			h.udpSessions.release(sessionIP)
 			logging.Warn("[CONN] listener %s: backend %s at max_connections — refusing %s", l.Name, l.Backend, c.RemoteAddr())
@@ -424,7 +424,8 @@ func listenerName(l *ListenerConfig) string {
 func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerConfig) {
 	// Runs inside OnOpen: every failure closes through closeOnOpen (a
 	// synchronous Close deadlocks the nbio poller — see closeOnOpen).
-	balancer, ok := h.engine.Balancers[l.Backend]
+	bv := h.engine.backends() // one consistent view for this session (H6)
+	balancer, ok := bv.Balancers[l.Backend]
 	if !ok {
 		logging.Error("Balancer '%s' not found for listener '%s'", l.Backend, l.Name)
 		closeOnOpen(clientConn)
@@ -432,7 +433,7 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 	}
 
 	// Get backend config to check SendProxyV2
-	backend := h.engine.Backends[l.Backend]
+	backend := bv.Backends[l.Backend]
 	if backend != nil && backend.BackendTLS.Enabled {
 		// backend_tls is implemented on the HTTP path only; never send
 		// plaintext to a backend configured for TLS (config load refuses

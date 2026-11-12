@@ -178,12 +178,13 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 		}
 	}
 
-	balancer, ok := e.Balancers[l.Backend]
+	bv := e.backends() // one consistent view for this connection (H6)
+	balancer, ok := bv.Balancers[l.Backend]
 	if !ok {
 		logging.Error("Balancer '%s' not found for listener '%s'", l.Backend, l.Name)
 		return
 	}
-	backend := e.Backends[l.Backend]
+	backend := bv.Backends[l.Backend]
 	if backend != nil && backend.BackendTLS.Enabled {
 		// backend_tls is implemented on the HTTP path only; never send
 		// plaintext to a backend configured for TLS (config load refuses
@@ -193,7 +194,7 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 		return
 	}
 	// Backend max_connections: one slot per session, held until it ends.
-	if cl, ok := e.ConnLimiters[l.Backend]; ok {
+	if cl, ok := bv.ConnLimiters[l.Backend]; ok {
 		if !cl.Acquire() {
 			logging.Warn("[CONN] listener %s: backend %s at max_connections — refusing %s", l.Name, l.Backend, realClientIP)
 			refused = l4StatusRateLimited

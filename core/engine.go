@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"nvelox/config"
@@ -46,18 +47,19 @@ type Engine struct {
 	DNSResolvers    map[string]*discovery.DNSResolver // keyed by backend name
 	AdminServer     *admin.Server
 	metricsServer   *http.Server
-	UDPPool         *UDPPool                // UDP session affinity pool
-	HTTPServers     []*httpproxy.HTTPServer // L7 HTTP sites (per listener config)
-	BindGroups      []*httpproxy.BindGroup  // socket-owning groups (one per bind addr)
-	ActiveConns     sync.WaitGroup          // tracks in-flight connections for graceful drain
-	DrainTimeout    time.Duration           // max wait on shutdown (default 30s)
-	tlsListeners    []net.Listener          // TLS listeners to close on shutdown
-	tcpListeners    []tcpListener           // plain L4 TCP listeners (std accept loop + relayL4)
-	acceptWG        sync.WaitGroup          // L4 TCP/TLS accept loops; waited on before closing live conns
-	l4Conns         sync.Map                // live L4 TCP/TLS client conns (net.Conn -> struct{}), closed on shutdown
-	runCtx          context.Context         // Start's ctx: cancels in-flight L4 backend dials on shutdown
-	reloadMu        sync.Mutex              // serializes concurrent SIGHUPs
-	configPath      string                  // path for reload
+	UDPPool         *UDPPool                    // UDP session affinity pool
+	HTTPServers     []*httpproxy.HTTPServer     // L7 HTTP sites (per listener config)
+	BindGroups      []*httpproxy.BindGroup      // socket-owning groups (one per bind addr)
+	ActiveConns     sync.WaitGroup              // tracks in-flight connections for graceful drain
+	DrainTimeout    time.Duration               // max wait on shutdown (default 30s)
+	tlsListeners    []net.Listener              // TLS listeners to close on shutdown
+	tcpListeners    []tcpListener               // plain L4 TCP listeners (std accept loop + relayL4)
+	acceptWG        sync.WaitGroup              // L4 TCP/TLS accept loops; waited on before closing live conns
+	l4Conns         sync.Map                    // live L4 TCP/TLS client conns (net.Conn -> struct{}), closed on shutdown
+	runCtx          context.Context             // Start's ctx: cancels in-flight L4 backend dials on shutdown
+	reloadMu        sync.Mutex                  // serializes concurrent SIGHUPs
+	view            atomic.Pointer[backendView] // what request paths read (backendview.go)
+	configPath      string                      // path for reload
 
 	// UDP session limits (see udpsession.go). Set from code constants in
 	// NewEngine — deliberately not configurable; tests lower them.
@@ -192,6 +194,7 @@ func (e *Engine) Start(ctx context.Context) error {
 
 	// 1. Initialize Backends & Health Checkers
 	e.initBackends()
+	e.publishBackends()
 
 	// 1b. Initialize Rate Limiters
 	for _, l := range e.Listeners {
@@ -206,7 +209,8 @@ func (e *Engine) Start(ctx context.Context) error {
 
 	// 1e. Start admin API
 	if e.Config.Admin.Enabled {
-		e.AdminServer = admin.NewServer(e.Config.Admin.Bind, e.Config.Admin.APIKey, e.Balancers, denylist.Default)
+		e.AdminServer = admin.NewServer(e.Config.Admin.Bind, e.Config.Admin.APIKey, nil, denylist.Default)
+		e.AdminServer.SetBalancerSource(func() map[string]lb.Balancer { return e.backends().Balancers })
 		if err := e.AdminServer.Start(); err != nil {
 			return err
 		}
@@ -475,6 +479,7 @@ func (e *Engine) Reload(cfg *config.Config) error {
 	warnInsecureBackendTLS(cfg.Backends)
 	e.Config = cfg
 	beAdded, beRemoved, beUpdated := e.reconcileBackends(cfg)
+	e.publishBackends()
 	sitesSwapped, bgAdded, bgRemoved := e.reloadL7Sites(expanded)
 
 	totalRotated := 0
@@ -778,7 +783,8 @@ func (e *Engine) buildL7Site(l *ListenerConfig) *httpproxy.HTTPServer {
 	for k, v := range e.CircuitBreakers {
 		cbs[k] = v
 	}
-	return httpproxy.NewHTTPServer(httpL, e.Balancers, e.Backends, rl, connLimiters, passiveHealth, e.StickyStores, cbs)
+	v := e.backends()
+	return httpproxy.NewHTTPServer(httpL, v.Balancers, v.Backends, rl, connLimiters, passiveHealth, v.StickyStores, cbs)
 }
 
 // initBackend wires one backend's balancer, conn limiter, passive health,
@@ -1133,14 +1139,15 @@ func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *
 		}
 	}
 
-	// Select backend
-	balancer, ok := e.Balancers[l.Backend]
+	// Select backend (one consistent view for this connection, H6)
+	bv := e.backends()
+	balancer, ok := bv.Balancers[l.Backend]
 	if !ok {
 		logging.Error("Balancer '%s' not found for TLS listener '%s'", l.Backend, l.Name)
 		return
 	}
 
-	backend := e.Backends[l.Backend]
+	backend := bv.Backends[l.Backend]
 	if backend != nil && backend.BackendTLS.Enabled {
 		// backend_tls is implemented on the HTTP path only; never send
 		// plaintext to a backend configured for TLS (config load refuses
@@ -1151,7 +1158,7 @@ func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *
 	}
 
 	// Backend max_connections: one slot per session, held until it ends.
-	if cl, ok := e.ConnLimiters[l.Backend]; ok {
+	if cl, ok := bv.ConnLimiters[l.Backend]; ok {
 		if !cl.Acquire() {
 			logging.Warn("[CONN] TLS listener %s: backend %s at max_connections — refusing %s", l.Name, l.Backend, client)
 			status = l4StatusRateLimited

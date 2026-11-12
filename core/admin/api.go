@@ -89,11 +89,15 @@ func parseBind(bind string) bindInfo {
 type Server struct {
 	httpServer *http.Server
 	balancers  map[string]lb.Balancer
-	startTime  time.Time
-	apiKey     string
-	apiKeySum  [sha256.Size]byte // sha256(apiKey): compared without leaking the key length
-	dynDeny    *denylist.Dynamic // runtime IP/CIDR denylist (nil = endpoint disabled)
-	bind       bindInfo
+	// balancerSource, when set, returns the engine's current backend view: a
+	// map a reload never writes again (the engine publishes a fresh one), so
+	// reading it races nothing. It replaces balancers.
+	balancerSource func() map[string]lb.Balancer
+	startTime      time.Time
+	apiKey         string
+	apiKeySum      [sha256.Size]byte // sha256(apiKey): compared without leaking the key length
+	dynDeny        *denylist.Dynamic // runtime IP/CIDR denylist (nil = endpoint disabled)
+	bind           bindInfo
 
 	// Per-source-IP failed auth tracking.
 	authMu       sync.Mutex
@@ -381,7 +385,7 @@ func (s *Server) Stop(ctx context.Context) error {
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	resp := StatsResponse{
 		Uptime:   time.Since(s.startTime).Round(time.Second).String(),
-		Backends: len(s.balancers),
+		Backends: len(s.currentBalancers()),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
@@ -389,7 +393,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleBackends(w http.ResponseWriter, r *http.Request) {
 	var backends []BackendStatus
-	for name := range s.balancers {
+	for name := range s.currentBalancers() {
 		backends = append(backends, BackendStatus{Name: name})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -411,7 +415,7 @@ func (s *Server) handleBackendAction(w http.ResponseWriter, r *http.Request) {
 	backendName := parts[3]
 	action := parts[4]
 
-	balancer, ok := s.balancers[backendName]
+	balancer, ok := s.currentBalancers()[backendName]
 	if !ok {
 		http.Error(w, "Backend not found", http.StatusNotFound)
 		return
@@ -514,4 +518,20 @@ func splitPath(path string) []string {
 		}
 	}
 	return parts
+}
+
+// SetBalancerSource makes the API read its backends through fn on every
+// request instead of the map given to NewServer. The engine passes its
+// published backend view, so a reload that adds or removes a backend never
+// writes a map a request is reading.
+func (s *Server) SetBalancerSource(fn func() map[string]lb.Balancer) {
+	s.balancerSource = fn
+}
+
+// currentBalancers is the backend map to read for this request.
+func (s *Server) currentBalancers() map[string]lb.Balancer {
+	if s.balancerSource != nil {
+		return s.balancerSource()
+	}
+	return s.balancers
 }
