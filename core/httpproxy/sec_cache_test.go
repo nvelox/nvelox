@@ -275,3 +275,24 @@ func TestCompression_MinLength(t *testing.T) {
 		t.Fatalf("compressed response without Vary: Accept-Encoding (Vary=%q)", resp.Header.Values("Vary"))
 	}
 }
+
+// TestCompression_PartialContentNotCompressed: a 206 carries a byte range
+// of the uncompressed body; compressing it would break its Content-Range.
+func TestCompression_PartialContentNotCompressed(t *testing.T) {
+	l := &ListenerConfig{Compression: config.CompressionConfig{Enabled: true, Types: []string{"text/plain"}}}
+	_, addr := secSite(t, l, []string{secHost(secCacheBackend(t))}, secOpts{})
+	tr := &http.Transport{DisableCompression: true}
+	defer tr.CloseIdleConnections()
+	req, _ := http.NewRequest("GET", "http://"+addr+"/file", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	req.Header.Set("Range", "bytes=2-4")
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent || resp.Header.Get("Content-Encoding") != "" || string(body) != "234" {
+		t.Fatalf("206: status=%d Content-Encoding=%q body=%q, want 206 identity \"234\"", resp.StatusCode, resp.Header.Get("Content-Encoding"), body)
+	}
+}

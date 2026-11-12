@@ -61,8 +61,9 @@ func (w *compressWriter) WriteHeader(code int) {
 	}
 	w.wroteHeader = true
 
-	// No body to compress.
-	if code == http.StatusNoContent || code == http.StatusNotModified {
+	// No body to compress, or a byte range of the uncompressed body (its
+	// Content-Range would not match a compressed one).
+	if code == http.StatusNoContent || code == http.StatusNotModified || code == http.StatusPartialContent {
 		w.ResponseWriter.WriteHeader(code)
 		return
 	}
