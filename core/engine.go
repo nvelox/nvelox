@@ -141,7 +141,9 @@ func (e *Engine) Start(ctx context.Context) error {
 	// 1e. Start admin API
 	if e.Config.Admin.Enabled {
 		e.AdminServer = admin.NewServer(e.Config.Admin.Bind, e.Config.Admin.APIKey, e.Balancers, denylist.Default)
-		e.AdminServer.Start()
+		if err := e.AdminServer.Start(); err != nil {
+			return err
+		}
 		// Evict expired dynamic-denylist entries periodically (admin API is the
 		// only mutator, so the sweeper only matters when admin is enabled).
 		denylist.Default.StartSweeper(time.Minute)
