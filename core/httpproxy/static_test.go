@@ -68,10 +68,10 @@ func TestTryFiles_FindsFile(t *testing.T) {
 	os.WriteFile(filepath.Join(tmpDir, "page.html"), []byte("page"), 0644)
 
 	r := httptest.NewRequest("GET", "/page.html", nil)
-	result := TryFiles(tmpDir, r, []string{"$uri"}, "=404")
+	result, isFallback := TryFiles(tmpDir, r, []string{"$uri"}, "=404")
 
-	if result != "/page.html" {
-		t.Errorf("expected /page.html, got %s", result)
+	if result != "/page.html" || isFallback {
+		t.Errorf("expected candidate /page.html, got %s (fallback=%v)", result, isFallback)
 	}
 }
 
@@ -79,10 +79,10 @@ func TestTryFiles_FallsBack(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	r := httptest.NewRequest("GET", "/missing", nil)
-	result := TryFiles(tmpDir, r, []string{"$uri", "$uri/"}, "/index.php$is_args$args")
+	result, isFallback := TryFiles(tmpDir, r, []string{"$uri", "$uri/"}, "/index.php$is_args$args")
 
-	if result != "/index.php" {
-		t.Errorf("expected /index.php, got %s", result)
+	if result != "/index.php" || !isFallback {
+		t.Errorf("expected fallback /index.php, got %s (fallback=%v)", result, isFallback)
 	}
 }
 
@@ -90,10 +90,10 @@ func TestTryFiles_FallbackWithQuery(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	r := httptest.NewRequest("GET", "/missing?q=test", nil)
-	result := TryFiles(tmpDir, r, []string{"$uri"}, "/index.php$is_args$args")
+	result, isFallback := TryFiles(tmpDir, r, []string{"$uri"}, "/index.php$is_args$args")
 
-	if result != "/index.php?q=test" {
-		t.Errorf("expected /index.php?q=test, got %s", result)
+	if result != "/index.php?q=test" || !isFallback {
+		t.Errorf("expected fallback /index.php?q=test, got %s (fallback=%v)", result, isFallback)
 	}
 }
 
@@ -101,10 +101,10 @@ func TestTryFiles_StatusFallback(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	r := httptest.NewRequest("GET", "/missing", nil)
-	result := TryFiles(tmpDir, r, []string{"$uri"}, "=404")
+	result, isFallback := TryFiles(tmpDir, r, []string{"$uri"}, "=404")
 
-	if result != "=404" {
-		t.Errorf("expected =404, got %s", result)
+	if result != "=404" || !isFallback {
+		t.Errorf("expected fallback =404, got %s (fallback=%v)", result, isFallback)
 	}
 }
 

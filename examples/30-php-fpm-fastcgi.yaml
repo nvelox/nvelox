@@ -1,6 +1,7 @@
 ## 30 — PHP-FPM via FastCGI
 ## Full PHP application setup equivalent to nginx + PHP-FPM.
-## Serves static files directly, forwards PHP to FastCGI.
+## Serves static files directly, runs the front controller (index.php)
+## through PHP-FPM.
 ##
 ## Equivalent nginx config:
 ##   root /var/www/html;
@@ -8,15 +9,28 @@
 ##       expires 1y;
 ##       try_files $uri =404;
 ##   }
-##   location ~ \.php(/|$) {
+##   location ~ \.(xml|pdf|xlsx)$ {
+##       expires -1;
+##       try_files $uri /index.php$is_args$args;
+##   }
+##   location ~ ^/index\.php(/|$) {
 ##       fastcgi_pass 127.0.0.1:9000;
 ##       fastcgi_split_path_info ^(.+\.php)(/.*)$;
+##       try_files $fastcgi_script_name =404;
 ##       fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
 ##       fastcgi_param DOCUMENT_ROOT $document_root;
 ##   }
 ##   location / {
 ##       try_files $uri $uri/ /index.php$is_args$args;
 ##   }
+##
+## As in nginx, a try_files fallback is an internal redirect: the target is
+## split at its first '?' into path and query, checked against the ACL and
+## routed again — /index.php lands on the PHP route. Static routes never
+## serve .php/.phtml/.phar files as files, and a fastcgi route hands
+## PHP-FPM only an existing .php file inside document_root (required; nvelox
+## must see it at the same path as PHP-FPM). Only index.php runs here: any
+## other .php file is a 404.
 
 version: "2"
 logging:
@@ -37,7 +51,8 @@ listeners:
           fallback: "=404"
         expires: "1y"
 
-      # PDF/XML — serve with no cache
+      # PDF/XML — serve with no cache; a missing file (e.g. a generated
+      # sitemap.xml) goes to the front controller through the PHP route below
       - match:
           path_regex: "\\.(xml|pdf|xlsx)$"
         static:
@@ -47,7 +62,7 @@ listeners:
           fallback: "/index.php$is_args$args"
         expires: "-1"
 
-      # PHP files — forward to PHP-FPM
+      # Front controller — forward to PHP-FPM
       - match:
           path_regex: "^/(index)\\.php(/|$)"
         fastcgi:
@@ -58,18 +73,15 @@ listeners:
             HTTPS: "$http_x_forwarded_proto"
             REMOTE_ADDR: "$http_x_real_ip"
 
-      # Everything else — try static, fall back to PHP
+      # Everything else — try static, fall back to the front controller
       - match:
           path_prefix: "/"
         static:
           root: "/var/www/html"
-          index: ["index.html", "index.php"]
+          index: ["index.html"]
         try_files:
           files: ["$uri", "$uri/"]
           fallback: "/index.php$is_args$args"
-        fastcgi:
-          pass: "127.0.0.1:9000"
-          document_root: "/var/www/html"
 
 # No backends needed — FastCGI routes handle everything
 backends: []

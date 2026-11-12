@@ -291,7 +291,7 @@ type RouteConfig struct {
 // FastCGIConfig defines FastCGI upstream (e.g., PHP-FPM) settings.
 type FastCGIConfig struct {
 	Pass          string            `yaml:"pass"`                      // FastCGI address (e.g., "127.0.0.1:9000" or "unix:/var/run/php-fpm.sock")
-	DocumentRoot  string            `yaml:"document_root,omitempty"`   // DOCUMENT_ROOT for SCRIPT_FILENAME
+	DocumentRoot  string            `yaml:"document_root,omitempty"`   // DOCUMENT_ROOT for SCRIPT_FILENAME; required — only existing .php files inside it are run
 	ScriptName    string            `yaml:"script_name,omitempty"`     // Override SCRIPT_NAME (default: from URL path)
 	SplitPathInfo string            `yaml:"split_path_info,omitempty"` // Regex to split PATH_INFO (like fastcgi_split_path_info)
 	Params        map[string]string `yaml:"params,omitempty"`          // Extra FastCGI params
@@ -719,6 +719,18 @@ func validate(cfg *Config) error {
 				if r.Match.Host == "" && r.Match.PathPrefix == "" && r.Match.PathRegex == "" {
 					return fmt.Errorf("listener %s: route %d must have at least host, path_prefix, or path_regex", l.Name, i)
 				}
+				// A route path_regex that doesn't compile must fail startup:
+				// the router would otherwise drop the route.
+				if r.Match.PathRegex != "" {
+					if err := validatePathRegex(r.Match.PathRegex); err != nil {
+						return fmt.Errorf("listener %s: route %d: path_regex: %v", l.Name, i, err)
+					}
+				}
+				if hasFastCGI {
+					if err := validateFastCGI(r.FastCGI); err != nil {
+						return fmt.Errorf("listener %s: route %d: fastcgi: %v", l.Name, i, err)
+					}
+				}
 			}
 			// Validate ACL rules: known action, sane deny status, and a
 			// compilable path_regex. A bad ACL regex must fail startup rather
@@ -988,4 +1000,44 @@ func resolveIncludeGlob(pattern, mainConfigPath string) ([]string, error) {
 		clean = append(clean, abs)
 	}
 	return clean, nil
+}
+
+// MaxPathRegexLen bounds a route path_regex and a fastcgi split_path_info
+// (the ACL path_regex check uses the same 1024).
+const MaxPathRegexLen = 1024
+
+// validatePathRegex checks a path regex: bounded length, compiles as RE2.
+func validatePathRegex(re string) error {
+	if len(re) > MaxPathRegexLen {
+		return fmt.Errorf("too long (%d bytes, max %d)", len(re), MaxPathRegexLen)
+	}
+	if _, err := regexp.Compile(re); err != nil {
+		return fmt.Errorf("invalid: %v", err)
+	}
+	return nil
+}
+
+// validateFastCGI checks a route's fastcgi block. document_root is required:
+// without it the script path was joined onto the process working directory
+// ("/" in the container image). script_name must not climb out of it.
+func validateFastCGI(f FastCGIConfig) error {
+	if f.DocumentRoot == "" {
+		return fmt.Errorf("document_root is required")
+	}
+	if f.SplitPathInfo != "" {
+		if err := validatePathRegex(f.SplitPathInfo); err != nil {
+			return fmt.Errorf("split_path_info: %v", err)
+		}
+	}
+	if f.ScriptName != "" {
+		if strings.ContainsAny(f.ScriptName, "\\\x00") {
+			return fmt.Errorf("script_name %q: backslash or NUL", f.ScriptName)
+		}
+		for _, seg := range strings.Split(f.ScriptName, "/") {
+			if seg == "." || seg == ".." {
+				return fmt.Errorf("script_name %q: '.' or '..' segment", f.ScriptName)
+			}
+		}
+	}
+	return nil
 }

@@ -276,15 +276,45 @@ func parseByteSize(s string) int64 {
 	return n * multiplier
 }
 
-// isPHPPath reports whether a request path should be handled by FastCGI
-// rather than the static-file handler. Matches the typical PHP-FPM
-// dispatch shape: a path ending in `.php` or containing `.php/` (the
-// latter is the PATH_INFO form, e.g. /index.php/foo/bar). Operators who
-// run a non-PHP FastCGI backend can configure their own regex on the
-// matching route; this helper only kicks in when static+fastcgi coexist
-// on the same route.
-func isPHPPath(p string) bool {
-	return strings.HasSuffix(p, ".php") || strings.Contains(p, ".php/")
+// tryFilesRedirect turns a try_files fallback into an internal redirect, as
+// nginx does: the target is split at its first '?' into path and query (a
+// target without '?' keeps the request's query) and the new path goes
+// through the listener ACL again; the caller then routes it. A target path
+// with a "." or ".." segment, a backslash or a NUL is refused with 400.
+// Returns false when the request has been answered.
+func (s *HTTPServer) tryFilesRedirect(w http.ResponseWriter, r *http.Request, target, clientIP string) bool {
+	p, query, hasQuery := strings.Cut(target, "?")
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	if unsafeTargetPath(p) {
+		logging.Warn("[HTTP] Refusing try_files target %q", logging.SanitizeLogField(target))
+		s.serveError(w, http.StatusBadRequest)
+		return false
+	}
+	if hasQuery {
+		r.URL.RawQuery = query
+	}
+	return s.rewriteRequestPath(w, r, p, clientIP)
+}
+
+// rewriteRequestPath points r at a new path chosen inside nvelox (a
+// try_files target, a directory index script) and runs the listener ACL on
+// it, as on the original path. Returns false when a deny rule answered.
+func (s *HTTPServer) rewriteRequestPath(w http.ResponseWriter, r *http.Request, p, clientIP string) bool {
+	r.URL.Path, r.URL.RawPath = p, ""
+	if s.ACLEngine == nil {
+		return true
+	}
+	action, status := s.ACLEngine.DecideClientIP(r, net.ParseIP(clientIP))
+	if action != "deny" {
+		return true
+	}
+	if status == 0 {
+		status = http.StatusForbidden
+	}
+	s.serveError(w, status)
+	return false
 }
 
 // warnIfKeyWorldReadable logs a WARN if a private-key file on disk has
@@ -493,6 +523,12 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	routeResult := s.router.MatchFull(r.Host, r.URL.Path)
 	var backendName string
 	var routeHeaders *config.HeadersConfig
+	// A try_files fallback is an internal redirect (nginx semantics): the
+	// ACL and the router run again on the new path and dispatch restarts
+	// here, once — the route it lands on serves the target without
+	// try_files.
+	tryFilesRedirected := false
+dispatch:
 	if routeResult != nil {
 		backendName = routeResult.Backend
 		routeHeaders = routeResult.Headers
@@ -513,46 +549,49 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		// Handle static file serving
 		if routeResult.Static.Root != "" {
-			// Set expires header
-			if routeResult.Expires != "" {
-				SetExpires(w, routeResult.Expires)
-			}
-
-			root := routeResult.Static.Root
-
-			// try_files logic
-			if len(routeResult.TryFiles.Files) > 0 {
-				resolved := TryFiles(root, r, routeResult.TryFiles.Files, routeResult.TryFiles.Fallback)
-				if resolved != "" {
-					// Check if fallback is a status code (e.g., "=404")
-					if strings.HasPrefix(resolved, "=") {
-						code := 404
-						fmt.Sscanf(resolved[1:], "%d", &code)
-						s.serveError(w, code)
+			// try_files: a candidate that exists is served by this route;
+			// the fallback is an internal redirect (see tryFilesRedirect).
+			if len(routeResult.TryFiles.Files) > 0 && !tryFilesRedirected {
+				target, isFallback := TryFiles(routeResult.Static.Root, r, routeResult.TryFiles.Files, routeResult.TryFiles.Fallback)
+				switch {
+				case isFallback && strings.HasPrefix(target, "="):
+					// Status fallback (e.g. "=404")
+					code := 404
+					fmt.Sscanf(target[1:], "%d", &code)
+					s.serveError(w, code)
+					return
+				case isFallback:
+					if !s.tryFilesRedirect(w, r, target, clientIP) {
 						return
 					}
-					// Update request path and serve
-					r.URL.Path = resolved
+					routeResult = s.router.MatchFull(r.Host, r.URL.Path)
+					tryFilesRedirected = true
+					goto dispatch
+				case target != "" && target != r.URL.Path:
+					if !s.rewriteRequestPath(w, r, target, clientIP) {
+						return
+					}
 				}
 			}
 
-			// If the route ALSO has FastCGI configured AND try_files
-			// resolved to a PHP path (front-controller pattern), skip
-			// the static handler and let FastCGI run the script.
-			// Without this, the static handler would happily serve
-			// index.php as plain text.
-			if routeResult.FastCGI.Pass != "" && isPHPPath(r.URL.Path) {
-				// Fall through to the FastCGI block below.
-			} else {
-				handler := NewStaticHandler(routeResult.Static)
-				if handler.ServeFile(w, r) {
+			// A script (.php, .phtml, .phar) is never served as a file. On a
+			// route with FastCGI it runs there — a directory index script
+			// under its own path; otherwise it counts as missing.
+			handler := NewStaticHandler(routeResult.Static)
+			f, found := handler.Resolve(r.URL.Path, routeResult.FastCGI.Pass != "")
+			switch {
+			case found && !f.script:
+				handler.Serve(newExpiresWriter(w, routeResult.Expires), r, f)
+				return
+			case found:
+				if f.urlPath != r.URL.Path && !s.rewriteRequestPath(w, r, f.urlPath, clientIP) {
 					return
 				}
-				// File not found — fall through to backend or 404
-				if backendName == "" && routeResult.FastCGI.Pass == "" {
-					s.serveError(w, http.StatusNotFound)
-					return
-				}
+				// Falls through to the FastCGI block below.
+			case backendName == "" && routeResult.FastCGI.Pass == "":
+				// File not found — no backend or FastCGI to fall through to.
+				s.serveError(w, http.StatusNotFound)
+				return
 			}
 		}
 
@@ -563,19 +602,16 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// the reverse-proxy path would inject. Without this, scripts that
 		// rely on $_SERVER['HTTP_X_FORWARDED_FOR'] (rate-limiting,
 		// geolocation, audit logs) see "(none)" even though nvelox knows
-		// the real client IP.
+		// the real client IP. The listener and route request-header rules
+		// apply exactly as they do to proxied requests.
 		if routeResult.FastCGI.Pass != "" {
 			s.setForwardedHeaders(r)
-			if routeResult.Expires != "" {
-				SetExpires(w, routeResult.Expires)
+			applyRequestHeaders(r, &s.Listener.Headers)
+			if routeHeaders != nil {
+				applyRequestHeaders(r, routeHeaders)
 			}
-			ServeFastCGI(w, r, routeResult.FastCGI)
+			ServeFastCGI(newExpiresWriter(w, routeResult.Expires), r, routeResult.FastCGI, s.serveError)
 			return
-		}
-
-		// Set expires header for non-static routes
-		if routeResult.Static.Root == "" && routeResult.Expires != "" {
-			SetExpires(w, routeResult.Expires)
 		}
 
 		// Handle rewrite
@@ -586,6 +622,11 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			r.URL.Path = newPath
 		}
+
+		// The route's expires lands on the backend's response once its
+		// status is known: cacheable statuses only, never over the
+		// backend's own Cache-Control / Expires (see applyExpires).
+		w = newExpiresWriter(w, routeResult.Expires)
 	} else {
 		backendName = s.router.defaultBackend
 	}

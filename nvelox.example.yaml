@@ -205,7 +205,9 @@ listeners:
           fallback: "=404"
         expires: "1y"
 
-      # PHP files via FastCGI
+      # PHP files via FastCGI. document_root is required, and nvelox must
+      # see it at the same path as PHP-FPM: only an existing .php file
+      # inside it is handed to PHP-FPM — anything else is a 404 from nvelox.
       - match:
           path_regex: "\\.php(/|$)"
         fastcgi:
@@ -215,18 +217,19 @@ listeners:
           params:
             HTTPS: "on"
 
-      # Catch-all: try static, fall back to PHP
+      # Catch-all: try static, fall back to the PHP front controller. The
+      # fallback is an internal redirect (as in nginx): /index.php — with
+      # the query string as QUERY_STRING — goes through the ACL and the
+      # routes again and lands on the PHP route above. Static routes never
+      # serve .php/.phtml/.phar files as files.
       - match:
           path_prefix: "/"
         static:
           root: "/var/www/html"
-          index: ["index.html", "index.php"]
+          index: ["index.html"]
         try_files:
           files: ["$uri", "$uri/"]
           fallback: "/index.php$is_args$args"
-        fastcgi:
-          pass: "127.0.0.1:9000"
-          document_root: "/var/www/html"
 
       # Lua scripting hook
       # - match:

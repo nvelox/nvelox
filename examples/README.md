@@ -586,10 +586,14 @@ listeners:
         try_files:
           files: ["$uri", "$uri/"]
           fallback: "/index.php$is_args$args"
-        fastcgi:
-          pass: "127.0.0.1:9000"
-          document_root: "/var/www/html"
 ```
+
+As in nginx, the `try_files` fallback is an internal redirect: `/index.php`
+(with the query string as `QUERY_STRING`) goes through the ACL and the routes
+again and lands on the PHP route. Static routes never serve `.php`, `.phtml`
+or `.phar` files as files. A `fastcgi` route needs `document_root`, and
+nvelox hands PHP-FPM only an existing `.php` file inside it — nvelox must see
+the document root at the same path as PHP-FPM.
 
 ---
 

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"nvelox/config"
+	"nvelox/core/logging"
 )
 
 type compiledRoute struct {
@@ -42,8 +43,13 @@ type Router struct {
 }
 
 // NewRouter creates a router from config routes and a default backend.
+//
+// A route whose path_regex is longer than config.MaxPathRegexLen or does not
+// compile is left out (logged): it must never become a route that matches
+// every path. Config validation refuses such configs, so this only guards
+// routes built without it.
 func NewRouter(routes []config.RouteConfig, defaultBackend string) *Router {
-	compiled := make([]compiledRoute, len(routes))
+	compiled := make([]compiledRoute, 0, len(routes))
 	for i, r := range routes {
 		cr := compiledRoute{
 			host:       strings.ToLower(r.Match.Host),
@@ -58,13 +64,18 @@ func NewRouter(routes []config.RouteConfig, defaultBackend string) *Router {
 			fastcgi:    r.FastCGI,
 		}
 		if r.Match.PathRegex != "" {
-			// Validate regex length to mitigate ReDoS
-			if len(r.Match.PathRegex) > 1024 {
-				continue // skip overly complex regex
+			if len(r.Match.PathRegex) > config.MaxPathRegexLen {
+				logging.Error("[HTTP] route %d: path_regex longer than %d bytes — route skipped", i, config.MaxPathRegexLen)
+				continue
 			}
-			cr.pathRegex, _ = regexp.Compile(r.Match.PathRegex)
+			re, err := regexp.Compile(r.Match.PathRegex)
+			if err != nil {
+				logging.Error("[HTTP] route %d: invalid path_regex: %v — route skipped", i, err)
+				continue
+			}
+			cr.pathRegex = re
 		}
-		compiled[i] = cr
+		compiled = append(compiled, cr)
 	}
 	return &Router{
 		routes:         compiled,
