@@ -4,42 +4,72 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"os"
 	"strings"
 
 	"nvelox/config"
 )
 
-// ConfigureClientAuth sets up client certificate authentication on a tls.Config.
-func ConfigureClientAuth(tlsCfg *tls.Config, cfg config.TLSConfig) error {
-	if cfg.ClientAuth == "" || strings.ToLower(cfg.ClientAuth) == "none" {
-		return nil
-	}
+// ClientAuth is a listener's parsed client-certificate (mTLS) policy.
+type ClientAuth struct {
+	Mode tls.ClientAuthType
+	CAs  *x509.CertPool // nil when no client_ca is configured
+}
 
-	switch strings.ToLower(cfg.ClientAuth) {
+// Apply sets the policy on a server tls.Config.
+func (c *ClientAuth) Apply(t *tls.Config) {
+	if c == nil {
+		return
+	}
+	t.ClientAuth = c.Mode
+	t.ClientCAs = c.CAs
+}
+
+// Requires reports whether the handshake demands a verified client certificate.
+func (c *ClientAuth) Requires() bool {
+	return c != nil && c.Mode == tls.RequireAndVerifyClientCert
+}
+
+// LoadClientAuth parses client_auth / client_ca and reads the CA bundle. It
+// returns (nil, nil) when client authentication is off ("" or "none") and an
+// error for an unknown mode, "require" without client_ca, or a client_ca that
+// cannot be read or holds no PEM certificate. Callers must fail startup /
+// the reload on error: serving without the configured client check would be
+// fail-open.
+func LoadClientAuth(cfg config.TLSConfig) (*ClientAuth, error) {
+	var ca ClientAuth
+	switch strings.ToLower(strings.TrimSpace(cfg.ClientAuth)) {
+	case "", "none":
+		if cfg.ClientCA != "" {
+			return nil, fmt.Errorf("client_ca is set but client_auth is %q", cfg.ClientAuth)
+		}
+		return nil, nil
 	case "require":
 		if cfg.ClientCA == "" {
-			return fmt.Errorf("client_auth 'require' needs client_ca to verify certificates")
+			return nil, fmt.Errorf("client_auth 'require' needs client_ca to verify certificates")
 		}
-		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
+		ca.Mode = tls.RequireAndVerifyClientCert
 	case "request":
-		tlsCfg.ClientAuth = tls.RequestClientCert
+		ca.Mode = tls.RequestClientCert
 	default:
-		return fmt.Errorf("invalid client_auth value: %q (must be require, request, or none)", cfg.ClientAuth)
+		return nil, fmt.Errorf("invalid client_auth value: %q (must be require, request, or none)", cfg.ClientAuth)
 	}
-
 	if cfg.ClientCA != "" {
-		caCert, err := os.ReadFile(cfg.ClientCA)
+		pool, err := config.LoadCertPool(cfg.ClientCA)
 		if err != nil {
-			return fmt.Errorf("failed to read client CA cert: %v", err)
+			return nil, fmt.Errorf("client CA: %v", err)
 		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(caCert) {
-			return fmt.Errorf("failed to parse client CA cert")
-		}
-		tlsCfg.ClientCAs = pool
+		ca.CAs = pool
 	}
+	return &ca, nil
+}
 
+// ConfigureClientAuth sets up client certificate authentication on a tls.Config.
+func ConfigureClientAuth(tlsCfg *tls.Config, cfg config.TLSConfig) error {
+	ca, err := LoadClientAuth(cfg)
+	if err != nil {
+		return err
+	}
+	ca.Apply(tlsCfg)
 	return nil
 }
 

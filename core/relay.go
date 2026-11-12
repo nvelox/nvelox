@@ -219,8 +219,8 @@ func closeWrite(c net.Conn) error {
 	return err
 }
 
-// tlsConnOf returns the *tls.Conn inside c (directly or under a
-// proxyproto.Conn), or nil for a plain transport.
+// tlsConnOf returns the *tls.Conn c is or wraps (under a proxyproto.Conn),
+// or nil for a plain transport.
 func tlsConnOf(c net.Conn) *tls.Conn {
 	if pc, ok := c.(*proxyproto.Conn); ok {
 		c = pc.Raw()
@@ -229,16 +229,21 @@ func tlsConnOf(c net.Conn) *tls.Conn {
 	return tc
 }
 
-// transportOf unwraps proxyproto.Conn / tls.Conn down to the transport
-// connection (normally a *net.TCPConn).
+// transportOf unwraps proxyproto.Conn / tls.Conn layers, in any order, down to
+// the transport connection (normally a *net.TCPConn). A TLS-terminating L4
+// listener with accept_proxy_from yields tls.Conn over proxyproto.Conn over
+// TCP: the PROXY header is read off the raw stream before the handshake.
 func transportOf(c net.Conn) net.Conn {
-	if pc, ok := c.(*proxyproto.Conn); ok {
-		c = pc.Raw()
+	for {
+		switch v := c.(type) {
+		case *proxyproto.Conn:
+			c = v.Raw()
+		case *tls.Conn:
+			c = v.NetConn()
+		default:
+			return c
+		}
 	}
-	if tc, ok := c.(*tls.Conn); ok {
-		c = tc.NetConn()
-	}
-	return c
 }
 
 // isCleanEOF reports an orderly end of stream. io.ErrUnexpectedEOF is what a

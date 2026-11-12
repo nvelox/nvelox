@@ -12,6 +12,7 @@ import (
 	"nvelox/config"
 	"nvelox/core"
 	"nvelox/core/logging"
+	"nvelox/core/procsignal"
 )
 
 var (
@@ -26,9 +27,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// SIGHUP reload channel
-	reloadCh := make(chan os.Signal, 1)
-	signal.Notify(reloadCh, syscall.SIGHUP)
+	// SIGHUP: reopen the log files and reload the config.
+	// SIGUSR1: reopen the log files (logrotate postrotate).
+	reloadCh := make(chan os.Signal, 4)
+	signal.Notify(reloadCh, procsignal.Control...)
 
 	if err := run(os.Args, ctx, reloadCh); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
@@ -65,6 +67,12 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 	logging.SetGateway(cfg.Server.GatewayID)
 	logging.Info("Nvelox Server %s starting...", Version)
 	logging.Info("Loaded configuration from %s", *configPath)
+	// server.user / group / pid_file / workers are parsed but not implemented
+	// (no privilege drop, no pid file, one process). Say so loudly on stderr
+	// (the error log under systemd) whatever the log level.
+	for _, w := range config.ServerWarnings(cfg.Server) {
+		fmt.Fprintf(os.Stderr, "[CONFIG] WARNING: %s\n", w)
+	}
 
 	// Expand port ranges in listeners.
 	expandedListeners, err := core.ExpandListeners(cfg.Listeners)
@@ -83,14 +91,28 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 		close(errCh)
 	}()
 
-	// Handle SIGHUP reload
+	// Handle SIGHUP (reopen logs + reload) and SIGUSR1 (reopen logs).
 	if reloadCh != nil {
 		go func() {
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case <-reloadCh:
+				case sig := <-reloadCh:
+					// Reopen the log files on either signal, before the
+					// reload: logrotate may send either one, and a reload
+					// that fails validation must not leave nvelox writing to
+					// the rotated file.
+					reopenErr := logging.Reopen()
+					if reopenErr != nil {
+						logging.Error("Log reopen failed: %v — still writing to the previous log files", reopenErr)
+					}
+					if procsignal.Reopen != nil && sig == procsignal.Reopen {
+						if reopenErr == nil {
+							logging.Info("Received SIGUSR1, log files reopened")
+						}
+						continue
+					}
 					logging.Info("Received SIGHUP, reloading configuration from %s", *configPath)
 					newCfg, err := config.Load(*configPath)
 					if err != nil {

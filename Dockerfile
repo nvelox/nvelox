@@ -22,8 +22,12 @@ FROM alpine:latest
 
 WORKDIR /app
 
-# Install runtime dependencies (e.g. ca-certificates for TLS)
-RUN apk add --no-cache ca-certificates tzdata
+# Install runtime dependencies (e.g. ca-certificates for TLS). mailcap
+# provides /etc/mime.types: the static file handler takes Content-Type from
+# the file extension (Go's built-in table plus this file) and falls back to
+# application/octet-stream, so without it .woff/.woff2/.ttf/.md/... would be
+# sent as octet-stream.
+RUN apk add --no-cache ca-certificates tzdata mailcap
 
 # Create nvelox user/group
 RUN addgroup -S nvelox && adduser -S nvelox -G nvelox

@@ -5,7 +5,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"unicode/utf8"
@@ -82,6 +81,11 @@ type loggerState struct {
 	accessLog *log.Logger
 	errorLog  *log.Logger
 	level     Level
+	// accessFile / errorFile are the files behind accessLog / errorLog (nil
+	// when that log goes to stdout / stderr). Reopen swaps the open file
+	// inside them (log rotation).
+	accessFile *logFile
+	errorFile  *logFile
 }
 
 // current holds the active logger state. Init swaps a fresh state in
@@ -123,9 +127,14 @@ func gateway() string {
 	return ""
 }
 
-// Init initializes the logger with config.
+// Init initializes the logger with config. Log files are opened for
+// appending with mode 0640 (directories 0750); an existing file is tightened
+// to at most 0640. Reopen re-opens them after log rotation.
 func Init(logLevel string, accessPath, errorPath string) error {
+	fileMu.Lock()
+	defer fileMu.Unlock()
 	next := &loggerState{}
+	var warnings []string
 
 	// Parse Level
 	switch strings.ToLower(logLevel) {
@@ -144,34 +153,42 @@ func Init(logLevel string, accessPath, errorPath string) error {
 	// Setup Error Log
 	var errWriter io.Writer = os.Stderr
 	if errorPath != "" {
-		if err := os.MkdirAll(filepath.Dir(errorPath), 0755); err != nil {
-			return fmt.Errorf("failed to create log dir: %w", err)
-		}
-		f, err := os.OpenFile(errorPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		f, warn, err := openLogFile(errorPath)
 		if err != nil {
 			return fmt.Errorf("failed to open error log: %w", err)
 		}
-		errWriter = f
+		if warn != "" {
+			warnings = append(warnings, warn)
+		}
+		next.errorFile = &logFile{path: errorPath, f: f}
+		errWriter = next.errorFile
 	}
 	next.errorLog = log.New(errWriter, "", log.LstdFlags) // Prefix handled in helpers
 
 	// Setup Access Log
 	var accessWriter io.Writer = os.Stdout
 	if accessPath != "" {
-		if err := os.MkdirAll(filepath.Dir(accessPath), 0755); err != nil {
-			return fmt.Errorf("failed to create log dir: %w", err)
-		}
-		f, err := os.OpenFile(accessPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		f, warn, err := openLogFile(accessPath)
 		if err != nil {
+			if next.errorFile != nil {
+				next.errorFile.f.Close()
+			}
 			return fmt.Errorf("failed to open access log: %w", err)
 		}
-		accessWriter = f // Access log usually file only or stdout
+		if warn != "" {
+			warnings = append(warnings, warn)
+		}
+		next.accessFile = &logFile{path: accessPath, f: f}
+		accessWriter = next.accessFile // Access log usually file only or stdout
 	}
 	next.accessLog = log.New(accessWriter, "", 0) // Raw format
 
 	// Atomic swap: concurrent readers see either the old or the new
 	// state in full — never a torn mix.
 	current.Store(next)
+	for _, w := range warnings {
+		Warn("%s", w)
+	}
 	return nil
 }
 
@@ -247,18 +264,50 @@ func SanitizeLogField(s string) string {
 	return string(b)
 }
 
+// escapeQuoted escapes the two bytes that could end or bend a quoted
+// access-log field: '"' becomes \x22 and '\' becomes \x5C (nginx's
+// escaping), so a value can never close its quotes and forge the fields that
+// follow. Control characters are left to SanitizeLogField, which runs after
+// this and so cannot be confused with an escaped backslash.
+func escapeQuoted(s string) string {
+	if !strings.ContainsAny(s, "\"\\") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '"':
+			b.WriteString(`\x22`)
+		case '\\':
+			b.WriteString(`\x5C`)
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
+}
+
 // AccessHTTP logs an HTTP request in CLF-like format. Every variable field is
 // sanitized against CRLF log injection. clientIP comes from the server's
 // trusted-proxy-aware resolver (always a validated IP — the real client behind
 // a trusted proxy, else the connection peer), so sanitizing it is normally a
 // no-op; we do it anyway as defense-in-depth against future callers passing a
 // less-validated value. host is the requested vhost (r.Host); an empty host is
-// logged as "-". fetchSite / fetchDest are the request's Sec-Fetch-Site /
-// Sec-Fetch-Dest headers ("" when absent) and tls whether it arrived over TLS
-// (HTTPS, including HTTP/3).
+// logged as "-". path is the request path as the server's callers pass it
+// (the escaped canonical path, so a decoded '"' or space never reaches the
+// line); like the User-Agent it additionally has '"' and '\' escaped (see
+// escapeQuoted). An empty backend (the request was answered without an
+// upstream: a deny, a redirect, a cache hit, ...) is logged as "-".
+// fetchSite / fetchDest are the request's Sec-Fetch-Site / Sec-Fetch-Dest
+// headers ("" when absent) and tls whether it arrived over TLS (HTTPS,
+// including HTTP/3).
 func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes int64, duration float64, backend, userAgent, fetchSite, fetchDest string, tls bool, requestID, site string) {
 	if host == "" {
 		host = "-"
+	}
+	if backend == "" {
+		backend = "-"
 	}
 	if requestID == "" {
 		requestID = "-"
@@ -282,11 +331,11 @@ func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes in
 		SanitizeLogField(clientIP),
 		SanitizeLogField(host),
 		SanitizeLogField(method),
-		SanitizeLogField(path),
+		SanitizeLogField(escapeQuoted(path)),
 		SanitizeLogField(proto),
 		status, bytes, duration,
 		SanitizeLogField(backend),
-		SanitizeLogField(clipUA(userAgent)),
+		SanitizeLogField(escapeQuoted(clipUA(userAgent))),
 		fetchMetaToken(fetchSite),
 		fetchMetaToken(fetchDest),
 		scheme,

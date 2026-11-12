@@ -96,6 +96,11 @@ func (e *Engine) closeL4Conns() {
 // goroutine-per-connection replacement of the nbio OnOpen -> connectBackend ->
 // OnData/OnClose chain for TCP, with identical accept-time gating, PROXY-v2
 // handling and L4 access record.
+//
+// Order: listener rate limit -> access policy on the RESOLVED client (the peer
+// for a direct client; for a trusted accept_proxy_from relay, the client its
+// PROXY-v2 header names, read before anything is dialed) -> backend
+// max_connections -> dial -> relay.
 func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 	e := h.engine
 	dstPort := portOf(clientConn.LocalAddr())
@@ -108,16 +113,20 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 	if rl, ok := e.RateLimiters[l.Name]; ok && !rl.Allow() {
 		logging.Warn("[RATE] Connection from %s rejected (rate limit on %s)", clientConn.RemoteAddr(), l.Name)
 		if !peerTrusted {
-			logging.AccessL4(ipStrOf(clientConn.RemoteAddr()), l.Protocol, dstPort, "ratelimited", 0, 0, 0)
+			logging.AccessL4(ipStrOf(clientConn.RemoteAddr()), l.Protocol, dstPort, l4StatusRateLimited, 0, 0, 0)
 		}
 		clientConn.Close()
 		return
 	}
-	// Dynamic denylist on the immediate peer when it IS the client (see l4Denied).
-	if h.l4Denied(clientConn.RemoteAddr(), peerTrusted) {
-		logging.AccessL4(ipStrOf(clientConn.RemoteAddr()), l.Protocol, dstPort, "denylisted", 0, 0, 0)
-		clientConn.Close()
-		return
+	// Access policy (ip_denylist, dynamic denylist, ip_allowlist, acl) on the
+	// immediate peer when it IS the client. A trusted relay's real client is
+	// checked below, once its header is read.
+	if !peerTrusted {
+		if ok, status := h.l4Admit(l, ipOf(clientConn.RemoteAddr())); !ok {
+			logging.AccessL4(ipStrOf(clientConn.RemoteAddr()), l.Protocol, dstPort, status, 0, 0, 0)
+			clientConn.Close()
+			return
+		}
 	}
 
 	logging.Info("[CONN] New %s client %s -> :%d", l.Protocol, clientConn.RemoteAddr(), dstPort)
@@ -125,16 +134,21 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 	realClientIP := ipStrOf(clientConn.RemoteAddr()) // upgraded to the PROXY-v2 client if a trusted header resolves
 	clientResolved := false
 	linked := false
+	refused := "" // access-log status when the resolved client or a limit refuses the session
 	var sessErr error
 	defer func() {
 		clientConn.Close()
 		logging.Info("[CONN] Closed %s (Dur: %v, Err: %v)", clientConn.RemoteAddr(), time.Since(start), sessErr)
 		// L4 access record: "ok" when a backend was linked, else "no_route" (the
-		// L4 analogue of a 404). Bytes are not accumulated in v1. SUPPRESSED when
-		// the peer is a trusted relay whose real client was never resolved.
+		// L4 analogue of a 404) or the refusal status. Bytes are not accumulated
+		// in v1. SUPPRESSED when the peer is a trusted relay whose real client
+		// was never resolved.
 		if !peerTrusted || clientResolved {
 			status := "no_route"
-			if linked {
+			switch {
+			case refused != "":
+				status = refused
+			case linked:
 				status = "ok"
 			}
 			durMs := float64(time.Since(start).Nanoseconds()) / 1e6
@@ -142,12 +156,52 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 		}
 	}()
 
-	balancer, ok := e.Balancers[l.Backend]
+	// Determine the real client. For a trusted peer, read its inbound PROXY-v2
+	// header off the stream BEFORE dialing, so the access policy runs on the
+	// client it names; payload bytes read past it are forwarded first.
+	// Untrusted peers skip this entirely (a forged header can never spoof).
+	// A trusted peer that sends no header is itself the client.
+	src := clientConn.RemoteAddr()
+	var pending []byte
+	if peerTrusted {
+		var err error
+		src, pending, err = readInboundProxyV2(clientConn, src, inboundProxyHeaderWait)
+		if err != nil {
+			sessErr = err
+			return
+		}
+		realClientIP = ipStrOf(src)
+		clientResolved = true
+		if ok, status := h.l4Admit(l, ipOf(src)); !ok {
+			refused = status
+			return
+		}
+	}
+
+	bv := e.backends() // one consistent view for this connection (H6)
+	balancer, ok := bv.Balancers[l.Backend]
 	if !ok {
 		logging.Error("Balancer '%s' not found for listener '%s'", l.Backend, l.Name)
 		return
 	}
-	backend := e.Backends[l.Backend]
+	backend := bv.Backends[l.Backend]
+	if backend != nil && backend.BackendTLS.Enabled {
+		// backend_tls is implemented on the HTTP path only; never send
+		// plaintext to a backend configured for TLS (config load refuses
+		// this pairing; a reload can still change a backend under a running
+		// L4 listener).
+		logging.Error("[CONN] listener %s: backend %s has backend_tls enabled, which L4 listeners do not implement — refusing %s", l.Name, l.Backend, realClientIP)
+		return
+	}
+	// Backend max_connections: one slot per session, held until it ends.
+	if cl, ok := bv.ConnLimiters[l.Backend]; ok {
+		if !cl.Acquire() {
+			logging.Warn("[CONN] listener %s: backend %s at max_connections — refusing %s", l.Name, l.Backend, realClientIP)
+			refused = l4StatusRateLimited
+			return
+		}
+		defer cl.Release()
+	}
 	target, err := balancer.Next()
 	if err != nil {
 		logging.Error("Balancer '%s' error: %v", l.Backend, err)
@@ -169,19 +223,6 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 		return
 	}
 	defer backendConn.Close()
-
-	// Determine the real client. For a trusted peer, read its inbound PROXY-v2
-	// header off the stream; payload bytes read past it are forwarded first.
-	// Untrusted peers skip this entirely (a forged header can never spoof).
-	src := clientConn.RemoteAddr()
-	var pending []byte
-	if peerTrusted {
-		src, pending, err = readInboundProxyV2(clientConn, src, inboundProxyHeaderWait)
-		if err != nil {
-			sessErr = err
-			return
-		}
-	}
 
 	// PROXY v2 to the backend. Its DESTINATION is the address the CLIENT
 	// connected to (clientConn.LocalAddr = the dedicated port the client or

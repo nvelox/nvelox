@@ -27,6 +27,37 @@ import (
 // sites and survives config reloads.
 var Default = New()
 
+// MinPrefixV4 and MinPrefixV6 are the widest ranges Add accepts. A /8 is the
+// largest IPv4 block ever delegated to a single organisation, and no single
+// IPv6 allocation is wider than a /16 (the RIRs hold /12s and hand out /19 to
+// /32 to providers). A wider range — 0.0.0.0/0, ::/0, or ::ffff:0:0/96, which
+// is all of IPv4 in mapped form — spans unrelated networks and can only be a
+// mistake or an attempt to black-hole most clients, so it is refused.
+const (
+	MinPrefixV4 = 8
+	MinPrefixV6 = 16
+)
+
+// checkWidth refuses a range wider than MinPrefixV4 / MinPrefixV6. An
+// IPv4-mapped IPv6 range (::ffff:a.b.c.d/96 and longer) is measured as the
+// IPv4 range it matches: net.IPNet.Contains compares IPv4 clients against it.
+func checkWidth(n *net.IPNet) error {
+	ones, bits := n.Mask.Size()
+	if n.IP.To4() != nil {
+		if bits == 8*net.IPv6len {
+			ones -= 96
+		}
+		if ones < MinPrefixV4 {
+			return fmt.Errorf("%s covers more than an IPv4 /%d: refusing to block it", n, MinPrefixV4)
+		}
+		return nil
+	}
+	if ones < MinPrefixV6 {
+		return fmt.Errorf("%s covers more than an IPv6 /%d: refusing to block it", n, MinPrefixV6)
+	}
+	return nil
+}
+
 type entry struct {
 	cidr      string     // canonical key (normalized bare IP or CIDR network)
 	ipnet     *net.IPNet // set for range entries; nil for exact single-IP entries
@@ -72,7 +103,8 @@ func expPtr(t time.Time) *time.Time {
 // Add inserts a single IP ("1.2.3.4", "2001:db8::1") or CIDR ("1.2.3.0/24")
 // into the denylist with an optional TTL (ttl<=0 means never expire). Adding
 // an existing key replaces it (refreshes the TTL). Returns the normalized
-// entry, or an error if the input is not a valid IP/CIDR.
+// entry, or an error if the input is not a valid IP/CIDR or is a range wider
+// than MinPrefixV4 / MinPrefixV6.
 func (d *Dynamic) Add(ipOrCIDR string, ttl time.Duration) (Entry, error) {
 	ipOrCIDR = strings.TrimSpace(ipOrCIDR)
 	if ipOrCIDR == "" {
@@ -81,6 +113,9 @@ func (d *Dynamic) Add(ipOrCIDR string, ttl time.Duration) (Entry, error) {
 	exp := expiry(ttl)
 
 	if ip, ipnet, err := net.ParseCIDR(ipOrCIDR); err == nil {
+		if err := checkWidth(ipnet); err != nil {
+			return Entry{}, err
+		}
 		ones, bits := ipnet.Mask.Size()
 		d.mu.Lock()
 		defer d.mu.Unlock()

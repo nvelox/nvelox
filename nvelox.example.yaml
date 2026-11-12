@@ -5,37 +5,60 @@ version: "2"
 
 # ─── Server Settings ───────────────────────────────────────
 server:
-  user: "nvelox"
-  group: "nvelox"
-  pid_file: "/var/run/nvelox.pid"
-  workers: 0  # SO_REUSEPORT workers (0 = single process)
+  # gateway_id: "gw-1"  # gw=<id> on HTTP access-log lines (default: hostname)
+  # user / group / pid_file / workers are accepted but NOT implemented:
+  # nvelox never drops privileges, writes no pid file and runs one process.
+  # When set (and the process is not already that user/group) nvelox prints a
+  # WARNING at startup. Run it under systemd User=/Group= with
+  # AmbientCapabilities=CAP_NET_BIND_SERVICE to bind ports below 1024.
+  # user: "nvelox"
+  # group: "nvelox"
 
 # ─── Logging ───────────────────────────────────────────────
+# Log files are created 0640 in 0750 directories (an existing file is
+# tightened to 0640). After logrotate moves them away, send SIGUSR1
+# (`kill -USR1 <pid>`, or `systemctl kill -s USR1 nvelox` under systemd)
+# and nvelox reopens both; SIGHUP reopens them too, then reloads.
 logging:
   level: "info"  # debug, info, warning, error
   access_log: "/var/log/nvelox/access.log"  # Per-request CLF format
   error_log: "/var/log/nvelox/error.log"
 
 # ─── Prometheus Metrics ───────────────────────────────────
+# No authentication. Loopback only by default (an empty bind means
+# 127.0.0.1:9090). To scrape from another host, bind a private interface IP
+# and firewall the port to your Prometheus servers — never a public
+# address. In a container, loopback is unreachable from outside: bind
+# "0.0.0.0:9090" there and publish the port to trusted networks only.
 metrics:
   enabled: true
-  bind: ":9090"
+  bind: "127.0.0.1:9090"
   path: "/metrics"
 
 # ─── Admin API ─────────────────────────────────────────────
 admin:
-  enabled: true
-  bind: "127.0.0.1:9091"
-  # api_key required when the API is reachable from anything other than
-  # loopback. Checked with constant-time compare; brute-force protection
-  # locks the source IP after 10 failed attempts in a 10m window.
+  enabled: false
+  bind: "127.0.0.1:9091"  # empty = 127.0.0.1:9091 (loopback only)
+  # api_key is REQUIRED when enabled: nvelox refuses to start without it.
+  # Sent as the X-API-Key header and compared in constant time. Use a long
+  # random value (`openssl rand -hex 32`): a valid key is always served, and
+  # 10 failed attempts from one IP in 10m only throttle that IP's further
+  # failures (429) for 15m.
   # api_key: "set-from-env-or-vault"
+  # Requests must name the bind address in the Host header, POST needs
+  # "Content-Type: application/json", and browser cross-site requests are
+  # refused. On a non-loopback bind, firewall the port to the managing hosts.
   # Endpoints:
-  #   GET  /api/v1/stats
-  #   GET  /api/v1/backends
-  #   POST /api/v1/backends/{name}/drain?server=addr
-  #   POST /api/v1/backends/{name}/enable?server=addr
-  #   POST /api/v1/backends/{name}/disable?server=addr
+  #   GET    /api/v1/stats
+  #   GET    /api/v1/backends
+  #   POST   /api/v1/backends/{name}/drain?server=addr
+  #   POST   /api/v1/backends/{name}/enable?server=addr
+  #   POST   /api/v1/backends/{name}/disable?server=addr
+  #   GET    /api/v1/denylist
+  #   POST   /api/v1/denylist {"ip": "<ip or cidr>", "ttl_seconds": N}
+  #          (ttl <= 0 = until restart; ranges wider than /8 IPv4 or
+  #          /16 IPv6 are refused)
+  #   DELETE /api/v1/denylist?cidr=<ip or cidr>
 
 # Hot reload: `kill -HUP $(pidof nvelox)` (or `systemctl reload nvelox`)
 # applies the current contents of this file without dropping connections.
@@ -84,9 +107,14 @@ listeners:
     tls:
       cert: "/etc/ssl/certs/server.pem"
       key: "/etc/ssl/private/server.key"
-      # ocsp_stapling: true
-      # client_auth: "require"         # mTLS: "require", "request", "none"
-      # client_ca: "/etc/ssl/ca.pem"
+      # client_auth: "require"         # mTLS: "require" (verified cert needed),
+      #                                #   "request" (asked, not required), "none"
+      # client_ca: "/etc/ssl/ca.pem"   # PEM CA bundle; required by "require".
+      #   Per site when several https listeners share a bind (chosen by SNI);
+      #   a request whose Host names a client_auth site over a connection
+      #   whose SNI chose another site gets 421. Also applies to http3 and to
+      #   TLS-terminating tcp listeners. A missing / unparseable CA fails the
+      #   load. (ocsp_stapling is not implemented and is rejected.)
       # min_version: "1.2"             # "1.2" or "1.3" (defaults 1.2)
       # max_version: "1.3"             # defaults 1.3
       # cipher_suites:                 # TLS 1.2 only; TLS 1.3 suites are
@@ -141,10 +169,17 @@ listeners:
       requests_per_second: 50
       burst: 20
 
-    # Security
+    # Security (ip_denylist / ip_allowlist / acl also work on tcp and udp
+    # listeners, per connection / UDP session; there an acl rule may only
+    # match source_ip). Entries must be IPs or CIDRs (a bad one fails the
+    # load); "0.0.0.0/0" here and in acl source_ip means every client, IPv6 too.
     ip_denylist: ["192.168.100.0/24"]
     # ip_allowlist: ["10.0.0.0/8"]  # If set, only listed CIDRs allowed
     max_body_size: "10MB"
+    # ACL path_prefix / path_regex see the canonical path ("//admin",
+    # "/x/../admin" and "/%2e/admin" are "/admin"); a deny rule also matches
+    # the path without ";params". Matching is case-sensitive: write
+    # path_regex: "(?i)^/admin(/|$)" in front of a case-insensitive backend.
     acl:
       - match:
           method: ["DELETE"]
@@ -155,8 +190,10 @@ listeners:
     compression:
       enabled: true
       types: ["text/html", "application/json", "text/css", "application/javascript"]
-      min_length: 1024
+      min_length: 1024   # by Content-Length (as nginx); unknown length is compressed
 
+    # Only a 200 received in full is cached; Range / If-* requests bypass the
+    # cache. One entry holds at most 8MB (or max_size); unset max_size = 64MB.
     cache:
       enabled: true
       max_size: "256MB"
@@ -205,7 +242,9 @@ listeners:
           fallback: "=404"
         expires: "1y"
 
-      # PHP files via FastCGI
+      # PHP files via FastCGI. document_root is required, and nvelox must
+      # see it at the same path as PHP-FPM: only an existing .php file
+      # inside it is handed to PHP-FPM — anything else is a 404 from nvelox.
       - match:
           path_regex: "\\.php(/|$)"
         fastcgi:
@@ -215,26 +254,22 @@ listeners:
           params:
             HTTPS: "on"
 
-      # Catch-all: try static, fall back to PHP
+      # Catch-all: try static, fall back to the PHP front controller. The
+      # fallback is an internal redirect (as in nginx): /index.php — with
+      # the query string as QUERY_STRING — goes through the ACL and the
+      # routes again and lands on the PHP route above. Static routes never
+      # serve .php/.phtml/.phar files as files.
       - match:
           path_prefix: "/"
         static:
           root: "/var/www/html"
-          index: ["index.html", "index.php"]
+          index: ["index.html"]
         try_files:
           files: ["$uri", "$uri/"]
           fallback: "/index.php$is_args$args"
-        fastcgi:
-          pass: "127.0.0.1:9000"
-          document_root: "/var/www/html"
 
-      # Lua scripting hook
-      # - match:
-      #     path_prefix: "/custom"
-      #   backend: "web-cluster"
-      #   scripts:
-      #     request_script: "/etc/nvelox/scripts/auth.lua"
-      #     response_script: "/etc/nvelox/scripts/transform.lua"
+      # (routes[].scripts — Lua hooks — are not implemented; a route that
+      # sets them is rejected at load.)
 
   # ─── TCP L4 proxy (gaming/tunneling) ───────────────────
   # L4 TCP sessions follow standard half-close semantics: when either side
@@ -275,15 +310,10 @@ listeners:
   #     servers: ["10.1.0.5:17999"]  # explicit mux port → all range ports land here
   #     send_proxy_v2: true
 
-  # ─── TLS passthrough with SNI routing ──────────────────
-  # - name: "tls-passthrough"
-  #   bind: ":8443"
-  #   protocol: "tcp"
-  #   sni_routes:
-  #     - server_name: "api.example.com"
-  #       backend: "api-servers"
-  #     - server_name: "*.example.com"
-  #       backend: "web-cluster"
+  # ─── TLS passthrough ───────────────────────────────────
+  # A tcp listener without a tls block forwards TLS untouched to its one
+  # backend. (sni_routes — routing passthrough by SNI — is not implemented;
+  # a listener that sets it is rejected at load.)
 
   # ─── Multi-server-per-port (nginx-style) ───────────────
   # Multiple HTTPS listeners may share the same `bind:`. Each is its own
@@ -305,6 +335,11 @@ listeners:
   #   backend: "web-cluster"
 
   # ─── UDP proxy ─────────────────────────────────────────
+  # Each client source ip:port is one session (own backend socket). Fixed
+  # limits: 16384 sessions per process, 512 per client IP; a session ends
+  # 10s after its first datagram if the backend never answered, else 60s
+  # after the backend's last reply. With accept_proxy_from, every datagram
+  # from a trusted relay must carry a PROXY v2 header (others are dropped).
   - name: "dns-proxy"
     bind: ":5353"
     protocol: "udp"
@@ -338,7 +373,7 @@ listeners:
 backends:
   - name: "web-cluster"
     balance: "roundrobin"  # roundrobin, leastconn, random
-    max_connections: 200
+    max_connections: 200   # concurrent HTTP requests / TCP conns / UDP sessions
     # send_proxy_v2 prepends a PROXY protocol v2 header so the backend
     # sees the real client address.
     #   - TCP backends: header sent once per connection (STREAM variant).
@@ -351,12 +386,17 @@ backends:
       connect: "3s"
       read: "15s"
 
-    # Retry on failure
+    # Retry on failure. "connect_failure": the server gave no response
+    # (the default when "on" is empty); "502" / "503": it answered with that
+    # status. A request is resent only if it never reached the server with
+    # its body untouched, or if it has no body and an idempotent method.
     retry:
       attempts: 3
       on: "connect_failure,502,503"
 
-    # Sticky sessions
+    # Sticky sessions. cookie: the cookie names the server (set on the first
+    # response, HttpOnly, SameSite=Lax, Secure over TLS); header: keyed by a
+    # hash of the header value (values over 256 bytes are ignored).
     sticky_session:
       type: "cookie"           # cookie, header, ip_hash
       cookie_name: "NVELOX_SRV"
@@ -370,7 +410,7 @@ backends:
         interval: "5s"
         timeout: "2s"
       passive:
-        max_fails: 3           # Mark down after 3 consecutive failures
+        max_fails: 3           # Out of rotation for 30s after 3 consecutive backend failures
 
     # Circuit breaker
     circuit_breaker:
@@ -379,10 +419,13 @@ backends:
       timeout: "30s"           # Time before half-open probe
       half_open_max: 2         # Probe requests in half-open state
 
-    # Backend TLS (connect to upstream via TLS — L7 only). Defaults are
-    # secure: InsecureSkipVerify=false, system roots, MinVersion=TLS1.2.
-    # Setting `insecure: true` explicitly opts out of cert verification
-    # and is logged at WARN on startup.
+    # Backend TLS (connect to upstream via TLS — http/https listeners only;
+    # a tcp/udp listener on a backend_tls backend is rejected at load).
+    # Defaults are secure: InsecureSkipVerify=false, system roots,
+    # MinVersion=TLS1.2. Setting `insecure: true` explicitly opts out of cert
+    # verification and is logged at WARN on startup. A ca_cert or client
+    # key pair that cannot be loaded fails the load / reload — nvelox never
+    # falls back to plaintext.
     # backend_tls:
     #   enabled: true
     #   ca_cert: "/etc/ssl/ca.pem"

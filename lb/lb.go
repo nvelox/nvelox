@@ -2,7 +2,7 @@ package lb
 
 import (
 	"errors"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,6 +29,61 @@ type Balancer interface {
 	IsHealthy(server string) bool
 	// UpdateServers replaces the server list (for DNS-based discovery).
 	UpdateServers(servers []string)
+	// Eject takes a server out of rotation for d (passive health). The
+	// ejection expires on its own and is independent of UpdateStatus: an
+	// expired ejection never re-enables a server that an active health
+	// check or the admin API marked down, and UpdateStatus(server, true)
+	// ends an ejection early.
+	Eject(server string, d time.Duration)
+	// Servers returns a copy of the configured server list, healthy or not.
+	Servers() []string
+}
+
+// activeServers returns, in configuration order, the servers that are up
+// (status) and not passively ejected at now.
+func activeServers(all []string, status map[string]bool, ejected map[string]time.Time, now time.Time) []string {
+	active := make([]string, 0, len(all))
+	for _, s := range all {
+		if !status[s] {
+			continue
+		}
+		if until, ok := ejected[s]; ok && now.Before(until) {
+			continue
+		}
+		active = append(active, s)
+	}
+	return active
+}
+
+// ejectedNow reports whether server has an ejection that has not expired.
+func ejectedNow(ejected map[string]time.Time, server string) bool {
+	until, ok := ejected[server]
+	return ok && time.Now().Before(until)
+}
+
+// keepEjections drops the ejections of servers that are no longer in all.
+func keepEjections(ejected map[string]time.Time, all []string) map[string]time.Time {
+	kept := make(map[string]time.Time, len(ejected))
+	for _, s := range all {
+		if until, ok := ejected[s]; ok {
+			kept[s] = until
+		}
+	}
+	return kept
+}
+
+// scheduleEjectionEnd rebuilds the healthy list once the ejection of server
+// that ends at until expires. A newer ejection of the same server (another
+// until) is left alone; its own timer ends it.
+func scheduleEjectionEnd(mu *sync.RWMutex, ejected *map[string]time.Time, server string, until time.Time, rebuild func()) {
+	time.AfterFunc(time.Until(until), func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if cur, ok := (*ejected)[server]; ok && cur.Equal(until) {
+			delete(*ejected, server)
+			rebuild()
+		}
+	})
 }
 
 // NewBalancer creates a new load balancer based on the algorithm name.
@@ -47,8 +102,9 @@ func NewBalancer(algorithm string, servers []string) Balancer {
 
 // RoundRobin implementation.
 type RoundRobin struct {
-	allServers []string        // Immutable configuration
-	status     map[string]bool // Current status
+	allServers []string             // Immutable configuration
+	status     map[string]bool      // Current status (active checks / admin)
+	ejected    map[string]time.Time // Passive ejections (until)
 
 	mu      sync.RWMutex
 	healthy []string // Derived active list
@@ -69,6 +125,7 @@ func NewRoundRobin(servers []string) *RoundRobin {
 	return &RoundRobin{
 		allServers: all,
 		status:     status,
+		ejected:    make(map[string]time.Time),
 		healthy:    all, // Initial healthy list is full list
 	}
 }
@@ -91,15 +148,30 @@ func (b *RoundRobin) UpdateStatus(server string, healthy bool) {
 	defer b.mu.Unlock()
 
 	b.status[server] = healthy
-
-	// Rebuild healthy list preserving order
-	active := make([]string, 0, len(b.allServers))
-	for _, s := range b.allServers {
-		if b.status[s] {
-			active = append(active, s)
-		}
+	if healthy {
+		delete(b.ejected, server) // an explicit "up" ends a passive ejection
 	}
-	b.healthy = active
+	b.rebuildLocked()
+}
+
+// rebuildLocked recomputes the healthy list, preserving order. b.mu held.
+func (b *RoundRobin) rebuildLocked() {
+	b.healthy = activeServers(b.allServers, b.status, b.ejected, time.Now())
+}
+
+func (b *RoundRobin) Eject(server string, d time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	until := time.Now().Add(d)
+	b.ejected[server] = until
+	b.rebuildLocked()
+	scheduleEjectionEnd(&b.mu, &b.ejected, server, until, b.rebuildLocked)
+}
+
+func (b *RoundRobin) Servers() []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return append([]string(nil), b.allServers...)
 }
 
 func (b *RoundRobin) OnConnect(server string)    {}
@@ -112,7 +184,7 @@ func (b *RoundRobin) MarkDraining(server string) {
 func (b *RoundRobin) IsHealthy(server string) bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	return b.status[server]
+	return b.status[server] && !ejectedNow(b.ejected, server)
 }
 
 func (b *RoundRobin) UpdateServers(servers []string) {
@@ -124,7 +196,8 @@ func (b *RoundRobin) UpdateServers(servers []string) {
 	for _, s := range b.allServers {
 		b.status[s] = true
 	}
-	b.healthy = append([]string{}, b.allServers...)
+	b.ejected = keepEjections(b.ejected, b.allServers)
+	b.rebuildLocked()
 }
 
 func (b *RoundRobin) NextExcluding(exclude []string) (string, error) {
@@ -145,15 +218,16 @@ func (b *RoundRobin) NextExcluding(exclude []string) (string, error) {
 	return "", ErrNoServers
 }
 
-// Random implementation.
+// Random implementation. Selection uses math/rand/v2's top-level
+// functions, which are safe for concurrent use: Next and NextExcluding run
+// under the read lock, so a shared *rand.Rand (not goroutine-safe) raced.
 type Random struct {
 	allServers []string
 	status     map[string]bool
+	ejected    map[string]time.Time
 
 	mu      sync.RWMutex
 	healthy []string
-
-	rnd *rand.Rand
 }
 
 func NewRandom(servers []string) *Random {
@@ -168,8 +242,8 @@ func NewRandom(servers []string) *Random {
 	return &Random{
 		allServers: all,
 		status:     status,
+		ejected:    make(map[string]time.Time),
 		healthy:    all,
-		rnd:        rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -180,7 +254,7 @@ func (b *Random) Next() (string, error) {
 	if len(b.healthy) == 0 {
 		return "", errors.New("no healthy backends available")
 	}
-	return b.healthy[b.rnd.Intn(len(b.healthy))], nil
+	return b.healthy[rand.IntN(len(b.healthy))], nil
 }
 
 func (b *Random) UpdateStatus(server string, healthy bool) {
@@ -188,14 +262,30 @@ func (b *Random) UpdateStatus(server string, healthy bool) {
 	defer b.mu.Unlock()
 
 	b.status[server] = healthy
-
-	active := make([]string, 0, len(b.allServers))
-	for _, s := range b.allServers {
-		if b.status[s] {
-			active = append(active, s)
-		}
+	if healthy {
+		delete(b.ejected, server)
 	}
-	b.healthy = active
+	b.rebuildLocked()
+}
+
+// rebuildLocked recomputes the healthy list. b.mu held.
+func (b *Random) rebuildLocked() {
+	b.healthy = activeServers(b.allServers, b.status, b.ejected, time.Now())
+}
+
+func (b *Random) Eject(server string, d time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	until := time.Now().Add(d)
+	b.ejected[server] = until
+	b.rebuildLocked()
+	scheduleEjectionEnd(&b.mu, &b.ejected, server, until, b.rebuildLocked)
+}
+
+func (b *Random) Servers() []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return append([]string(nil), b.allServers...)
 }
 
 func (r *Random) OnConnect(server string)    {}
@@ -208,7 +298,7 @@ func (r *Random) MarkDraining(server string) {
 func (r *Random) IsHealthy(server string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.status[server]
+	return r.status[server] && !ejectedNow(r.ejected, server)
 }
 
 func (r *Random) UpdateServers(servers []string) {
@@ -220,7 +310,8 @@ func (r *Random) UpdateServers(servers []string) {
 	for _, s := range r.allServers {
 		r.status[s] = true
 	}
-	r.healthy = append([]string{}, r.allServers...)
+	r.ejected = keepEjections(r.ejected, r.allServers)
+	r.rebuildLocked()
 }
 
 func (r *Random) NextExcluding(exclude []string) (string, error) {
@@ -239,13 +330,14 @@ func (r *Random) NextExcluding(exclude []string) (string, error) {
 	if len(candidates) == 0 {
 		return "", ErrNoServers
 	}
-	return candidates[r.rnd.Intn(len(candidates))], nil
+	return candidates[rand.IntN(len(candidates))], nil
 }
 
 // LeastConn implementation
 type LeastConn struct {
 	allServers []string
 	status     map[string]bool
+	ejected    map[string]time.Time
 
 	mu      sync.RWMutex
 	healthy []string
@@ -267,6 +359,7 @@ func NewLeastConn(servers []string) *LeastConn {
 	return &LeastConn{
 		allServers: all,
 		status:     status,
+		ejected:    make(map[string]time.Time),
 		healthy:    all,
 		conns:      conns,
 	}
@@ -304,14 +397,30 @@ func (b *LeastConn) UpdateStatus(server string, healthy bool) {
 	defer b.mu.Unlock()
 
 	b.status[server] = healthy
-
-	active := make([]string, 0, len(b.allServers))
-	for _, s := range b.allServers {
-		if b.status[s] {
-			active = append(active, s)
-		}
+	if healthy {
+		delete(b.ejected, server)
 	}
-	b.healthy = active
+	b.rebuildLocked()
+}
+
+// rebuildLocked recomputes the healthy list. b.mu held.
+func (b *LeastConn) rebuildLocked() {
+	b.healthy = activeServers(b.allServers, b.status, b.ejected, time.Now())
+}
+
+func (b *LeastConn) Eject(server string, d time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	until := time.Now().Add(d)
+	b.ejected[server] = until
+	b.rebuildLocked()
+	scheduleEjectionEnd(&b.mu, &b.ejected, server, until, b.rebuildLocked)
+}
+
+func (b *LeastConn) Servers() []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return append([]string(nil), b.allServers...)
 }
 
 func (b *LeastConn) OnConnect(server string) {
@@ -339,7 +448,7 @@ func (b *LeastConn) MarkDraining(server string) {
 func (b *LeastConn) IsHealthy(server string) bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	return b.status[server]
+	return b.status[server] && !ejectedNow(b.ejected, server)
 }
 
 func (b *LeastConn) UpdateServers(servers []string) {
@@ -354,7 +463,8 @@ func (b *LeastConn) UpdateServers(servers []string) {
 		newConns[s] = b.conns[s] // preserve existing counts
 	}
 	b.conns = newConns
-	b.healthy = append([]string{}, b.allServers...)
+	b.ejected = keepEjections(b.ejected, b.allServers)
+	b.rebuildLocked()
 }
 
 func (b *LeastConn) NextExcluding(exclude []string) (string, error) {

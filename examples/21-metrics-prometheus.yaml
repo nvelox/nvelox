@@ -1,11 +1,14 @@
 ## 21 — Prometheus Metrics Endpoint
-## Exposes /metrics on :9090 for scraping.
+## Exposes /metrics on 127.0.0.1:9090 for scraping (an empty bind means the
+## same: loopback only). The endpoint has no authentication: to scrape from
+## another host, bind it to a private interface (e.g. "10.0.0.5:9090") and
+## firewall the port to your Prometheus servers — never a public address.
 version: "2"
 logging:
   level: "debug"
 metrics:
   enabled: true
-  bind: ":9090"
+  bind: "127.0.0.1:9090"
   path: "/metrics"
 listeners:
   - name: "web"

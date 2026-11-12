@@ -1,11 +1,24 @@
 ## 22 — Admin REST API
-## Runtime management API on :9091.
+## Runtime management API on 127.0.0.1:9091 (an empty bind means the same).
+##
+## api_key is required: nvelox refuses to start with the admin API enabled
+## and no key. Send it as the X-API-Key header on every request, and use a
+## long random value (e.g. `openssl rand -hex 32`): a valid key is always
+## served, and ten failed attempts from one IP in 10 minutes only throttle
+## that IP's further FAILURES (429) for 15 minutes.
+##
+## Requests must name the bind address in the Host header (call
+## http://127.0.0.1:9091/..., or http://<bind-ip>:9091/... for a non-loopback
+## bind), POST requests need "Content-Type: application/json", and browser
+## cross-site requests are refused. Bound to anything but loopback, keep the
+## port firewalled to the hosts that manage nvelox.
 version: "2"
 logging:
   level: "debug"
 admin:
   enabled: true
   bind: "127.0.0.1:9091"
+  api_key: "replace-with-the-output-of-openssl-rand-hex-32"
 listeners:
   - name: "web"
     bind: ":9000"

@@ -1,5 +1,6 @@
 FROM --platform=$TARGETPLATFORM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata
+# mailcap: /etc/mime.types for static Content-Type by extension (see Dockerfile)
+RUN apk add --no-cache ca-certificates tzdata mailcap
 RUN addgroup -S nvelox && adduser -S nvelox -G nvelox
 COPY nvelox /usr/local/bin/nvelox
 COPY nvelox.example.yaml /etc/nvelox/nvelox.conf
