@@ -141,10 +141,15 @@ listeners:
       requests_per_second: 50
       burst: 20
 
-    # Security
+    # Security. Entries must be IPs or CIDRs (a bad one fails the load);
+    # "0.0.0.0/0" here and in acl source_ip means every client, IPv6 too.
     ip_denylist: ["192.168.100.0/24"]
     # ip_allowlist: ["10.0.0.0/8"]  # If set, only listed CIDRs allowed
     max_body_size: "10MB"
+    # ACL path_prefix / path_regex see the canonical path ("//admin",
+    # "/x/../admin" and "/%2e/admin" are "/admin"); a deny rule also matches
+    # the path without ";params". Matching is case-sensitive: write
+    # path_regex: "(?i)^/admin(/|$)" in front of a case-insensitive backend.
     acl:
       - match:
           method: ["DELETE"]
@@ -155,8 +160,10 @@ listeners:
     compression:
       enabled: true
       types: ["text/html", "application/json", "text/css", "application/javascript"]
-      min_length: 1024
+      min_length: 1024   # by Content-Length (as nginx); unknown length is compressed
 
+    # Only a 200 received in full is cached; Range / If-* requests bypass the
+    # cache. One entry holds at most 8MB (or max_size); unset max_size = 64MB.
     cache:
       enabled: true
       max_size: "256MB"
@@ -351,12 +358,17 @@ backends:
       connect: "3s"
       read: "15s"
 
-    # Retry on failure
+    # Retry on failure. "connect_failure": the server gave no response
+    # (the default when "on" is empty); "502" / "503": it answered with that
+    # status. A request is resent only if it never reached the server with
+    # its body untouched, or if it has no body and an idempotent method.
     retry:
       attempts: 3
       on: "connect_failure,502,503"
 
-    # Sticky sessions
+    # Sticky sessions. cookie: the cookie names the server (set on the first
+    # response, HttpOnly, SameSite=Lax, Secure over TLS); header: keyed by a
+    # hash of the header value (values over 256 bytes are ignored).
     sticky_session:
       type: "cookie"           # cookie, header, ip_hash
       cookie_name: "NVELOX_SRV"
@@ -370,7 +382,7 @@ backends:
         interval: "5s"
         timeout: "2s"
       passive:
-        max_fails: 3           # Mark down after 3 consecutive failures
+        max_fails: 3           # Out of rotation for 30s after 3 consecutive backend failures
 
     # Circuit breaker
     circuit_breaker:
