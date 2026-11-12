@@ -65,8 +65,8 @@ func newUDPSessionLimiter(maxTotal, maxPerIP int) *udpSessionLimiter {
 	return &udpSessionLimiter{perIP: make(map[netip.Addr]int), maxTotal: maxTotal, maxPerIP: maxPerIP}
 }
 
-// acquire reserves a session slot, charged to ip when ip is valid (a zero ip
-// = client not known yet: a trusted relay's, charged later by chargeIP). It
+// acquire reserves a session slot, charged to ip when ip is valid. A trusted
+// relay's session acquires once a valid PROXY header names its client. It
 // returns "" on success, else the drop reason.
 func (s *udpSessionLimiter) acquire(ip netip.Addr) string {
 	s.mu.Lock()
@@ -84,19 +84,7 @@ func (s *udpSessionLimiter) acquire(ip netip.Addr) string {
 	return ""
 }
 
-// chargeIP charges a session that already holds a slot to its client ip, once
-// known. False when ip is at its limit (the caller ends the session).
-func (s *udpSessionLimiter) chargeIP(ip netip.Addr) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.perIP[ip] >= s.maxPerIP {
-		return false
-	}
-	s.perIP[ip]++
-	return true
-}
-
-// release frees a slot taken by acquire (and chargeIP for ip, when valid).
+// release frees a slot taken by acquire.
 func (s *udpSessionLimiter) release(ip netip.Addr) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
