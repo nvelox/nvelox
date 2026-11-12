@@ -613,6 +613,9 @@ func TestAdminAPI_SuccessClearsFailures(t *testing.T) {
 // throttled without a record (a valid key from a new IP is still served),
 // and expired records are pruned.
 func TestAdminAPI_AuthFailureTableBounded(t *testing.T) {
+	// Thousands of failures: keep their Warn lines out of the test output.
+	logging.Init("error", "", "")
+	defer logging.Init("debug", "", "")
 	srv := newTestServer(map[string]lb.Balancer{})
 	fail := func(ip string) int {
 		req := localRequest("GET", "/api/v1/stats")
