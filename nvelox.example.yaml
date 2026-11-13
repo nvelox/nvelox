@@ -186,6 +186,9 @@ listeners:
     # "/x/../admin" and "/%2e/admin" are "/admin"); a deny rule also matches
     # the path without ";params". Matching is case-sensitive: write
     # path_regex: "(?i)^/admin(/|$)" in front of a case-insensitive backend.
+    # A backslash ("\" or "%5C") is not a path separator and reaches the
+    # backend unchanged (as in nginx): in front of a backend that treats it
+    # as "/", match it too, e.g. path_regex: "^/admin([/\\\\]|$)".
     acl:
       - match:
           method: ["DELETE"]
