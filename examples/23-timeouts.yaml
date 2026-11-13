@@ -1,22 +1,37 @@
 ## 23 — Configurable Timeouts
-## Per-listener and per-backend timeouts.
+## Per-listener and per-backend timeouts. "0" means unlimited.
 ##
-## Listener fields (HTTP / HTTPS only — TCP/UDP listeners are byte-pumps
-## and have no per-request timeout):
+## Listener fields (HTTP / HTTPS):
 ##   read_header — slowloris guard for header parsing. Shared across all
 ##                 sites on the same bind port (one http.Server); the
 ##                 engine uses the max configured across sites, default 10s.
-##   read        — whole-request budget (incl. body). Applied PER-REQUEST
-##                 via http.ResponseController once the matched site is
-##                 known, so two sites sharing one bind port can have
-##                 different read budgets. Default 60s when unset.
-##   write       — whole-response budget. Same per-request shape as read.
-##                 Default 60s when unset.
+##   read        — how long the client may stall while sending its request
+##                 body: the time nvelox waits for the next bytes of it.
+##                 Default 60s.
+##   write       — how long the client may stall while taking the response:
+##                 the time one write waits for the client. Default 60s.
+##                 read and write count only time stuck, not the length of
+##                 the transfer: a quiet event stream, or an upload or
+##                 download that keeps moving, is never cut; a client that
+##                 stops sending or reading is. Both apply per request once
+##                 the matched site is known, so two sites sharing one bind
+##                 port can have different values.
 ##   idle        — between-request idle on a kept-alive connection.
 ##                 Shared across sites on the bind port (max wins). Default 120s.
+##   connect     — default dial timeout of the listener's backends.
 ##
-## "0" means unlimited (an explicit opt-out). Useful for long-running
-## endpoints such as Docker registry blob uploads or WebSocket-style streams.
+## Backend fields:
+##   connect         — dial timeout: this, else the listener's, else 10s.
+##   response_header — how long the backend may take to start answering once
+##                     the request was sent. Past it the client gets 504 and
+##                     the attempt counts as a failure (passive health,
+##                     circuit breaker). Default 60s.
+##   read            — HTTP: the longest the backend may stay silent once it
+##                     has started answering; past it the response is cut.
+##                     No limit unless set. Event streams that can be quiet
+##                     need it unset, or above their keep-alive interval.
+## write, idle and read_header on a backend, and response_header on a
+## listener, are refused at load.
 version: "2"
 logging:
   level: "debug"
@@ -28,8 +43,8 @@ listeners:
     protocol: "http"
     backend: "backend"
 
-  # Tight budgets — strict slowloris guard, short body limit. Override
-  # only what differs from defaults.
+  # A client that stalls for 10s is dropped; a long transfer that keeps
+  # moving is not.
   - name: "strict-http"
     bind: ":9001"
     protocol: "http"
@@ -39,21 +54,19 @@ listeners:
       read:        "10s"
       write:       "10s"
 
-  # Long-lived uploads (e.g. Docker registry blob PUT/PATCH) — give the
-  # body 30 minutes. read_header stays strict; only the body needs leeway.
-  # When this listener shares :9001 with strict-http (different example —
-  # not literally on the same bind here), the bindgroup uses the max of
-  # the two read_header values (5s); the per-request read budget is set
-  # independently for each matched site, so registry's 30m doesn't
-  # weaken strict-http's 10s.
+  # Clients on poor links, which may stall for minutes mid-upload (e.g.
+  # Docker registry blob PUT/PATCH from far away). When this listener shares
+  # a bind port with strict-http (not literally here), the bind group uses
+  # the max of the two read_header values; read and write are per site, so
+  # this one's 5m doesn't weaken strict-http's 10s.
   - name: "long-upload"
     bind: ":9002"
     protocol: "http"
-    backend: "backend"
+    backend: "slow-backend"
     timeouts:
       read_header: "10s"
-      read:        "30m"
-      write:       "30m"
+      read:        "5m"
+      write:       "5m"
 
 backends:
   - name: "backend"
@@ -61,5 +74,16 @@ backends:
     servers:
       - "127.0.0.1:8081"
     timeouts:
-      connect: "2s"
-      read:    "10s"
+      connect:         "2s"
+      response_header: "30s"
+      read:            "30s"
+
+  # A backend that may think for minutes before it answers (reports,
+  # exports). Same server, its own timeouts.
+  - name: "slow-backend"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"
+    timeouts:
+      connect:         "2s"
+      response_header: "10m"

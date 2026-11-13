@@ -28,20 +28,12 @@ type upstreamRequest struct {
 	reqIDOn      bool
 	cacheKey     string // "" = this response is not cached
 	upgrade      bool   // WebSocket upgrade request
-	// readDeadline is when the listener's read timeout expires for this
-	// request (zero: none). On HTTP/1 net/http cancels the request context
-	// when it passes, which is not the client going away.
-	readDeadline time.Time
 	// admission (upgrades) is what the tunnel is admitted with, completed
 	// with its server when the backend switches; clientIP is the client
 	// the access rules checked.
 	admission *tunnelAdmission
 	clientIP  net.IP
 }
-
-// deadlineSlack absorbs the gap between the read deadline BindGroup set and
-// the one ServeHTTP computed from its own start time.
-const deadlineSlack = 50 * time.Millisecond
 
 // errRetryStatus is returned by ModifyResponse to turn a 502 / 503 that
 // retry.on lists into a retry on another server. ModifyResponse has already
@@ -61,8 +53,8 @@ const (
 	outcomeBadGateway                           // backend failure, not retried: 502
 	outcomeClientGone                           // the client went away: nothing is sent, logged as 499
 	outcomeTooLarge                             // the request body is over max_body_size: 413
-	outcomeBodyTimeout                          // the client's body stalled past the read deadline: 408
-	outcomeGatewayTimeout                       // the listener's read timeout ran out waiting for the backend: 504
+	outcomeBodyTimeout                          // the client's body stalled past the read limit: 408
+	outcomeGatewayTimeout                       // the backend did not start answering within timeouts.response_header: 504
 	outcomeBadRequest                           // the request (or its body) cannot be sent upstream: 400
 )
 
@@ -153,6 +145,7 @@ func (s *HTTPServer) proxy(w http.ResponseWriter, r *http.Request, rec *statusRe
 		case outcomeBodyTimeout:
 			s.serveError(w, http.StatusRequestTimeout)
 		case outcomeGatewayTimeout:
+			logging.Error("[HTTP] Upstream %s did not answer %s in time: %v", target, logging.SanitizeLogField(r.URL.Path), perr)
 			s.serveError(w, http.StatusGatewayTimeout)
 		case outcomeBadRequest:
 			s.serveError(w, http.StatusBadRequest)
@@ -200,6 +193,8 @@ func (s *HTTPServer) proxyOnce(out http.ResponseWriter, r *http.Request, rec *st
 	transport, scheme := s.backendTransport, "http"
 	if t, ok := s.backendTransports[u.backendName]; ok {
 		transport, scheme = t, s.backendSchemes[u.backendName]
+	} else if t, ok := s.plainTransports[u.backendName]; ok {
+		transport = t
 	}
 
 	var (
@@ -257,6 +252,13 @@ func (s *HTTPServer) proxyOnce(out http.ResponseWriter, r *http.Request, rec *st
 			}
 			if st != nil {
 				st.bind(resp.Header, target, r.TLS != nil)
+			}
+			// The backend's timeouts.read: the longest it may stay silent
+			// once it has started answering. Never on a protocol switch
+			// (ReverseProxy needs the connection itself as the body; a
+			// tunnel has the idle timeout).
+			if d := backendSilenceLimit(u.backend); d > 0 && resp.StatusCode != http.StatusSwitchingProtocols && resp.Body != http.NoBody {
+				resp.Body = newSilenceBody(resp.Body, d, target)
 			}
 			if cacheW != nil && cacheableResponse(resp, cacheW.limit) {
 				cacheHdr = cacheHeaders(resp.Header)
@@ -317,9 +319,6 @@ func (s *HTTPServer) proxyOnce(out http.ResponseWriter, r *http.Request, rec *st
 	case bodyErr != nil && isTimeout(bodyErr):
 		return outcomeBodyTimeout, bodyErr
 	case r.Context().Err() != nil:
-		if !u.readDeadline.IsZero() && time.Until(u.readDeadline) < deadlineSlack {
-			return outcomeGatewayTimeout, proxyErr
-		}
 		return outcomeClientGone, proxyErr
 	case bodyErr != nil:
 		// Reading the client's body failed but the client is still there.
@@ -328,6 +327,12 @@ func (s *HTTPServer) proxyOnce(out http.ResponseWriter, r *http.Request, rec *st
 		// ReverseProxy refused the request before contacting the backend
 		// (e.g. an Upgrade value that is not a printable token).
 		return outcomeBadRequest, proxyErr
+	case sent.Load() && isTimeout(proxyErr):
+		// The request reached the backend, which did not start answering
+		// within its timeouts.response_header: a backend failure, answered
+		// 504 and not retried (the backend may still be working on it).
+		report(false)
+		return outcomeGatewayTimeout, proxyErr
 	}
 	report(false)
 	if canRetry && policy.onConnectFailure && replayable(r, body, sent.Load()) {

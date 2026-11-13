@@ -384,20 +384,31 @@ type SNIRoute struct {
 }
 
 // TimeoutConfig defines configurable timeouts for listeners and backends.
+// Every value is a duration; "0" means no limit.
 //
 // On HTTP listeners, ReadHeader bounds the time spent parsing request headers
-// (slowloris guard) and is enforced at the http.Server level. Read and Write
-// are applied per-request via http.ResponseController.SetReadDeadline /
-// SetWriteDeadline once the routing site is known, so two sites sharing the
-// same bind port can have different Read/Write budgets. ReadHeader is shared
+// (slowloris guard) and is enforced at the http.Server level; it is shared
 // across sites on the same bind port (one http.Server) — the engine uses the
 // max configured value across sites, falling back to a sensible default.
+// Read and Write limit how long a transfer with the client may be stuck, not
+// how long it may take: Read is how long nvelox waits for the next piece of a
+// request body, Write how long it waits for the client to take the next piece
+// of the response. A quiet event stream, or an upload or download that keeps
+// moving, is never cut. Both are applied per request once the routing site is
+// known, so two sites sharing a bind port can have different values.
+//
+// On backends (HTTP): Connect is the dial timeout (else the listener's, else
+// 10s), ResponseHeader the time the backend gets to start answering once the
+// request was sent, and Read the longest the backend may stay silent once it
+// has started answering (no limit unless set). Write, Idle and ReadHeader are
+// listener settings and are refused on a backend.
 type TimeoutConfig struct {
-	Connect    string `yaml:"connect,omitempty"`     // dial timeout (default "10s")
-	ReadHeader string `yaml:"read_header,omitempty"` // request header read timeout (HTTP listeners)
-	Read       string `yaml:"read,omitempty"`        // read timeout (whole request incl. body)
-	Write      string `yaml:"write,omitempty"`       // write timeout (whole response)
-	Idle       string `yaml:"idle,omitempty"`        // idle connection timeout
+	Connect        string `yaml:"connect,omitempty"`         // dial timeout (default "10s")
+	ReadHeader     string `yaml:"read_header,omitempty"`     // request header read timeout (HTTP listeners)
+	Read           string `yaml:"read,omitempty"`            // listener: client stalled sending its body; backend: silent once answering
+	Write          string `yaml:"write,omitempty"`           // listener: client stalled taking the response
+	Idle           string `yaml:"idle,omitempty"`            // idle connection timeout (listeners)
+	ResponseHeader string `yaml:"response_header,omitempty"` // backend: time to start answering (default "60s")
 }
 
 // ParseConnect returns the connect timeout duration, defaulting to 10s.
@@ -473,6 +484,68 @@ func (t TimeoutConfig) ResolveReadHeader(def time.Duration) time.Duration {
 		return def
 	}
 	return t.ParseReadHeader()
+}
+
+// ResolveResponseHeader mirrors ResolveRead for a backend's response-header
+// timeout.
+func (t TimeoutConfig) ResolveResponseHeader(def time.Duration) time.Duration {
+	if t.ResponseHeader == "" {
+		return def
+	}
+	d, _ := time.ParseDuration(t.ResponseHeader)
+	return d
+}
+
+// validateTimeout checks one timeout value: empty (unset) or a duration that
+// is not negative ("0" = no limit). A negative value used to pass and act as
+// no limit at all.
+func validateTimeout(val string) error {
+	if val == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(val)
+	if err != nil {
+		return err
+	}
+	if d < 0 {
+		return fmt.Errorf("must not be negative")
+	}
+	return nil
+}
+
+// validateBackendTimeouts checks a backend's timeouts: connect,
+// response_header and read must be valid durations; write, idle and
+// read_header are listener settings, refused here because on a backend they
+// would do nothing.
+func validateBackendTimeouts(b Backend) error {
+	t := b.Timeouts
+	for _, f := range []struct{ name, val string }{
+		{"write", t.Write}, {"idle", t.Idle}, {"read_header", t.ReadHeader},
+	} {
+		if f.val != "" {
+			return fmt.Errorf("backend %s: timeouts.%s is a listener setting; a backend takes connect, response_header and read", b.Name, f.name)
+		}
+	}
+	for _, f := range []struct{ name, val string }{
+		{"connect", t.Connect}, {"response_header", t.ResponseHeader}, {"read", t.Read},
+	} {
+		if err := validateTimeout(f.val); err != nil {
+			return fmt.Errorf("backend %s has invalid %s timeout %q: %v", b.Name, f.name, f.val, err)
+		}
+	}
+	return nil
+}
+
+// httpOnlyBackendTimeout names a timeouts field of b that only the HTTP path
+// uses (response_header, read), or "" when it sets none.
+func httpOnlyBackendTimeout(b Backend) string {
+	switch {
+	case b.Timeouts.ResponseHeader != "":
+		return "response_header"
+	case b.Timeouts.Read != "":
+		return "read"
+	}
+	return ""
 }
 
 // HeadersConfig defines request/response header manipulation.
@@ -706,7 +779,8 @@ func validate(cfg *Config) error {
 	}
 
 	backendNames := make(map[string]bool)
-	backendTLS := make(map[string]bool) // backend name -> backend_tls enabled
+	backendTLS := make(map[string]bool)        // backend name -> backend_tls enabled
+	backendHTTPOnly := make(map[string]string) // backend name -> an HTTP-only timeouts field it sets
 	validAlgorithms := map[string]bool{"": true, "roundrobin": true, "leastconn": true, "random": true}
 
 	for _, b := range cfg.Backends {
@@ -758,12 +832,10 @@ func validate(cfg *Config) error {
 			}
 		}
 
-		// Validate backend timeouts
-		if b.Timeouts.Connect != "" {
-			if _, err := time.ParseDuration(b.Timeouts.Connect); err != nil {
-				return fmt.Errorf("backend %s has invalid connect timeout %q: %v", b.Name, b.Timeouts.Connect, err)
-			}
+		if err := validateBackendTimeouts(b); err != nil {
+			return err
 		}
+		backendHTTPOnly[b.Name] = httpOnlyBackendTimeout(b)
 	}
 
 	for _, l := range cfg.Listeners {
@@ -859,17 +931,22 @@ func validate(cfg *Config) error {
 				return fmt.Errorf("listener %s: backend %s has backend_tls enabled, which is not implemented for %s listeners (only http/https listeners connect to backends over TLS)",
 					l.Name, l.Backend, proto)
 			}
+			if f := backendHTTPOnly[l.Backend]; f != "" {
+				return fmt.Errorf("listener %s: backend %s sets timeouts.%s, which only http/https listeners use; give this %s listener a backend without it",
+					l.Name, l.Backend, f, proto)
+			}
 		}
 
-		// Validate listener timeouts
+		// Validate listener timeouts. response_header is a backend setting.
+		if l.Timeouts.ResponseHeader != "" {
+			return fmt.Errorf("listener %s: timeouts.response_header is a backend setting (the time a backend gets to start answering)", l.Name)
+		}
 		for _, field := range []struct{ name, val string }{
-			{"connect", l.Timeouts.Connect}, {"read", l.Timeouts.Read},
-			{"write", l.Timeouts.Write}, {"idle", l.Timeouts.Idle},
+			{"connect", l.Timeouts.Connect}, {"read_header", l.Timeouts.ReadHeader},
+			{"read", l.Timeouts.Read}, {"write", l.Timeouts.Write}, {"idle", l.Timeouts.Idle},
 		} {
-			if field.val != "" {
-				if _, err := time.ParseDuration(field.val); err != nil {
-					return fmt.Errorf("listener %s has invalid %s timeout %q: %v", l.Name, field.name, field.val, err)
-				}
+			if err := validateTimeout(field.val); err != nil {
+				return fmt.Errorf("listener %s has invalid %s timeout %q: %v", l.Name, field.name, field.val, err)
 			}
 		}
 

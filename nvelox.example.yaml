@@ -191,12 +191,18 @@ listeners:
     #   read_header — slowloris guard for header parsing. Shared across
     #                 sites on the same bind port; the engine takes the
     #                 max configured value (or 10s default).
-    #   read        — whole-request budget (headers + body). Applied
-    #                 per-request after Host-based routing, so two sites
-    #                 sharing a bind can use different values. 60s default.
-    #   write       — whole-response budget. Per-request like read. 60s.
+    #   read        — how long the client may stall while sending its
+    #                 request body (no byte arriving). 60s default.
+    #   write       — how long the client may stall while taking the
+    #                 response (a write waiting for it). 60s default.
+    #                 read and write count only time stuck: a quiet event
+    #                 stream, or an upload or download that keeps moving,
+    #                 is never cut. Applied per request after Host-based
+    #                 routing, so two sites sharing a bind can differ.
     #   idle        — keep-alive idle between requests on a connection.
     #                 Shared across sites; max wins. 120s default.
+    #   connect     — default dial timeout of this listener's backends
+    #                 (a backend's own timeouts.connect wins). 10s default.
     timeouts:
       read_header: "10s"
       read: "30s"
@@ -434,10 +440,20 @@ backends:
     #   the first key) for a receiver that sets accept_proxy_key_file; for
     #   UDP every datagram's header is signed over that datagram
 
-    # Timeouts (override listener defaults)
+    # Timeouts of this backend. "0" means unlimited.
+    #   connect         — dial timeout (else the listener's, else 10s).
+    #   response_header — how long the backend may take to start answering
+    #                     once the request was sent; past it the client gets
+    #                     504 and the attempt counts as a failure. 60s default.
+    #   read            — (HTTP) the longest the backend may stay silent once
+    #                     it has started answering; past it the response is
+    #                     cut. No limit unless set. Leave it unset for event
+    #                     streams that can be quiet, or keep it above their
+    #                     keep-alive interval.
+    # write, idle and read_header are listener settings: refused here.
     timeouts:
       connect: "3s"
-      read: "15s"
+      response_header: "30s"
 
     # Retry on failure. "connect_failure": the server gave no response
     # (the default when "on" is empty); "502" / "503": it answered with that

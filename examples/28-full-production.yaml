@@ -96,7 +96,7 @@ backends:
       - "127.0.0.1:8083"
     timeouts:
       connect: "2s"
-      read: "10s"
+      response_header: "10s"
     circuit_breaker:
       enabled: true
       threshold: 5
