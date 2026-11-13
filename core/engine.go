@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,7 +78,10 @@ type Engine struct {
 	udpMaxSessions      int
 	udpMaxSessionsPerIP int
 	udpNoReplyTimeout   time.Duration
-	l4Handler           *ProxyEventHandler // set by Start (under reloadMu)
+	// udpRelayPendingTimeout ends a trusted relay's session no header has
+	// reached (udpsession.go).
+	udpRelayPendingTimeout time.Duration
+	l4Handler              *ProxyEventHandler // set by Start (under reloadMu)
 }
 
 type ListenerConfig struct {
@@ -159,9 +163,10 @@ func NewEngine(cfg *config.Config) *Engine {
 		DNSResolvers:    make(map[string]*discovery.DNSResolver),
 		Metrics:         metrics.Default,
 
-		udpMaxSessions:      maxUDPSessions,
-		udpMaxSessionsPerIP: maxUDPSessionsPerIP,
-		udpNoReplyTimeout:   udpNoReplyTimeout,
+		udpMaxSessions:         maxUDPSessions,
+		udpMaxSessionsPerIP:    maxUDPSessionsPerIP,
+		udpNoReplyTimeout:      udpNoReplyTimeout,
+		udpRelayPendingTimeout: udpRelayPendingTimeout,
 	}
 	return e
 }
@@ -566,15 +571,25 @@ func (e *Engine) Reload(cfg *config.Config) error {
 
 	// Pre-flight passed — apply mutations.
 	// L4 listeners keep running as configured at start, except for their
-	// PROXY signing keys, which take the re-read key files (rotation).
+	// PROXY signing keys, which take the re-read key files (rotation) — but
+	// only while accept_proxy_from and accept_proxy_interfaces are
+	// unchanged: new keys under the old trust would mix two configs (old
+	// relay ranges with no key at all, say). A trust change needs a
+	// restart; until then the listener keeps its trust and keys.
 	for _, l := range expanded {
-		if running := e.l4Running[l4Key(l)]; running != nil && running.proxyTrust != nil && l.proxyTrust != nil {
-			var keys [][]byte
-			if k := l.proxyTrust.keys.Load(); k != nil {
-				keys = *k
-			}
-			running.proxyTrust.setKeys(keys)
+		running := e.l4Running[l4Key(l)]
+		if running == nil || running.proxyTrust == nil || l.proxyTrust == nil {
+			continue
 		}
+		if !slices.Equal(running.AcceptProxyFrom, l.AcceptProxyFrom) || !slices.Equal(running.proxyInterfaces, l.proxyInterfaces) {
+			logging.Warn("[RELOAD] listener %s: accept_proxy_from or accept_proxy_interfaces changed; restart nvelox to apply that (until then it keeps its current PROXY trust and keys)", l.Name)
+			continue
+		}
+		var keys [][]byte
+		if k := l.proxyTrust.keys.Load(); k != nil {
+			keys = *k
+		}
+		running.proxyTrust.setKeys(keys)
 	}
 	warnInsecureBackendTLS(cfg.Backends)
 	e.Config = cfg

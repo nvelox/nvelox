@@ -7,8 +7,11 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/lesismal/nbio"
 
 	"nvelox/config"
 )
@@ -106,4 +109,108 @@ func TestUDPInterfaces_StartErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// udpRec is a datagram a recording backend received, and the socket it came
+// from.
+type udpRec struct{ payload, from string }
+
+// recordingUDPBackend records every datagram with its source address.
+func recordingUDPBackend(t *testing.T) (string, func() []udpRec) {
+	t.Helper()
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	var mu sync.Mutex
+	var recs []udpRec
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, from, err := c.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			recs = append(recs, udpRec{string(buf[:n]), from.String()})
+			mu.Unlock()
+		}
+	}()
+	return c.LocalAddr().String(), func() []udpRec {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]udpRec(nil), recs...)
+	}
+}
+
+// TestUDPInterfaces_SessionsKeepTheirOwnBackendSockets: one relay address
+// can have two sessions on one port at once — a trusted one that arrived on
+// the listed interface and an ordinary one that arrived elsewhere (a forged
+// source, say). They must not share a backend socket: the ordinary
+// session's datagrams would join the trusted flow, and its end would close
+// it. (Here lo is listed; the same source sends once to 127.0.0.1, filed
+// under lo, and once to another address of this host.)
+func TestUDPInterfaces_SessionsKeepTheirOwnBackendSockets(t *testing.T) {
+	_, otherIP := firstNonLoopbackIPv4(t)
+	be, recs := recordingUDPBackend(t)
+	_, port, _ := net.SplitHostPort(stFreeUDPAddr(t))
+	e := stStart(t, &config.Config{
+		Listeners: []config.Listener{{Name: "relayed", Bind: ":" + port, Protocol: "udp", Backend: "be",
+			AcceptProxyFrom: []string{"127.0.0.0/8"}, AcceptProxyInterfaces: []string{"lo"}}},
+		Backends: []config.Backend{{Name: "be", Servers: []string{be}}},
+	}, nil)
+	h := stHandler(e)
+	src, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	viaLo := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: mustAtoiPort(t, port)}
+	viaOther := &net.UDPAddr{IP: otherIP, Port: viaLo.Port}
+	from := func(payload string) string {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			for _, r := range recs() {
+				if r.payload == payload {
+					return r.from
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("backend never got %q (got %+v)", payload, recs())
+		return ""
+	}
+
+	src.WriteToUDP(stUDPDatagramWithProxy(t, "198.51.100.80:4000", viaLo.String(), []byte("relayed-1")), viaLo)
+	trustedSock := from("relayed-1")
+	src.WriteToUDP([]byte("ordinary"), viaOther)
+	if from("ordinary") == trustedSock {
+		t.Fatal("the ordinary session wrote into the trusted session's backend socket")
+	}
+
+	// End the ordinary session; the trusted flow keeps its backend socket.
+	h.sessions.Range(func(k, v any) bool {
+		if ctx := v.(*ConnContext); !ctx.IsBackend && !ctx.PeerTrusted {
+			k.(*nbio.Conn).Close()
+		}
+		return true
+	})
+	time.Sleep(200 * time.Millisecond)
+	src.WriteToUDP(stUDPDatagramWithProxy(t, "198.51.100.80:4000", viaLo.String(), []byte("relayed-2")), viaLo)
+	if got := from("relayed-2"); got != trustedSock {
+		t.Fatalf("after the ordinary session ended the trusted flow moved from %s to %s", trustedSock, got)
+	}
+}
+
+func mustAtoiPort(t *testing.T, p string) int {
+	t.Helper()
+	n := 0
+	for _, c := range p {
+		if c < '0' || c > '9' {
+			t.Fatalf("port %q", p)
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }

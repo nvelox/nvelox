@@ -259,3 +259,30 @@ func TestSignedProxy_KeyRotationByReload(t *testing.T) {
 		t.Fatal("key A after it was removed: accepted")
 	}
 }
+
+// TestSignedProxy_ReloadChangingTrustKeepsIt: a reload swaps the PROXY keys
+// of a running listener only while its accept_proxy_from is unchanged. A
+// reload that drops both the key file and accept_proxy_from must not leave
+// the old relay range trusted with no key: the listener keeps its trust and
+// keys (a trust change needs a restart), so an unsigned header is still
+// dropped.
+func TestSignedProxy_ReloadChangingTrustKeepsIt(t *testing.T) {
+	be, got := stUDPBackend(t, nil)
+	addr := stFreeUDPAddr(t)
+	signedCfg := &config.Config{
+		Listeners: []config.Listener{{Name: "relay-udp", Bind: addr, Protocol: "udp", Backend: "be",
+			AcceptProxyFrom: []string{"127.0.0.0/8"}, AcceptProxyKeys: [][]byte{sigKeyA}}},
+		Backends: []config.Backend{{Name: "be", Servers: []string{be}}},
+	}
+	e := stStart(t, signedCfg, nil)
+	if err := e.Reload(&config.Config{Version: "2",
+		Listeners: []config.Listener{{Name: "relay-udp", Bind: addr, Protocol: "udp", Backend: "be"}},
+		Backends:  []config.Backend{{Name: "be", Servers: []string{be}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stUDPExchange("127.0.0.1", addr, stUDPDatagramWithProxy(t, "198.51.100.91:4000", addr, []byte("unsigned")), 300*time.Millisecond)
+	if d, ok := stWaitGot(got, 300*time.Millisecond); ok {
+		t.Fatalf("after the reload an unsigned header was trusted: the backend got %q", d)
+	}
+}

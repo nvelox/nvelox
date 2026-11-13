@@ -105,6 +105,14 @@ type ConnContext struct {
 	resolvedSrc  net.Addr
 	refused      string
 	closed       bool
+	// pendingHeld: the session holds a place among the relay sessions
+	// waiting for a header (udpSessionLimiter.acquirePending), and
+	// pendingTimer ends it if no header comes. viaInterface: the session
+	// arrived on a socket bound to one of the listener's
+	// accept_proxy_interfaces (part of its backend-socket key).
+	pendingHeld  bool
+	pendingTimer *time.Timer
+	viaInterface bool
 }
 
 func (h *ProxyEventHandler) setCtx(c *nbio.Conn, ctx *ConnContext) {
@@ -192,6 +200,14 @@ func (h *ProxyEventHandler) onOpen(c *nbio.Conn, viaListedInterface bool) {
 	// a source forged to look like a relay cannot hold capacity. The timer
 	// ends a session whose first datagram never reaches OnData.
 	if peerTrusted {
+		// Such sessions hold no session slot, so they have a cap of their
+		// own; a session no header reaches (an empty datagram) ends after
+		// udpRelayPendingTimeout.
+		if reason := h.udpSessions.acquirePending(); reason != "" {
+			h.udpDrops.note(reason, l.Name, c.RemoteAddr())
+			closeOnOpen(c)
+			return
+		}
 		h.engine.ActiveConns.Add(1)
 		relayCtx := &ConnContext{
 			IsBackend:    false,
@@ -204,9 +220,12 @@ func (h *ProxyEventHandler) onOpen(c *nbio.Conn, viaListedInterface bool) {
 			LocalAddr:    c.LocalAddr(),
 			listener:     l,
 			relayPending: true,
+			pendingHeld:  true,
+			viaInterface: viaListedInterface,
 		}
 		h.setCtx(c, relayCtx)
-		time.AfterFunc(h.engine.udpNoReplyTimeout, func() {
+		relayCtx.Mu.Lock()
+		relayCtx.pendingTimer = time.AfterFunc(h.engine.udpRelayPendingTimeout, func() {
 			relayCtx.Mu.Lock()
 			pending := relayCtx.relayPending && !relayCtx.closed
 			relayCtx.Mu.Unlock()
@@ -214,6 +233,7 @@ func (h *ProxyEventHandler) onOpen(c *nbio.Conn, viaListedInterface bool) {
 				_ = c.Close()
 			}
 		})
+		relayCtx.Mu.Unlock()
 		return
 	}
 
@@ -263,6 +283,7 @@ func (h *ProxyEventHandler) onOpen(c *nbio.Conn, viaListedInterface bool) {
 		slotHeld:     true,
 		sessionIP:    sessionIP,
 		limiter:      limiter,
+		viaInterface: viaListedInterface,
 	}
 	h.setCtx(c, clientCtx)
 	// A block added after the access check above, before the session was
@@ -313,6 +334,11 @@ func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
 	clientResolved := ctx.ClientResolved
 	refused := ctx.refused
 	slotHeld, sessionIP, limiter := ctx.slotHeld, ctx.sessionIP, ctx.limiter
+	pendingHeld := ctx.pendingHeld
+	ctx.pendingHeld = false
+	if ctx.pendingTimer != nil {
+		ctx.pendingTimer.Stop()
+	}
 	ctx.PeerConn = nil // prevent double-close
 	ctx.closed = true  // a late OnData must not charge the released session
 	ctx.limiter = nil
@@ -330,6 +356,9 @@ func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
 	if !isBackend {
 		if slotHeld {
 			h.udpSessions.release(sessionIP)
+		}
+		if pendingHeld {
+			h.udpSessions.releasePending()
 		}
 		if limiter != nil {
 			limiter.Release()
@@ -455,6 +484,13 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 				return
 			}
 			ctx.relayPending = false
+			if ctx.pendingHeld {
+				ctx.pendingHeld = false
+				h.udpSessions.releasePending()
+			}
+			if ctx.pendingTimer != nil {
+				ctx.pendingTimer.Stop()
+			}
 			admitted = true
 			// The outbound header names the client the relay named; the
 			// backend connection (dialed below) sends it with every datagram.
@@ -624,7 +660,13 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 	// name, so without the local port two clients with the same source IP:port
 	// (CGNAT) hitting DIFFERENT dedicated ports would collide on one backend conn
 	// and their replies would cross.
-	poolKey := fmt.Sprintf("%s|%d|%s", clientConn.RemoteAddr().String(), portOf(clientConn.LocalAddr()), clientCtx.BackendServer)
+	//
+	// With accept_proxy_interfaces one relay address can have two sessions
+	// on one port at once: a trusted one that arrived on a listed interface
+	// and an ordinary one (perhaps a forged source) that arrived elsewhere.
+	// The arrival path is part of the key, so they never share a backend
+	// socket (one could write into, or close, the other's flow).
+	poolKey := fmt.Sprintf("%s|%d|%t|%s", clientConn.RemoteAddr().String(), portOf(clientConn.LocalAddr()), clientCtx.viaInterface, clientCtx.BackendServer)
 	if session := h.engine.UDPPool.Get(poolKey); session != nil {
 		// Reuse existing backend connection
 		clientCtx.Mu.Lock()

@@ -37,6 +37,11 @@ const (
 	// one-datagram (or spoofed) source frees its slot after 10 s instead of
 	// 60 s. A session the backend answered keeps udpIdleTimeout.
 	udpNoReplyTimeout = 10 * time.Second
+	// udpRelayPendingTimeout ends a trusted relay's session that no datagram
+	// with a PROXY header has reached (an empty datagram opens a session but
+	// never reaches OnData). A real relay's header arrives with the datagram
+	// that opened the session.
+	udpRelayPendingTimeout = 2 * time.Second
 	// udpIdleTimeout ends a session after this long without a backend reply
 	// (the nbio client-side read timeout is the same).
 	udpIdleTimeout = 60 * time.Second
@@ -51,19 +56,43 @@ const (
 	udpDropNoProxyHeader = "no_proxy_header" // trusted relay datagram without a valid PROXY v2 header
 	udpDropClientChanged = "client_changed"  // trusted relay datagram naming another client than the session's
 	udpDropBadSignature  = "bad_signature"   // trusted relay datagram whose header signature is missing or wrong (accept_proxy_key_file)
+	udpDropRelayPending  = "relay_pending"   // too many trusted-relay sessions still waiting for a header: new one refused
 )
 
-// udpSessionLimiter counts live UDP sessions, globally and per client IP.
+// udpSessionLimiter counts live UDP sessions, globally and per client IP,
+// and apart from them the trusted relays' sessions still waiting for a
+// PROXY header: those hold no session slot (H5), so they get a cap of
+// their own, as large as the session cap.
 type udpSessionLimiter struct {
 	mu       sync.Mutex
 	total    int
 	perIP    map[netip.Addr]int
 	maxTotal int
 	maxPerIP int
+	pending  int
 }
 
 func newUDPSessionLimiter(maxTotal, maxPerIP int) *udpSessionLimiter {
 	return &udpSessionLimiter{perIP: make(map[netip.Addr]int), maxTotal: maxTotal, maxPerIP: maxPerIP}
+}
+
+// acquirePending reserves a place for a trusted relay's session that no
+// header has admitted yet; "" on success, else the drop reason.
+func (s *udpSessionLimiter) acquirePending() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pending >= s.maxTotal {
+		return udpDropRelayPending
+	}
+	s.pending++
+	return ""
+}
+
+// releasePending frees a place taken by acquirePending.
+func (s *udpSessionLimiter) releasePending() {
+	s.mu.Lock()
+	s.pending--
+	s.mu.Unlock()
 }
 
 // acquire reserves a session slot, charged to ip when ip is valid. A trusted
@@ -171,4 +200,5 @@ var udpDropText = map[string]string{
 	udpDropNoProxyHeader: "datagrams from a trusted relay without a valid PROXY v2 header",
 	udpDropClientChanged: "datagrams from a trusted relay naming another client than the session's",
 	udpDropBadSignature:  "datagrams from a trusted relay without a valid header signature",
+	udpDropRelayPending:  fmt.Sprintf("trusted-relay sessions waiting for a PROXY header (limit %d), new ones refused", maxUDPSessions),
 }

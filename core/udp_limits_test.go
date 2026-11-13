@@ -309,3 +309,55 @@ func TestUDP_ForgedRelaySourcesHoldNothing(t *testing.T) {
 		t.Fatalf("relayed client after forged relay datagrams: backend got %q (ok=%v); the forged sessions still hold the caps", d, ok)
 	}
 }
+
+// TestUDPRelayPendingSessionsCapped: sessions from a trusted relay address
+// that no PROXY header has reached yet hold no session slot, so they have a
+// cap of their own; an empty datagram (which never reaches OnData) opens one
+// that ends after the pending timeout.
+func TestUDPRelayPendingSessionsCapped(t *testing.T) {
+	be, _ := stUDPBackend(t, nil)
+	addr := stFreeUDPAddr(t)
+	const limit = 20
+	e := stStart(t, &config.Config{
+		Listeners: []config.Listener{{Name: "relay-udp", Bind: addr, Protocol: "udp", Backend: "be",
+			AcceptProxyFrom: []string{"127.0.0.0/8"}}},
+		Backends: []config.Backend{{Name: "be", Servers: []string{be}}},
+	}, func(e *Engine) {
+		e.udpMaxSessions = limit
+		e.udpRelayPendingTimeout = 300 * time.Millisecond
+	})
+	h := stHandler(e)
+	pending := func() int {
+		n := 0
+		h.sessions.Range(func(_, v any) bool {
+			ctx := v.(*ConnContext)
+			ctx.Mu.Lock()
+			if ctx.relayPending && !ctx.closed {
+				n++
+			}
+			ctx.Mu.Unlock()
+			return true
+		})
+		return n
+	}
+	raddr, _ := net.ResolveUDPAddr("udp", addr)
+	for i := 0; i < 5*limit; i++ {
+		c, err := net.DialUDP("udp", nil, raddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Write(nil) // empty: opens a session, never reaches OnData
+		c.Close()
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := pending(); n > limit {
+		t.Fatalf("%d sessions waiting for a header, cap %d", n, limit)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for pending() > 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d sessions still waiting after the pending timeout", pending())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
