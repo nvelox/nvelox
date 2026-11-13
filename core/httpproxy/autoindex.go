@@ -50,7 +50,7 @@ func (h *StaticHandler) serveListing(w http.ResponseWriter, r *http.Request, f s
 	}
 	if !strings.HasSuffix(r.URL.Path, "/") {
 		// Relative links need the trailing slash (net/http and nginx do the same).
-		target := path.Base(r.URL.Path) + "/"
+		target := url.PathEscape(path.Base(r.URL.Path)) + "/"
 		if r.URL.RawQuery != "" {
 			target += "?" + r.URL.RawQuery
 		}
@@ -89,7 +89,8 @@ func (h *StaticHandler) serveListing(w http.ResponseWriter, r *http.Request, f s
 		if err != nil || !(fi.IsDir() || fi.Mode().IsRegular()) {
 			continue
 		}
-		href := url.PathEscape(name)
+		// "./": a name with a colon is not taken for a URL scheme.
+		href := "./" + url.PathEscape(name)
 		if fi.IsDir() {
 			href += "/"
 		}

@@ -22,6 +22,8 @@ func autoindexSite(t *testing.T, autoindex bool) (string, *HTTPServer) {
 		"files/run.php":                   "<?php // source",
 		"files/sub/c.txt":                 "c",
 		"files/<img src=x onerror=1>.txt": "x",
+		"files/x:y.txt":                   "colon",
+		"files/q?d/e.txt":                 "e",
 		"files/with index/index.html":     "INDEX",
 		"outside/secret.txt":              "outside",
 	} {
@@ -63,8 +65,8 @@ func TestAutoindex_ListsWhatTheRouteServes(t *testing.T) {
 	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'none'") {
 		t.Errorf("CSP = %q", csp)
 	}
-	for _, want := range []string{`href="a.txt"`, `href="b.bin"`, `href="link-in.txt"`, `href="sub/"`, `href="with%20index/"`, `href="../"`,
-		"&lt;img src=x onerror=1&gt;.txt", `href="%3Cimg%20src=x%20onerror=1%3E.txt"`} {
+	for _, want := range []string{`href="./a.txt"`, `href="./b.bin"`, `href="./link-in.txt"`, `href="./sub/"`, `href="./with%20index/"`, `href="../"`,
+		"&lt;img src=x onerror=1&gt;.txt", `href="./%3Cimg%20src=x%20onerror=1%3E.txt"`, `href="./x:y.txt"`, `href="./q%3Fd/"`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("listing lacks %s", want)
 		}
@@ -74,7 +76,7 @@ func TestAutoindex_ListsWhatTheRouteServes(t *testing.T) {
 			t.Errorf("listing shows %q", not)
 		}
 	}
-	if strings.Index(body, `href="sub/"`) > strings.Index(body, `href="a.txt"`) {
+	if strings.Index(body, `href="./sub/"`) > strings.Index(body, `href="./a.txt"`) {
 		t.Error("directories are not listed first")
 	}
 	if rec := serveRaw(s, "/files/with%20index/"); rec.Body.String() != "INDEX" {
@@ -85,6 +87,10 @@ func TestAutoindex_ListsWhatTheRouteServes(t *testing.T) {
 	}
 	if rec := serveRaw(s, "/files"); rec.Code != http.StatusMovedPermanently || rec.Header().Get("Location") != "/files/" {
 		t.Errorf("/files: HTTP %d Location %q, want 301 to /files/", rec.Code, rec.Header().Get("Location"))
+	}
+	// A "?" in the name stays part of the path in the redirect.
+	if rec := serveRaw(s, "/files/q%3Fd"); rec.Code != http.StatusMovedPermanently || rec.Header().Get("Location") != "/files/q%3Fd/" {
+		t.Errorf("/files/q%%3Fd: HTTP %d Location %q, want 301 to /files/q%%3Fd/", rec.Code, rec.Header().Get("Location"))
 	}
 }
 
