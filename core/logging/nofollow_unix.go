@@ -18,3 +18,11 @@ func isSymlinkRefusal(err error) bool {
 }
 
 func runningAsRoot() bool { return os.Geteuid() == 0 }
+
+// linkCount is the number of hard links of the file fi describes.
+func linkCount(fi os.FileInfo) uint64 {
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return uint64(st.Nlink)
+	}
+	return 1
+}

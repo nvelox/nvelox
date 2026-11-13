@@ -52,10 +52,11 @@ func (l *logFile) swap(f *os.File) *os.File {
 // to): that comes back as warn for the caller to log.
 //
 // Running as root, it does not follow a symbolic link at path (outside /dev
-// and /proc, whose links only the system makes, e.g. /dev/stdout). The log
-// directory is usually writable by the user nvelox switches to
-// (server.user), who could otherwise point a log at any file for root to
-// create or append to.
+// and /proc, whose links only the system makes, e.g. /dev/stdout), and it
+// refuses a file with more than one hard link. The log directory is usually
+// writable by the user nvelox switches to (server.user), who could otherwise
+// point a log at any file for root to create or append to — and later have
+// it handed over (HandOver).
 func openLogFile(path string) (f *os.File, warn string, err error) {
 	return openLogFileAs(path, runningAsRoot())
 }
@@ -77,7 +78,15 @@ func openLogFileAs(path string, root bool) (f *os.File, warn string, err error) 
 	}
 	fi, err := f.Stat()
 	if err != nil {
+		if root {
+			f.Close()
+			return nil, "", fmt.Errorf("log file %s: %w", path, err)
+		}
 		return f, fmt.Sprintf("log file %s: cannot check its permissions: %v", path, err), nil
+	}
+	if n := linkCount(fi); root && fi.Mode().IsRegular() && n > 1 {
+		f.Close()
+		return nil, "", fmt.Errorf("%s has %d hard links: running as root, nvelox writes a log only to a file with one", path, n)
 	}
 	// Only regular files: a path like /dev/stdout or a pipe must not be
 	// chmod-ed.

@@ -97,3 +97,24 @@ func TestOpenLogFile_RootDoesNotFollowSymlinks(t *testing.T) {
 	}
 	f.Close()
 }
+
+// TestOpenLogFile_RootRefusesHardLinks: running as root, a log file with
+// another hard link (it could be any file of the system's) is refused.
+func TestOpenLogFile_RootRefusesHardLinks(t *testing.T) {
+	dir := t.TempDir()
+	other, log := filepath.Join(dir, "other"), filepath.Join(dir, "error.log")
+	if err := os.WriteFile(other, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(other, log); err != nil {
+		t.Skip(err)
+	}
+	if _, _, err := openLogFileAs(log, true); err == nil || !strings.Contains(err.Error(), "hard links") {
+		t.Fatalf("as root, a hard-linked log file: err %v, want a refusal", err)
+	}
+	f, _, err := openLogFileAs(log, false)
+	if err != nil {
+		t.Fatalf("not as root: %v", err)
+	}
+	f.Close()
+}
