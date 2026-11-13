@@ -12,6 +12,7 @@ import (
 	"nvelox/config"
 	"nvelox/core"
 	"nvelox/core/logging"
+	"nvelox/core/privdrop"
 	"nvelox/core/procsignal"
 )
 
@@ -67,10 +68,9 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 	logging.SetGateway(cfg.Server.GatewayID)
 	logging.Info("Nvelox Server %s starting...", Version)
 	logging.Info("Loaded configuration from %s", *configPath)
-	// server.user / group / pid_file / workers are parsed but not implemented
-	// (no privilege drop, no pid file, one process). Say so loudly on stderr
-	// (the error log under systemd) whatever the log level.
-	for _, w := range config.ServerWarnings(cfg.Server) {
+	// Keys that do nothing and settings that expose something: say so loudly
+	// on stderr (the error log under systemd) whatever the log level.
+	for _, w := range config.StartupWarnings(cfg) {
 		fmt.Fprintf(os.Stderr, "[CONFIG] WARNING: %s\n", w)
 	}
 
@@ -82,6 +82,9 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 
 	engine := core.NewEngine(cfg)
 	engine.Listeners = expandedListeners
+	// Bind as root, serve only as server.user: nothing is answered before
+	// the switch below.
+	engine.HoldServing()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -90,6 +93,31 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 		}
 		close(errCh)
 	}()
+
+	// Once every port is bound and the log files are open, switch to
+	// server.user / server.group. A root process that cannot give root up
+	// stops here rather than run with rights it was told to drop.
+	select {
+	case <-engine.Ready():
+		info, warning, err := privdrop.Switch(cfg.Server.User, cfg.Server.Group, logging.HandOver)
+		if err != nil {
+			return fmt.Errorf("server.user / server.group: %w", err)
+		}
+		if warning != "" {
+			fmt.Fprintf(os.Stderr, "[CONFIG] WARNING: %s\n", warning)
+		}
+		if info != "" {
+			logging.Info("[SERVER] %s", info)
+		}
+		engine.Serve()
+	case err, ok := <-errCh:
+		if ok && err != nil && err != context.Canceled {
+			return fmt.Errorf("engine stopped: %v", err)
+		}
+		return nil
+	case <-ctx.Done():
+		return nil
+	}
 
 	// Handle SIGHUP (reopen logs + reload) and SIGUSR1 (reopen logs).
 	if reloadCh != nil {

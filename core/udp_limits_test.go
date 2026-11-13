@@ -250,17 +250,15 @@ func TestUDPSessionLimiter(t *testing.T) {
 			t.Fatalf("acquire %d for a: %q, want %q", i, got, want)
 		}
 	}
-	if got := s.acquire(netip.Addr{}); got != "" { // client not known yet
+	if got := s.acquire(netip.Addr{}); got != "" { // an address that cannot be keyed
 		t.Fatalf("acquire without ip: %q", got)
 	}
 	if got := s.acquire(b); got != udpDropSessionLimit {
 		t.Fatalf("acquire over the global cap: %q", got)
 	}
-	if !s.chargeIP(b) {
-		t.Fatal("charging the unknown-client session to b must succeed")
-	}
-	if s.chargeIP(a) {
-		t.Fatal("charging a third session to a must fail (per-IP cap 2)")
+	s.release(netip.Addr{})
+	if got := s.acquire(b); got != "" {
+		t.Fatalf("acquire for b after a release: %q", got)
 	}
 	s.release(a)
 	s.release(a)
@@ -274,5 +272,92 @@ func TestUDPSessionLimiter(t *testing.T) {
 	// IPv4-mapped addresses fold onto the IPv4 key.
 	if addrKey(net.ParseIP("::ffff:192.0.2.1")) != a || addrKey(nil).IsValid() {
 		t.Fatal("addrKey normalisation")
+	}
+}
+
+// TestUDP_ForgedRelaySourcesHoldNothing (H5): datagrams from a trusted relay
+// address without a valid PROXY header — what a source forged to look like
+// the relay sends — used to open sessions that held a session slot and a
+// backend max_connections slot for udpNoReplyTimeout (10 s) before their
+// header was checked. They now end at the first datagram and hold nothing,
+// so a real relayed client still gets in at once.
+func TestUDP_ForgedRelaySourcesHoldNothing(t *testing.T) {
+	be, got := stUDPBackend(t, nil)
+	addr := stFreeUDPAddr(t)
+	stStart(t, &config.Config{
+		Listeners: []config.Listener{{Name: "relay-udp", Bind: addr, Protocol: "udp", Backend: "be",
+			AcceptProxyFrom: []string{"127.0.0.0/8"}}},
+		Backends: []config.Backend{{Name: "be", Servers: []string{be}, MaxConnections: 1}},
+	}, func(e *Engine) { e.udpMaxSessions = 2 })
+
+	raddr, _ := net.ResolveUDPAddr("udp", addr)
+	for i := 0; i < 5; i++ {
+		forged, err := net.DialUDP("udp", nil, raddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := forged.Write([]byte("no-header")); err != nil {
+			t.Fatal(err)
+		}
+		forged.Close()
+	}
+	if d, ok := stWaitGot(got, 300*time.Millisecond); ok {
+		t.Fatalf("a datagram without a header was forwarded: %q", d)
+	}
+	stUDPExchange("127.0.0.1", addr, stUDPDatagramWithProxy(t, "198.51.100.30:4000", addr, []byte("real-client")), 50*time.Millisecond)
+	if d, ok := stWaitGot(got, time.Second); !ok || string(d) != "real-client" {
+		t.Fatalf("relayed client after forged relay datagrams: backend got %q (ok=%v); the forged sessions still hold the caps", d, ok)
+	}
+}
+
+// TestUDPRelayPendingSessionsCapped: sessions from a trusted relay address
+// that no PROXY header has reached yet hold no session slot, so they have a
+// cap of their own; an empty datagram (which never reaches OnData) opens one
+// that ends after the pending timeout.
+func TestUDPRelayPendingSessionsCapped(t *testing.T) {
+	be, _ := stUDPBackend(t, nil)
+	addr := stFreeUDPAddr(t)
+	const limit = 20
+	e := stStart(t, &config.Config{
+		Listeners: []config.Listener{{Name: "relay-udp", Bind: addr, Protocol: "udp", Backend: "be",
+			AcceptProxyFrom: []string{"127.0.0.0/8"}}},
+		Backends: []config.Backend{{Name: "be", Servers: []string{be}}},
+	}, func(e *Engine) {
+		e.udpMaxSessions = limit
+		e.udpRelayPendingTimeout = 300 * time.Millisecond
+	})
+	h := stHandler(e)
+	pending := func() int {
+		n := 0
+		h.sessions.Range(func(_, v any) bool {
+			ctx := v.(*ConnContext)
+			ctx.Mu.Lock()
+			if ctx.relayPending && !ctx.closed {
+				n++
+			}
+			ctx.Mu.Unlock()
+			return true
+		})
+		return n
+	}
+	raddr, _ := net.ResolveUDPAddr("udp", addr)
+	for i := 0; i < 5*limit; i++ {
+		c, err := net.DialUDP("udp", nil, raddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Write(nil) // empty: opens a session, never reaches OnData
+		c.Close()
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := pending(); n > limit {
+		t.Fatalf("%d sessions waiting for a header, cap %d", n, limit)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for pending() > 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d sessions still waiting after the pending timeout", pending())
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

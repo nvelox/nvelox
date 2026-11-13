@@ -21,7 +21,7 @@ go test -v ./integration/  # Integration tests only
 | `config/` | Config validation | Version, addresses, ports, TLS, health check durations, balance algorithms, HTTP listener rules, routes, FastCGI |
 | `core/` | Rate limiter, conn limiter, UDP pool, passive health, engine reload, drain, timeouts | Token bucket, semaphore, session affinity, failure tracking, graceful shutdown |
 | `core/acl/` | ACL engine | Source IP/CIDR, method, header matching, allow/deny |
-| `core/admin/` | Admin API | Stats, backends, drain/enable/disable, denylist; required key, lockout that never refuses a valid key, bounded failure table, Host / cross-origin / Content-Type checks, ngris-sentinel client calls |
+| `core/admin/` | Admin API | Stats, backends, drain/enable/disable, denylist; required key, lockout that never refuses a valid key, bounded failure table, Host / cross-origin / Content-Type checks, script client calls (block, unblock, ping) |
 | `core/circuitbreaker/` | Circuit breaker | Closed/open/half-open states, threshold, timeout, success reset |
 | `core/discovery/` | DNS resolver | IP passthrough, hostname resolution, change detection |
 | `core/health/` | Health checker | TCP connect, HTTP GET, lifecycle |

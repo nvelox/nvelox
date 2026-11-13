@@ -587,7 +587,7 @@ func TestL4HalfClose_HalfClosedIdleTimeout(t *testing.T) {
 }
 
 // TestL4HalfClose_TrustedRelayProxyHeader covers the production listener
-// shape (accept_proxy_from + send_proxy_v2): a trusted peer-region relay sends
+// shape (accept_proxy_from + send_proxy_v2): a trusted relay sends
 // its inbound PROXY-v2 header, the request, then half-closes. nvelox must
 // strip that header, forward the REAL client in its own PROXY-v2 header, keep
 // payload bytes that arrived in the same segment, and still deliver the whole

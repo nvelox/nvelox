@@ -108,16 +108,20 @@ func ServeFastCGI(w http.ResponseWriter, r *http.Request, cfg config.FastCGIConf
 		mapFCGIHeaders,
 		func(inner gofast.SessionHandler) gofast.SessionHandler {
 			return func(client gofast.Client, req *gofast.Request) (*gofast.ResponsePipe, error) {
+				// Custom params first: the script variables below are set
+				// last, so no param can replace the checked script (the
+				// config load also refuses them).
+				for k, v := range cfg.Params {
+					req.Params[k] = expandFCGIVar(v, r)
+				}
 				req.Params["SCRIPT_FILENAME"] = scriptFilename
 				req.Params["SCRIPT_NAME"] = scriptName
 				req.Params["DOCUMENT_ROOT"] = docRoot
+				delete(req.Params, "PATH_TRANSLATED")
 				if pathInfo != "" {
 					req.Params["PATH_INFO"] = pathInfo
-				}
-
-				// Apply custom params
-				for k, v := range cfg.Params {
-					req.Params[k] = expandFCGIVar(v, r)
+				} else {
+					delete(req.Params, "PATH_INFO")
 				}
 
 				return inner(client, req)

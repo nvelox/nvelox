@@ -41,12 +41,13 @@ type staticFile struct {
 	path    string // real path on disk, symlinks resolved
 	urlPath string // URL path naming the file: the request path, or the directory path plus the index file name
 	script  bool   // a script (see isScriptFile): never served as a file
+	dir     bool   // a directory without an index file, listed (autoindex)
 }
 
 // Resolve maps urlPath to a file under the document root: dotfile segments
 // are refused, the path must stay inside the root before and after symlink
 // resolution (on a separator boundary), and a directory resolves to the first
-// existing entry of the index list.
+// existing entry of the index list — or, with autoindex, to itself (listed).
 //
 // Script files (.php, .phtml, .phar) are returned only when scripts is true —
 // the route can hand them to FastCGI — and then with script set; otherwise
@@ -110,6 +111,9 @@ func (h *StaticHandler) Resolve(urlPath string, scripts bool) (staticFile, bool)
 		}
 		return staticFile{path: realIdx, urlPath: path.Join(reqPath, idx), script: script}, true
 	}
+	if h.autoindex {
+		return staticFile{path: realPath, urlPath: reqPath, dir: true}, true
+	}
 	return staticFile{}, false
 }
 
@@ -118,6 +122,10 @@ func (h *StaticHandler) Resolve(urlPath string, scripts bool) (staticFile, bool)
 // from content sniffing, which would serve an uploaded .md / .log /
 // extension-less file that contains HTML as text/html.
 func (h *StaticHandler) Serve(w http.ResponseWriter, r *http.Request, f staticFile) {
+	if f.dir {
+		h.serveListing(w, r, f)
+		return
+	}
 	ctype := mime.TypeByExtension(filepath.Ext(f.path))
 	if ctype == "" {
 		ctype = "application/octet-stream"

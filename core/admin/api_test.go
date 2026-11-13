@@ -167,21 +167,21 @@ func TestAdminAPI_HostHeaderMustNameBind(t *testing.T) {
 		ok    []string
 		notOK []string
 	}{
-		{"10.0.0.130:9091",
-			[]string{"10.0.0.130:9091", "10.0.0.130", "[::ffff:10.0.0.130]:9091"},
-			[]string{"attacker.example:9091", "attacker.example", "localhost:9091", "127.0.0.1:9091", "10.0.0.131:9091", ""}},
+		{"10.20.0.10:9091",
+			[]string{"10.20.0.10:9091", "10.20.0.10", "[::ffff:10.20.0.10]:9091"},
+			[]string{"attacker.example:9091", "attacker.example", "localhost:9091", "127.0.0.1:9091", "10.20.0.11:9091", ""}},
 		{"127.0.0.1:9091",
 			[]string{"127.0.0.1:9091", "localhost:9091", "LOCALHOST", "[::1]:9091"},
-			[]string{"attacker.example:9091", "10.0.0.130:9091", "localhost.attacker.example:9091"}},
+			[]string{"attacker.example:9091", "10.20.0.10:9091", "localhost.attacker.example:9091"}},
 		{"[::1]:9091",
 			[]string{"[::1]:9091", "localhost:9091", "[::1]"},
 			[]string{"attacker.example:9091"}},
 		{":9091",
-			[]string{"10.0.0.130:9091", "192.0.2.1", "[2001:db8::1]:9091", "localhost:9091"},
+			[]string{"10.20.0.10:9091", "192.0.2.1", "[2001:db8::1]:9091", "localhost:9091"},
 			[]string{"attacker.example:9091", "gw.internal:9091"}},
 		{"gw.internal:9091",
 			[]string{"gw.internal:9091", "GW.internal"},
-			[]string{"10.0.0.130:9091", "attacker.example:9091", "localhost:9091"}},
+			[]string{"10.20.0.10:9091", "attacker.example:9091", "localhost:9091"}},
 	}
 	for _, c := range cases {
 		srv := NewServer(c.bind, testAPIKey, map[string]lb.Balancer{}, denylist.New())
@@ -207,9 +207,9 @@ func TestAdminAPI_HostHeaderMustNameBind(t *testing.T) {
 // cross-site, or carrying a foreign Origin, cannot change state even if it
 // somehow carries the key. Non-browser clients (no such headers) are fine.
 func TestAdminAPI_CrossOriginRefused(t *testing.T) {
-	srv := NewServer("10.0.0.130:9091", testAPIKey, map[string]lb.Balancer{}, denylist.New())
+	srv := NewServer("10.20.0.10:9091", testAPIKey, map[string]lb.Balancer{}, denylist.New())
 	post := func(hdr map[string]string) int {
-		req := httptest.NewRequest("POST", "http://10.0.0.130:9091/api/v1/denylist", strings.NewReader(`{"ip":"203.0.113.7","ttl_seconds":60}`))
+		req := httptest.NewRequest("POST", "http://10.20.0.10:9091/api/v1/denylist", strings.NewReader(`{"ip":"203.0.113.7","ttl_seconds":60}`))
 		req.RemoteAddr = "10.0.0.5:40000"
 		req.Header.Set("X-API-Key", testAPIKey)
 		req.Header.Set("Content-Type", "application/json")
@@ -232,7 +232,7 @@ func TestAdminAPI_CrossOriginRefused(t *testing.T) {
 		t.Fatal("a cross-origin POST changed the denylist")
 	}
 	if code := post(nil); code != http.StatusOK {
-		t.Fatalf("POST without browser headers (sentinel, curl): expected 200, got %d", code)
+		t.Fatalf("POST without browser headers (curl, scripts): expected 200, got %d", code)
 	}
 	if code := post(map[string]string{"Sec-Fetch-Site": "same-origin"}); code != http.StatusOK {
 		t.Errorf("same-origin POST: expected 200, got %d", code)
@@ -243,16 +243,16 @@ func TestAdminAPI_CrossOriginRefused(t *testing.T) {
 // Content-Type: application/json, so an HTML form (urlencoded, multipart,
 // text/plain) can never drive the API — including the body-less backend
 // actions that take their target from the query. A body-less DELETE
-// ?cidr= (what ngris-sentinel sends to unblock) needs none.
+// ?cidr= (what a script sends to unblock) needs none.
 func TestAdminAPI_RequiresJSONContentType(t *testing.T) {
 	balancers := map[string]lb.Balancer{"web": lb.NewRoundRobin([]string{"s1:80", "s2:80"})}
-	srv := NewServer("10.0.0.130:9091", testAPIKey, balancers, denylist.New())
+	srv := NewServer("10.20.0.10:9091", testAPIKey, balancers, denylist.New())
 	do := func(method, target, ctype, body string) int {
 		var rd io.Reader
 		if body != "" {
 			rd = strings.NewReader(body)
 		}
-		req := httptest.NewRequest(method, "http://10.0.0.130:9091"+target, rd)
+		req := httptest.NewRequest(method, "http://10.20.0.10:9091"+target, rd)
 		req.RemoteAddr = "10.0.0.5:40000"
 		req.Header.Set("X-API-Key", testAPIKey)
 		if ctype != "" {
@@ -356,11 +356,11 @@ func TestAdminAPI_Denylist(t *testing.T) {
 	}
 }
 
-// sentinelBlock, sentinelUnblock and sentinelPing build exactly the requests
-// ngris-sentinel sends (worker/enforce.go Block and Unblock,
-// worker/apiserver.go pingGateway). With apiKey "" no X-API-Key header is
-// set, as sentinel does when it has no key configured.
-func sentinelBlock(base, apiKey, ip string, ttlSec int) *http.Request {
+// scriptBlock, scriptUnblock and scriptPing build the requests a typical
+// non-browser API client sends: block (POST JSON), unblock (DELETE ?cidr=,
+// no body) and a health ping (GET). With apiKey "" no X-API-Key header is
+// set, as a client without a configured key does.
+func scriptBlock(base, apiKey, ip string, ttlSec int) *http.Request {
 	payload, _ := json.Marshal(map[string]interface{}{"ip": ip, "ttl_seconds": ttlSec})
 	req, _ := http.NewRequest(http.MethodPost, base+"/api/v1/denylist", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
@@ -370,7 +370,7 @@ func sentinelBlock(base, apiKey, ip string, ttlSec int) *http.Request {
 	return req
 }
 
-func sentinelUnblock(base, apiKey, ip string) *http.Request {
+func scriptUnblock(base, apiKey, ip string) *http.Request {
 	req, _ := http.NewRequest(http.MethodDelete, base+"/api/v1/denylist?cidr="+url.QueryEscape(ip), nil)
 	if apiKey != "" {
 		req.Header.Set("X-API-Key", apiKey)
@@ -378,7 +378,7 @@ func sentinelUnblock(base, apiKey, ip string) *http.Request {
 	return req
 }
 
-func sentinelPing(base, apiKey string) *http.Request {
+func scriptPing(base, apiKey string) *http.Request {
 	req, _ := http.NewRequest(http.MethodGet, base+"/api/v1/denylist", nil)
 	if apiKey != "" {
 		req.Header.Set("X-API-Key", apiKey)
@@ -386,17 +386,16 @@ func sentinelPing(base, apiKey string) *http.Request {
 	return req
 }
 
-// TestAdminAPI_SentinelClientCompat replays ngris-sentinel's three calls —
-// Block (POST JSON), Unblock (DELETE ?cidr=, no body, no Content-Type) and
-// the gateway ping (GET) — over real HTTP/1.1 against an admin API set up
-// like each gateway: bound to its private or WireGuard IP with an API key
-// and called by that IP, as sentinel's URLs do. Each call succeeds with the
+// TestAdminAPI_ScriptClientCompat replays those three calls — block (POST
+// JSON), unblock (DELETE ?cidr=, no body, no Content-Type) and the ping
+// (GET) — over real HTTP/1.1 against an admin API bound to a private or VPN
+// address with an API key and called by that address. Each call succeeds with the
 // key and is refused (401, nothing changes) without it or with a wrong one.
-func TestAdminAPI_SentinelClientCompat(t *testing.T) {
+func TestAdminAPI_ScriptClientCompat(t *testing.T) {
 	for _, bind := range []string{
-		"10.0.0.130:9091", "10.0.0.140:9091", // private-network gateways
-		"10.2.0.130:9091", "10.2.0.131:9091", "10.2.0.140:9091",
-		"10.10.0.2:9091", "10.10.0.3:9091", // edges: their WireGuard IP
+		"10.20.0.10:9091", "10.20.0.20:9091", // private-network gateways
+		"10.30.0.10:9091", "10.30.0.11:9091", "10.30.0.20:9091",
+		"10.40.0.2:9091", "10.40.0.3:9091", // VPN addresses
 	} {
 		t.Run(bind, func(t *testing.T) {
 			srv := NewServer(bind, testAPIKey, map[string]lb.Balancer{}, denylist.New())
@@ -438,10 +437,10 @@ func TestAdminAPI_SentinelClientCompat(t *testing.T) {
 			blocked := func() bool { return srv.dynDeny.Blocked(net.ParseIP(ip)) }
 
 			for _, key := range []string{"", "not-the-key"} {
-				if code, _ := do(sentinelBlock(base, key, ip, 3600)); code != http.StatusUnauthorized {
+				if code, _ := do(scriptBlock(base, key, ip, 3600)); code != http.StatusUnauthorized {
 					t.Errorf("Block with key %q: status %d, want 401", key, code)
 				}
-				if code, _ := do(sentinelPing(base, key)); code != http.StatusUnauthorized {
+				if code, _ := do(scriptPing(base, key)); code != http.StatusUnauthorized {
 					t.Errorf("ping with key %q: status %d, want 401", key, code)
 				}
 			}
@@ -449,26 +448,26 @@ func TestAdminAPI_SentinelClientCompat(t *testing.T) {
 				t.Fatal("an unauthenticated Block changed the denylist")
 			}
 
-			code, req := do(sentinelBlock(base, testAPIKey, ip, 3600))
+			code, req := do(scriptBlock(base, testAPIKey, ip, 3600))
 			if code != http.StatusOK || !blocked() {
 				t.Fatalf("Block with the key: status %d, blocked=%v", code, blocked())
 			}
 			if req.host != bind || req.ctype != "application/json" {
 				t.Errorf("Block arrived as Host %q, Content-Type %q", req.host, req.ctype)
 			}
-			if code, _ := do(sentinelPing(base, testAPIKey)); code != http.StatusOK {
+			if code, _ := do(scriptPing(base, testAPIKey)); code != http.StatusOK {
 				t.Fatalf("ping with the key: status %d", code)
 			}
 
 			for _, key := range []string{"", "not-the-key"} {
-				if code, _ := do(sentinelUnblock(base, key, ip)); code != http.StatusUnauthorized {
+				if code, _ := do(scriptUnblock(base, key, ip)); code != http.StatusUnauthorized {
 					t.Errorf("Unblock with key %q: status %d, want 401", key, code)
 				}
 			}
 			if !blocked() {
 				t.Fatal("an unauthenticated Unblock changed the denylist")
 			}
-			code, req = do(sentinelUnblock(base, testAPIKey, ip))
+			code, req = do(scriptUnblock(base, testAPIKey, ip))
 			if code != http.StatusOK || blocked() {
 				t.Fatalf("Unblock with the key: status %d, still blocked=%v", code, blocked())
 			}

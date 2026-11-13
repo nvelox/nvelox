@@ -17,6 +17,7 @@ import (
 
 	"nvelox/core/denylist"
 	"nvelox/core/logging"
+	"nvelox/core/servegate"
 	"nvelox/lb"
 )
 
@@ -88,6 +89,8 @@ func parseBind(bind string) bindInfo {
 // Server provides a REST API for runtime management.
 type Server struct {
 	httpServer *http.Server
+	serveGate  *servegate.Gate // Start serves once it opens (nil: at once)
+	gateDone   <-chan struct{}
 	balancers  map[string]lb.Balancer
 	// balancerSource, when set, returns the engine's current backend view: a
 	// map a reload never writes again (the engine publishes a fresh one), so
@@ -145,7 +148,7 @@ func NewServer(bind string, apiKey string, balancers map[string]lb.Balancer, dyn
 	// Before routing: the peer and Host checks, then the browser cross-origin
 	// (CSRF) check, which refuses a state-changing request that a browser
 	// marks cross-site (Sec-Fetch-Site) or whose Origin is not this host.
-	// Clients that send neither header (curl, ngris-sentinel) pass it.
+	// Clients that send neither header (curl, scripts, controllers) pass it.
 	s.httpServer = &http.Server{
 		Addr:              bind,
 		Handler:           s.guard(http.NewCrossOriginProtection().Handler(mux)),
@@ -361,6 +364,12 @@ func (s *Server) clearAuthFailures(ip string) {
 // background. A missing API key or an unparsable bind is an error: the
 // admin API never runs unauthenticated. A listen failure (port taken,
 // address not yet up) is logged and does not stop the proxy.
+// SetServeGate makes Start bind but serve nothing until gate opens; done
+// (closed at shutdown) ends the wait. Call before Start.
+func (s *Server) SetServeGate(gate *servegate.Gate, done <-chan struct{}) {
+	s.serveGate, s.gateDone = gate, done
+}
+
 func (s *Server) Start() error {
 	if s.apiKey == "" {
 		return errors.New("admin API: api_key is required (set admin.api_key)")
@@ -368,8 +377,18 @@ func (s *Server) Start() error {
 	if s.bind.err != nil {
 		return fmt.Errorf("admin API: %w", s.bind.err)
 	}
+	// Bind before returning (a busy port fails startup, and the socket is
+	// held before the process gives up root).
+	ln, err := net.Listen("tcp", s.httpServer.Addr)
+	if err != nil {
+		return fmt.Errorf("admin API: %w", err)
+	}
 	go func() {
-		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if !s.serveGate.Wait(s.gateDone) {
+			ln.Close()
+			return
+		}
+		if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 			logging.Error("[ADMIN] Server error: %v", err)
 		}
 	}()

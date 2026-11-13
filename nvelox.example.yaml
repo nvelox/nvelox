@@ -6,13 +6,20 @@ version: "2"
 # ─── Server Settings ───────────────────────────────────────
 server:
   # gateway_id: "gw-1"  # gw=<id> on HTTP access-log lines (default: hostname)
-  # user / group / pid_file / workers are accepted but NOT implemented:
-  # nvelox never drops privileges, writes no pid file and runs one process.
-  # When set (and the process is not already that user/group) nvelox prints a
-  # WARNING at startup. Run it under systemd User=/Group= with
-  # AmbientCapabilities=CAP_NET_BIND_SERVICE to bind ports below 1024.
+  # user / group: started as root, nvelox binds every port, hands its log
+  # files to this user and then runs as it (like nginx); nothing is served
+  # before the switch. It exits if it cannot switch. Not root: a startup
+  # WARNING, and it runs as it is. The config, certificates and log directory
+  # must be readable by this user for reloads and log reopens; a reload cannot
+  # add a port below 1024 (restart for that) and does not change the user.
+  # Keep the config and every file it names (certificates, keys, CA files,
+  # PROXY key files, error pages) NOT writable by this user: nvelox reads them
+  # as root at start. The log directory may be; as root, nvelox does not
+  # follow a symbolic link at a log path.
   # user: "nvelox"
   # group: "nvelox"
+  # pid_file / workers are accepted but not implemented (no pid file, one
+  # process); setting them prints a startup WARNING.
 
 # ─── Logging ───────────────────────────────────────────────
 # Log files are created 0640 in 0750 directories (an existing file is
@@ -57,7 +64,8 @@ admin:
   #   GET    /api/v1/denylist
   #   POST   /api/v1/denylist {"ip": "<ip or cidr>", "ttl_seconds": N}
   #          (ttl <= 0 = until restart; ranges wider than /8 IPv4 or
-  #          /16 IPv6 are refused)
+  #          /16 IPv6 are refused). Also closes the client's open
+  #          WebSocket tunnels, TCP/TLS connections and UDP sessions.
   #   DELETE /api/v1/denylist?cidr=<ip or cidr>
 
 # Hot reload: `kill -HUP $(pidof nvelox)` (or `systemctl reload nvelox`)
@@ -66,7 +74,9 @@ admin:
 # listener routes/ACL/headers, TLS certs (Let's Encrypt rotation), and
 # bind addresses (added or removed with 10s graceful drain). All-or-
 # nothing: pre-flight aborts the apply if any new bind addr is unbindable
-# or the new config is invalid. See examples/32-hot-reload.yaml.
+# or the new config is invalid. Open WebSocket tunnels are checked against
+# the new rules; one they would refuse is closed. See
+# examples/32-hot-reload.yaml.
 
 # ─── OpenTelemetry Tracing ─────────────────────────────────
 # tracing:
@@ -133,15 +143,47 @@ listeners:
     #   makes every IP-based control forgeable; prefer externalTrafficPolicy:
     #   Local and/or firewall the listener to the proxy.
     # accept_proxy_from: ["10.50.0.0/16"]
-    #   L4 inbound PROXY-protocol-v2 trust (tcp / https-passthrough listeners).
-    #   For connections from these CIDRs, nvelox parses the inbound PROXY-v2
-    #   header and uses its source as the real client (then forwards it via
-    #   send_proxy_v2 to the backend). Peers OUTSIDE the list have any inbound
-    #   PROXY header IGNORED — the real TCP peer is used — so a direct client
-    #   cannot spoof its source. Non-PROXY clients (browsers) pass through
-    #   unchanged. Empty (default) = trust nobody. Use this on a region's edge
-    #   to accept the PROXY-v2 header that a PEER region's tunnel-server relay
-    #   prepends, preserving the real client IP across a cross-region hop.
+    #   L4 inbound PROXY-protocol-v2 trust (tcp, https-passthrough and udp
+    #   listeners). For peers in these CIDRs, nvelox parses the inbound
+    #   PROXY-v2 header and uses its source as the real client (then forwards
+    #   it via send_proxy_v2 to the backend). Peers OUTSIDE the list have any
+    #   inbound PROXY header IGNORED and are the client themselves. Empty
+    #   (default) = trust nobody. Use this behind a relay (another nvelox,
+    #   HAProxy, a load balancer) that prepends a PROXY-v2 header, to keep the
+    #   real client IP across the hop.
+    #   TCP: the handshake proves the peer's address, so only a listed peer
+    #   can supply a header. UDP: a datagram's source address can be forged,
+    #   so anyone who can send packets claiming a listed address can name any
+    #   client. Protect a UDP relay with accept_proxy_key_file or
+    #   accept_proxy_interfaces, or list it only where the network drops
+    #   such packets before they reach this host (startup WARNING otherwise).
+    # accept_proxy_key_file: "/etc/nvelox/proxy.keys"
+    #   A trusted peer's PROXY header must carry a valid signature made with
+    #   one of these keys (one per line, at least 32 characters, e.g.
+    #   `openssl rand -hex 32`; "#" comments; chmod 600). An unsigned or
+    #   wrongly signed header refuses the TCP connection / drops the UDP
+    #   datagram; a peer that sends no header is itself the client. The
+    #   sending nvelox signs with send_proxy_key_file. Rotation without a
+    #   restart: add the new key on the receivers (SIGHUP), put it first on
+    #   the senders (SIGHUP), then remove the old key from the receivers.
+    # accept_proxy_interfaces: ["eth1"]
+    #   (udp listeners, Linux) A trusted peer's PROXY header counts only on
+    #   datagrams that arrived on one of these network interfaces — e.g. a
+    #   second network card, a VLAN or a tunnel that only the relays reach —
+    #   addressed to one of its addresses. A datagram claiming a listed
+    #   address that arrives on another interface is an ordinary client
+    #   datagram. For relays that cannot sign their headers.
+    #   The listener shares its port with sockets bound to these interfaces,
+    #   and any program on the machine can bind a UDP port shared that way:
+    #   where other users or services run on the machine, use a port below
+    #   1024 (only privileged programs bind those) or run nvelox alone in its
+    #   own container or VM. A program on this machine can also send from
+    #   the machine's own addresses, and such a datagram counts as arriving
+    #   on the interface that has the address: keep this machine's addresses
+    #   out of accept_proxy_from (a startup WARNING names them), and where
+    #   untrusted programs run here use accept_proxy_key_file instead. The
+    #   interfaces and their addresses are read at start: restart nvelox
+    #   after they change (a reload does not re-read them).
 
     # Timeouts (HTTP/HTTPS listeners). All values accept Go duration
     # strings ("30s", "5m", "1h"). An explicit "0" means unlimited.
@@ -180,6 +222,9 @@ listeners:
     # "/x/../admin" and "/%2e/admin" are "/admin"); a deny rule also matches
     # the path without ";params". Matching is case-sensitive: write
     # path_regex: "(?i)^/admin(/|$)" in front of a case-insensitive backend.
+    # A backslash ("\" or "%5C") is not a path separator and reaches the
+    # backend unchanged (as in nginx): in front of a backend that treats it
+    # as "/", match it too, e.g. path_regex: "^/admin([/\\\\]|$)".
     acl:
       - match:
           method: ["DELETE"]
@@ -264,6 +309,10 @@ listeners:
         static:
           root: "/var/www/html"
           index: ["index.html"]
+          # autoindex: true   # list a directory that has no index file (like
+          #                   # nginx autoindex): names, sizes and dates, no
+          #                   # dotfiles, no scripts, no symlinks out of the
+          #                   # root, at most 10,000 entries, GET/HEAD only
         try_files:
           files: ["$uri", "$uri/"]
           fallback: "/index.php$is_args$args"
@@ -296,17 +345,17 @@ listeners:
   # PROXY-v2 header's DESTINATION is the port the client actually hit (the
   # dedicated port), so the single backend listener can de-multiplex the whole
   # range from one socket — no per-port listener. accept_proxy_from lets the
-  # backend also trust a relayed inbound header (cross-region). This is how the
-  # tunnel-server serves 10k–100k dedicated ports without 10k–100k listeners.
+  # listener also trust a relayed inbound header. A PROXY-aware backend can
+  # serve 10k–100k dedicated ports this way without 10k–100k listeners.
   # - name: "dedicated-mux"
   #   bind: ":17000-17100"          # the dedicated range (grow as needed)
   #   protocol: "tcp"
   #   zero_copy: true
-  #   backend: "tunnel-mux"         # backend MUST specify an explicit port (the mux port)
-  #   accept_proxy_from: ["10.50.0.0/16"]   # trust relayed PROXY headers from peer regions
+  #   backend: "port-mux"           # backend MUST specify an explicit port (the mux port)
+  #   accept_proxy_from: ["10.50.0.0/16"]   # trust PROXY headers from your relays
   # (and a matching backend, e.g.)
   # backends:
-  #   - name: "tunnel-mux"
+  #   - name: "port-mux"
   #     servers: ["10.1.0.5:17999"]  # explicit mux port → all range ports land here
   #     send_proxy_v2: true
 
@@ -346,24 +395,25 @@ listeners:
     backend: "dns-servers"
 
   # ─── Dedicated-UDP MUX (range → one backend UDP port) ──
-  # The UDP counterpart of "dedicated-mux" above (cross-region UDP). Funnel the
+  # The UDP counterpart of "dedicated-mux" above. Funnel the
   # whole dedicated UDP range to ONE backend UDP port (give the backend an
   # explicit port so nvelox does NOT append the listener port). With
   # send_proxy_v2 the per-datagram PROXY-v2 DGRAM header's DESTINATION is the
-  # dedicated port the client hit, so the tunnel-server UDP mux de-multiplexes the
-  # whole range from one socket. accept_proxy_from trusts a peer-region relay's
-  # inbound header so the REAL client (not the relay) is preserved end-to-end.
-  # NOTE: the mux backend port must be firewalled to nvelox/peer-regions only —
-  # it trusts the PROXY header. See docs/CROSS_REGION_TCP_UDP_PROXY.md (#77).
+  # dedicated port the client hit, so a PROXY-aware backend de-multiplexes the
+  # whole range from one socket. accept_proxy_from trusts a relay's inbound
+  # header so the REAL client (not the relay) is preserved end-to-end — over
+  # UDP only where the network drops forged relay addresses (see
+  # accept_proxy_from above). NOTE: the mux backend port must be firewalled to
+  # nvelox only — it trusts the PROXY header.
   # - name: "dedicated-udp-mux"
   #   bind: ":17000-17100"          # the dedicated UDP range
   #   protocol: "udp"
-  #   backend: "tunnel-udp-mux"     # backend MUST specify an explicit port (the UDP mux port)
-  #   accept_proxy_from: ["10.50.0.0/16"]   # trust relayed PROXY headers from peer regions
+  #   backend: "udp-port-mux"       # backend MUST specify an explicit port (the UDP mux port)
+  #   accept_proxy_from: ["10.50.0.0/16"]   # trust PROXY headers from your relays
   # (and a matching backend, e.g.)
   # backends:
-  #   - name: "tunnel-udp-mux"
-  #     servers: ["10.1.0.5:7444"]  # explicit UDP mux port (TUNNEL_SERVER_UDP_MUX_PORT)
+  #   - name: "udp-port-mux"
+  #     servers: ["10.1.0.5:7444"]  # explicit UDP mux port
   #     send_proxy_v2: true
 
 # ═══════════════════════════════════════════════════════════
@@ -380,6 +430,9 @@ backends:
     #   - UDP backends: header prepended to each datagram (DGRAM variant)
     #     so QUIC/HTTP3 backends can recover the client IP per packet.
     send_proxy_v2: false
+    # send_proxy_key_file: "/etc/nvelox/proxy.keys"  # sign the header (with
+    #   the first key) for a receiver that sets accept_proxy_key_file; for
+    #   UDP every datagram's header is signed over that datagram
 
     # Timeouts (override listener defaults)
     timeouts:

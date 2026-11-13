@@ -46,7 +46,7 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 - **Redirect Rules** — 301/302 with variable substitution (`${host}`, `${path}`, `${uri}`, `${scheme}`, `${query}`, `${port}`)
 
 ### Static Files & PHP
-- **Static File Serving** — serve from document root with directory index support
+- **Static File Serving** — serve from document root with directory index support and optional directory listings (`autoindex`)
 - **try_files** — nginx-style `$uri`, `$uri/`, `/fallback$is_args$args`
 - **expires** — `1y`, `30d`, `1h`, `-1` (no-cache), sets Cache-Control/Expires headers
 - **FastCGI (PHP-FPM)** — forward to PHP-FPM via TCP or Unix socket with `split_path_info`, custom params
@@ -56,6 +56,8 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 - **Client Certificate Auth (mTLS)** — `client_auth: require` / `request` with `client_ca` verification on TLS-terminating TCP, HTTPS and HTTP/3 listeners; per site (by SNI) when sites share a port
 - **ACLs** — match by source IP/CIDR, HTTP method, path, headers; allow/deny actions (TCP/UDP listeners: source IP only)
 - **IP Allowlist/Denylist** — CIDR-based per-listener filtering on HTTP, TCP and UDP listeners (behind a trusted PROXY v2 relay, on the client it names)
+- **Signed PROXY v2 headers** — relays and receivers share a key so a forged header (a spoofed UDP source) cannot name a client; keys rotate on reload
+- **Interface-bound relay trust** — for UDP relays that cannot sign: trust their PROXY headers only on datagrams that arrived on chosen network interfaces (`accept_proxy_interfaces`, Linux)
 - **Per-IP Rate Limiting** — token bucket per client IP with LRU cleanup
 - **Per-Listener Rate Limiting** — global connection rate limit
 - **Request Body Size Limit** — reject oversized request bodies
@@ -81,13 +83,13 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 - **Per-Request Access Logging** — method, path, status, bytes, latency, backend in CLF format
 - **Prometheus Metrics** — `/metrics` endpoint with counters, gauges, histograms
 - **Admin REST API** — runtime stats, drain/enable/disable servers
-- **Hot Reload** — SIGHUP reloads the whole config without dropping in-flight connections: backends (with sticky / CB / LeastConn state preserved on rename), per-listener routes / ACL / headers / error pages, TLS certs (Let's Encrypt rotation), and bind addresses (added or removed with 10s graceful drain). Pre-flight port-availability check ensures all-or-nothing apply.
+- **Hot Reload** — SIGHUP reloads the whole config without dropping in-flight connections: backends (with sticky / CB / LeastConn state preserved on rename), per-listener routes / ACL / headers / error pages, TLS certs (Let's Encrypt rotation), and bind addresses (added or removed with 10s graceful drain). Pre-flight port-availability check ensures all-or-nothing apply. Open WebSocket tunnels are checked against the new rules: a tunnel the new config would refuse (IP lists, ACL, route, backend server) is closed, the others keep running.
 
 ### Extensibility
 - **PROXY Protocol v2** — pass client IP to backends in HAProxy format; accept it from trusted relays (`accept_proxy_from`)
 - **DNS Service Discovery** — periodic hostname resolution with auto-update
 - **Modular Config** — split configs via `include` glob patterns
-- **Config Validation** — comprehensive validation at load time; keys that are parsed but not implemented (`sni_routes`, `throttle`, `tls.ocsp_stapling`, `routes[].scripts`) are rejected with an error naming the key, and `server.user` / `group` / `pid_file` / `workers` print a startup warning (nvelox does not drop privileges: run it under systemd `User=` with `CAP_NET_BIND_SERVICE`)
+- **Config Validation** — comprehensive validation at load time; keys that are parsed but not implemented (`sni_routes`, `throttle`, `tls.ocsp_stapling`, `routes[].scripts`) are rejected with an error naming the key, and `server.pid_file` / `workers` print a startup warning. Started as root with `server.user` / `group`, nvelox binds its ports and then switches to that user
 
 ## Architecture
 
@@ -293,6 +295,7 @@ backends:
 - `POST` requests need `Content-Type: application/json` (the body-less backend actions too), and browser cross-site requests (`Sec-Fetch-Site` / `Origin`) are refused with 403.
 - A valid key is always served. After 10 failed attempts from one IP within 10 minutes, that IP's further *failures* get `429` (with `Retry-After`) for 15 minutes.
 - The denylist refuses ranges wider than an IPv4 `/8` or an IPv6 `/16` (`0.0.0.0/0`, `::/0`, `::ffff:0:0/96`, …). `ttl_seconds` ≤ 0 keeps an entry until restart.
+- Adding an entry also closes what that client has open: WebSocket tunnels, L4 TCP and TLS connections and UDP sessions.
 
 ```bash
 KEY=...   # admin.api_key

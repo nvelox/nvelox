@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,16 +24,21 @@ import (
 	"nvelox/core/httpproxy"
 	"nvelox/core/logging"
 	"nvelox/core/metrics"
+	"nvelox/core/servegate"
 	"nvelox/core/sticky"
 	"nvelox/core/tlsutil"
 	"nvelox/lb"
+	"nvelox/proxy"
 
 	"github.com/lesismal/nbio"
 	"github.com/pires/go-proxyproto"
 )
 
 type Engine struct {
-	UDPEngine       *nbio.Engine
+	UDPEngine *nbio.Engine
+	// UDPIfaceEngine serves the interface-bound sockets of udp listeners with
+	// accept_proxy_interfaces (udpdevice.go).
+	UDPIfaceEngine  *nbio.Engine
 	Listeners       []*ListenerConfig
 	Config          *config.Config
 	Balancers       map[string]lb.Balancer
@@ -55,18 +61,27 @@ type Engine struct {
 	tlsListeners    []net.Listener              // TLS listeners to close on shutdown
 	tcpListeners    []tcpListener               // plain L4 TCP listeners (std accept loop + relayL4)
 	acceptWG        sync.WaitGroup              // L4 TCP/TLS accept loops; waited on before closing live conns
-	l4Conns         sync.Map                    // live L4 TCP/TLS client conns (net.Conn -> struct{}), closed on shutdown
+	l4Conns         sync.Map                    // live L4 TCP/TLS client conns (net.Conn -> *l4Client), closed on shutdown
 	runCtx          context.Context             // Start's ctx: cancels in-flight L4 backend dials on shutdown
 	reloadMu        sync.Mutex                  // serializes concurrent SIGHUPs
 	view            atomic.Pointer[backendView] // what request paths read (backendview.go)
-	configPath      string                      // path for reload
+	ready           chan struct{}               // closed once Start holds every listening socket
+	serveGate       *servegate.Gate             // HoldServing: sockets serve nothing until Serve
+	// l4Running: the L4 (tcp, udp) listener configs Start began serving,
+	// keyed by protocol, name and address. A reload does not rebuild them;
+	// it only swaps their PROXY signing keys (rotation).
+	l4Running  map[string]*ListenerConfig
+	configPath string // path for reload
 
 	// UDP session limits (see udpsession.go). Set from code constants in
 	// NewEngine — deliberately not configurable; tests lower them.
 	udpMaxSessions      int
 	udpMaxSessionsPerIP int
 	udpNoReplyTimeout   time.Duration
-	l4Handler           *ProxyEventHandler // set by Start (under reloadMu)
+	// udpRelayPendingTimeout ends a trusted relay's session no header has
+	// reached (udpsession.go).
+	udpRelayPendingTimeout time.Duration
+	l4Handler              *ProxyEventHandler // set by Start (under reloadMu)
 }
 
 type ListenerConfig struct {
@@ -91,6 +106,7 @@ type ListenerConfig struct {
 	TrustedProxies  []string
 	AcceptProxyFrom []string
 	proxyTrust      *proxyTrust // parsed once from AcceptProxyFrom (inbound PROXY-v2 trust)
+	proxyInterfaces []string    // accept_proxy_interfaces (udp): trust only datagrams that arrived on them
 	ServerNames     []string
 	DefaultServer   bool
 	Compression     config.CompressionConfig
@@ -106,8 +122,34 @@ type ListenerConfig struct {
 	prepared   bool
 }
 
+// l4Key identifies an L4 listener across a reload.
+func l4Key(l *ListenerConfig) string { return l.Protocol + "|" + l.Name + "|" + l.Addr }
+
+// Ready is closed once Start has bound every listening socket (HTTP, HTTPS
+// and HTTP/3, TCP, UDP, admin API, metrics). main switches to server.user /
+// server.group only then.
+func (e *Engine) Ready() <-chan struct{} { return e.ready }
+
+// HoldServing makes Start bind every socket but serve nothing until Serve:
+// main switches to server.user in between, so nothing is answered with root
+// rights. Call it before Start. Connections wait in the kernel's accept
+// queue meanwhile; a UDP datagram's session waits in OnOpen.
+func (e *Engine) HoldServing() { e.serveGate = servegate.New() }
+
+// Serve lets the sockets Start bound serve (after HoldServing).
+func (e *Engine) Serve() { e.serveGate.Open() }
+
+// runDone is closed when Start's context ends (nil before Start).
+func (e *Engine) runDone() <-chan struct{} {
+	if e.runCtx == nil {
+		return nil
+	}
+	return e.runCtx.Done()
+}
+
 func NewEngine(cfg *config.Config) *Engine {
 	e := &Engine{
+		ready:           make(chan struct{}),
 		Listeners:       make([]*ListenerConfig, 0),
 		Config:          cfg,
 		Balancers:       make(map[string]lb.Balancer),
@@ -121,9 +163,10 @@ func NewEngine(cfg *config.Config) *Engine {
 		DNSResolvers:    make(map[string]*discovery.DNSResolver),
 		Metrics:         metrics.Default,
 
-		udpMaxSessions:      maxUDPSessions,
-		udpMaxSessionsPerIP: maxUDPSessionsPerIP,
-		udpNoReplyTimeout:   udpNoReplyTimeout,
+		udpMaxSessions:         maxUDPSessions,
+		udpMaxSessionsPerIP:    maxUDPSessionsPerIP,
+		udpNoReplyTimeout:      udpNoReplyTimeout,
+		udpRelayPendingTimeout: udpRelayPendingTimeout,
 	}
 	return e
 }
@@ -178,6 +221,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	// on ctx; the shutdown path snapshots BindGroups under it again.
 	e.reloadMu.Lock()
 	startupLocked := true
+	e.runCtx = ctx
 	defer func() {
 		if startupLocked {
 			e.reloadMu.Unlock()
@@ -191,6 +235,12 @@ func (e *Engine) Start(ctx context.Context) error {
 		return err
 	}
 	warnInsecureBackendTLS(e.Config.Backends)
+	e.l4Running = make(map[string]*ListenerConfig)
+	for _, l := range e.Listeners {
+		if l.Protocol == "tcp" || l.Protocol == "udp" {
+			e.l4Running[l4Key(l)] = l
+		}
+	}
 
 	// 1. Initialize Backends & Health Checkers
 	e.initBackends()
@@ -211,6 +261,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	if e.Config.Admin.Enabled {
 		e.AdminServer = admin.NewServer(e.Config.Admin.Bind, e.Config.Admin.APIKey, nil, denylist.Default)
 		e.AdminServer.SetBalancerSource(func() map[string]lb.Balancer { return e.backends().Balancers })
+		e.AdminServer.SetServeGate(e.serveGate, ctx.Done())
 		if err := e.AdminServer.Start(); err != nil {
 			return err
 		}
@@ -228,8 +279,17 @@ func (e *Engine) Start(ctx context.Context) error {
 		mux := http.NewServeMux()
 		mux.Handle(metricsPath, e.Metrics.Handler())
 		e.metricsServer = newMetricsServer(e.Config.Metrics.Bind, mux)
+		// Bound here, like every listener, before Start reports ready.
+		mln, err := net.Listen("tcp", e.metricsServer.Addr)
+		if err != nil {
+			return fmt.Errorf("metrics endpoint: %w", err)
+		}
 		go func() {
-			if err := e.metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			if !e.serveGate.Wait(ctx.Done()) {
+				mln.Close()
+				return
+			}
+			if err := e.metricsServer.Serve(mln); err != nil && err != http.ErrServerClosed {
 				logging.Error("[METRICS] Server error: %v", err)
 			}
 		}()
@@ -264,6 +324,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	for _, addr := range bindOrder {
 		group := bindGroups[addr]
 		bg := httpproxy.NewBindGroup(addr, group[0].listener.Protocol)
+		bg.SetServeGate(e.serveGate, ctx.Done())
 		for _, s := range group {
 			bg.AddSite(s.site)
 		}
@@ -286,8 +347,6 @@ func (e *Engine) Start(ctx context.Context) error {
 	// 2. Setup Handler
 	handler := NewProxyEventHandler(e)
 	e.l4Handler = handler
-
-	e.runCtx = ctx
 
 	// 3. L4 TCP listeners. Plain (non-TLS) listeners run a std accept loop
 	// with one relayL4 goroutine pair per connection; TLS-terminating
@@ -322,15 +381,25 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 
 	// 4. Setup UDP Engine
-	udpAddrs := e.getAddrs("udp")
+	plan, err := e.planUDPInterfaces()
+	if err != nil {
+		return err
+	}
+	var udpAddrs []string
+	for _, a := range e.getAddrs("udp") {
+		if !plan.onDevice[a] {
+			udpAddrs = append(udpAddrs, a)
+		}
+	}
 	if len(udpAddrs) > 0 {
 		conf := nbio.Config{
 			Network:        "udp",
 			Addrs:          udpAddrs,
 			UDPReadTimeout: 60 * time.Second,
+			ListenUDP:      plan.listenShared,
 		}
 		e.UDPEngine = nbio.NewEngine(conf)
-		e.UDPEngine.OnOpen(handler.OnOpen)
+		e.UDPEngine.OnOpen(func(c *nbio.Conn) { handler.onOpen(c, false) })
 		e.UDPEngine.OnData(handler.OnData)
 		e.UDPEngine.OnClose(handler.OnClose)
 
@@ -339,10 +408,32 @@ func (e *Engine) Start(ctx context.Context) error {
 		}
 		logging.Info("NBIO UDP Engine Started on %d listeners", len(udpAddrs))
 	}
+	if len(plan.deviceAddrs) > 0 {
+		conf := nbio.Config{
+			Network:        "udp",
+			Addrs:          plan.deviceAddrs,
+			UDPReadTimeout: 60 * time.Second,
+			ListenUDP:      plan.listenDevice,
+		}
+		e.UDPIfaceEngine = nbio.NewEngine(conf)
+		// Every session of this engine arrived on a listed interface.
+		e.UDPIfaceEngine.OnOpen(func(c *nbio.Conn) { handler.onOpen(c, true) })
+		e.UDPIfaceEngine.OnData(handler.OnData)
+		e.UDPIfaceEngine.OnClose(handler.OnClose)
+		if err := e.UDPIfaceEngine.Start(); err != nil {
+			return fmt.Errorf("UDP interface engine start failed: %v", err)
+		}
+		logging.Info("UDP accept_proxy_interfaces sockets started on %v", plan.deviceAddrs)
+	}
 
-	// 5. Wait for Context. Reloads may run from here on.
+	// 5. Every socket is bound: report ready, then wait for the context.
+	// Reloads may run from here on. A dynamic denylist add also ends what
+	// the blocked client has open (denyclose.go).
 	startupLocked = false
 	e.reloadMu.Unlock()
+	stopDenyClose := denylist.Default.OnAdd(e.closeDenylisted)
+	defer stopDenyClose()
+	close(e.ready)
 	<-ctx.Done()
 
 	logging.Info("Stopping Engines...")
@@ -382,6 +473,9 @@ func (e *Engine) Start(ctx context.Context) error {
 	// Stop the nbio UDP engine
 	if e.UDPEngine != nil {
 		e.UDPEngine.Stop()
+	}
+	if e.UDPIfaceEngine != nil {
+		e.UDPIfaceEngine.Stop()
 	}
 
 	// Drain active L4 connections
@@ -476,6 +570,27 @@ func (e *Engine) Reload(cfg *config.Config) error {
 	}
 
 	// Pre-flight passed — apply mutations.
+	// L4 listeners keep running as configured at start, except for their
+	// PROXY signing keys, which take the re-read key files (rotation) — but
+	// only while accept_proxy_from and accept_proxy_interfaces are
+	// unchanged: new keys under the old trust would mix two configs (old
+	// relay ranges with no key at all, say). A trust change needs a
+	// restart; until then the listener keeps its trust and keys.
+	for _, l := range expanded {
+		running := e.l4Running[l4Key(l)]
+		if running == nil || running.proxyTrust == nil || l.proxyTrust == nil {
+			continue
+		}
+		if !slices.Equal(running.AcceptProxyFrom, l.AcceptProxyFrom) || !slices.Equal(running.proxyInterfaces, l.proxyInterfaces) {
+			logging.Warn("[RELOAD] listener %s: accept_proxy_from or accept_proxy_interfaces changed; restart nvelox to apply that (until then it keeps its current PROXY trust and keys)", l.Name)
+			continue
+		}
+		var keys [][]byte
+		if k := l.proxyTrust.keys.Load(); k != nil {
+			keys = *k
+		}
+		running.proxyTrust.setKeys(keys)
+	}
 	warnInsecureBackendTLS(cfg.Backends)
 	e.Config = cfg
 	beAdded, beRemoved, beUpdated := e.reconcileBackends(cfg)
@@ -595,6 +710,7 @@ func (e *Engine) reloadL7Sites(expanded []*ListenerConfig) (swapped, added, remo
 	for _, addr := range newAddrs {
 		g := newGroups[addr]
 		bg := httpproxy.NewBindGroup(addr, g.protocol)
+		bg.SetServeGate(e.serveGate, e.runDone())
 		for _, s := range g.sites {
 			bg.AddSite(s)
 		}
@@ -691,7 +807,8 @@ func ExpandListeners(listeners []config.Listener) ([]*ListenerConfig, error) {
 			ACL:             l.ACL,
 			TrustedProxies:  l.TrustedProxies,
 			AcceptProxyFrom: l.AcceptProxyFrom,
-			proxyTrust:      newProxyTrust(l.AcceptProxyFrom),
+			proxyTrust:      newProxyTrust(l.AcceptProxyFrom, l.AcceptProxyKeys),
+			proxyInterfaces: l.AcceptProxyInterfaces,
 			ServerNames:     l.ServerNames,
 			DefaultServer:   l.DefaultServer,
 			Compression:     l.Compression,
@@ -1053,6 +1170,9 @@ func (e *Engine) startTLSListener(l *ListenerConfig, handler *ProxyEventHandler)
 			Listener:          raw,
 			Policy:            pol,
 			ReadHeaderTimeout: tlsProxyHeaderTimeout,
+			// With accept_proxy_key_file a trusted peer's header must be
+			// signed; the library drops the connection otherwise.
+			ValidateHeader: func(h *proxyproto.Header) error { return l.proxyTrust.verify(h, nil, false) },
 		}
 		logging.Info("TLS listener %s accepts inbound PROXY-v2 from %v", l.Name, l.AcceptProxyFrom)
 	}
@@ -1114,7 +1234,10 @@ func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *
 	}()
 
 	// Access policy (static lists, ACL, dynamic denylist) on the resolved
-	// client, before the handshake: a refused client costs no crypto.
+	// client, before the handshake: a refused client costs no crypto. The
+	// client is recorded first, so a block added after the check still finds
+	// the connection (closeDenylisted).
+	e.setL4Client(clientConn, ipOf(client))
 	if ok, st := handler.l4Admit(l, ipOf(client)); !ok {
 		status = st
 		return
@@ -1198,6 +1321,12 @@ func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *
 	// Send PROXY v2 if configured
 	if backend != nil && backend.SendProxyV2 {
 		header := proxyproto.HeaderProxyFromAddrs(2, client, backendConn.LocalAddr())
+		if len(backend.SendProxyKey) > 0 {
+			if err := proxy.SignHeader(header, backend.SendProxyKey, time.Now()); err != nil {
+				logging.Error("Failed to sign PROXY v2 header on TLS conn: %v", err)
+				return
+			}
+		}
 		if _, err := header.WriteTo(backendConn); err != nil {
 			logging.Error("Failed to write PROXY v2 header on TLS conn: %v", err)
 			return

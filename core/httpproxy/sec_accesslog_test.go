@@ -17,7 +17,7 @@ import (
 // the raw writer, not the recorder), and every early return — IP / ACL
 // denies, rate limits, redirects, cache hits, WebSocket upgrades — wrote no
 // access-log line at all (AccessHTTP ran only at the end of the proxy path).
-// The sentinel reads these lines. Now every response gets exactly one line
+// Log parsers and blockers read these lines. Now every response gets exactly one line
 // with the status the client was sent.
 
 type secDenyAll struct{}

@@ -159,8 +159,8 @@ func TestAccessHTTP_UAClipped(t *testing.T) {
 	}
 }
 
-// TestAccessL4_Format locks the L4 access-line format to exactly what the
-// ngris-sentinel parser (l4Re) expects: "<ip> - l4 <proto>/<port> <status> <in> <out> <durMs>ms".
+// TestAccessL4_Format locks the L4 access-line format log parsers rely on:
+// "<ip> - l4 <proto>/<port> <status> <in> <out> <durMs>ms".
 func TestAccessL4_Format(t *testing.T) {
 	tmpDir := t.TempDir()
 	accessPath := filepath.Join(tmpDir, "access.log")

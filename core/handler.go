@@ -55,14 +55,14 @@ type ConnContext struct {
 	BalancerRef   lb.Balancer // Reference for OnDisconnect in OnClose
 	// L4 access logging (one record per connection at close, via logging.AccessL4):
 	// the protocol, the dialed (listener) port, and the REAL client — the
-	// PROXY-v2-decoded source for a cross-region/trusted peer, NOT the relay. Proto
+	// PROXY-v2-decoded source behind a trusted relay, NOT the relay. Proto
 	// and DstPort are set once at OnOpen; RealClientIP defaults to the peer and is
 	// upgraded to the parsed client when a trusted inbound PROXY-v2 header resolves.
 	// PeerTrusted: the immediate peer is a trusted relay (its inbound PROXY-v2 header
 	// names the real client). ClientResolved: that header was actually parsed, so
 	// RealClientIP is the real client. When PeerTrusted && !ClientResolved we must NOT
-	// emit an L4 record — attributing it to the relay could get a peer-region relay
-	// scored/blocked (a cross-region outage).
+	// emit an L4 record — attributing it to the relay could get the relay itself
+	// blocked by whatever acts on the access log (cutting off all its clients).
 	Proto          string
 	DstPort        int
 	RealClientIP   string
@@ -73,8 +73,8 @@ type ConnContext struct {
 	// backend has send_proxy_v2: true (or, for StripInbound conns, in OnData
 	// once the real client is recovered from the inbound header).
 	ProxyHeader []byte
-	// StripInbound (UDP, cross-region #77 / N1): this listener trusts an inbound
-	// PROXY-v2 header from the immediate peer (a peer-region relay). OnData then
+	// StripInbound (UDP): this listener trusts an inbound PROXY-v2 header from
+	// the immediate peer (a relay). OnData then
 	// strips a per-datagram DGRAM header and builds the OUTBOUND header from the
 	// parsed REAL client instead of the relay's address. SendProxyV2/LocalAddr are
 	// snapshotted so OnData can build that header (src = real client, dst =
@@ -85,19 +85,31 @@ type ConnContext struct {
 	Mu           sync.Mutex
 
 	// UDP session bookkeeping, released by OnClose. listener is the session's
-	// listener (OnData admits a relayed client against it). sessionIP is the
-	// client IP the session is charged to in the per-IP limit (zero until a
-	// trusted relay's client is known). limiter is the backend
-	// max_connections slot the session holds, if any. resolvedSrc is the
-	// client a trusted relay's first header named. refused is the access-log
-	// status when the session was refused after OnOpen. closed is set by
-	// OnClose so a late OnData cannot charge a released session.
-	listener    *ListenerConfig
-	sessionIP   netip.Addr
-	limiter     *ConnLimiter
-	resolvedSrc net.Addr
-	refused     string
-	closed      bool
+	// listener (OnData admits a relayed client against it). slotHeld: the
+	// session holds a session slot, charged to sessionIP in the per-IP limit.
+	// relayPending: a trusted relay's session whose client no valid header
+	// has named yet — it holds no slot, no backend slot and no backend
+	// connection (H5). limiter is the backend max_connections slot the
+	// session holds, if any. resolvedSrc is the client a trusted relay's
+	// first header named. refused is the access-log status when the session
+	// was refused after OnOpen. closed is set by OnClose so a late OnData
+	// cannot charge a released session.
+	listener     *ListenerConfig
+	slotHeld     bool
+	relayPending bool
+	sessionIP    netip.Addr
+	limiter      *ConnLimiter
+	resolvedSrc  net.Addr
+	refused      string
+	closed       bool
+	// pendingHeld: the session holds a place among the relay sessions
+	// waiting for a header (udpSessionLimiter.acquirePending), and
+	// pendingTimer ends it if no header comes. viaInterface: the session
+	// arrived on a socket bound to one of the listener's
+	// accept_proxy_interfaces (part of its backend-socket key).
+	pendingHeld  bool
+	pendingTimer *time.Timer
+	viaInterface bool
 }
 
 func (h *ProxyEventHandler) setCtx(c *nbio.Conn, ctx *ConnContext) {
@@ -122,9 +134,18 @@ func (h *ProxyEventHandler) deleteCtx(c *nbio.Conn) {
 // a trusted relay's client is admitted in OnData once its PROXY header names
 // it) -> session limits -> backend max_connections -> backend socket.
 // Every refusal closes through closeOnOpen, never synchronously.
-func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
+func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) { h.onOpen(c, false) }
+
+// onOpen is OnOpen for a session that arrived on a socket bound to one of the
+// listener's accept_proxy_interfaces (viaListedInterface) or not.
+func (h *ProxyEventHandler) onOpen(c *nbio.Conn, viaListedInterface bool) {
 	// Backend connections from DialAsync already have session set in callback
 	if h.getCtx(c) != nil {
+		return
+	}
+	// Nothing is served before the process gave up root (Engine.HoldServing).
+	if h.engine != nil && !h.engine.serveGate.Wait(h.engine.runDone()) {
+		closeOnOpen(c)
 		return
 	}
 
@@ -143,11 +164,16 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 	}
 
 	dstPort := portOf(localAddr)
-	// Is the immediate peer a TRUSTED relay (cross-region)? Its inbound PROXY-v2
+	// Is the immediate peer a TRUSTED relay (accept_proxy_from)? Its inbound PROXY-v2
 	// header names the REAL client — but that isn't parsed until after the backend
 	// dial, so until then an L4 record can only carry the relay IP. Track it so the
-	// emit paths can suppress a relay-misattributed record (cross-region-outage risk).
-	peerTrusted := l.proxyTrust != nil && l.proxyTrust.trusts(c.RemoteAddr())
+	// emit paths can suppress a record that would blame the relay for its clients.
+	// With accept_proxy_interfaces the datagram must also have arrived on one
+	// of them, that is on a socket bound to one (the interface engine,
+	// udpdevice.go): a forged relay source arriving anywhere else is an
+	// ordinary client.
+	peerTrusted := l.proxyTrust.trusts(c.RemoteAddr()) &&
+		(len(l.proxyInterfaces) == 0 || viaListedInterface)
 
 	// Check rate limit
 	if rl, ok := h.engine.RateLimiters[l.Name]; ok {
@@ -164,26 +190,64 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 		}
 	}
 
-	// Access policy (ip_denylist, the dynamic sentinel-pushed denylist,
-	// ip_allowlist, acl) on the immediate peer when it IS the client
-	// (untrusted/direct). For a trusted relay the peer is infra and the real
-	// client isn't known until OnData parses its PROXY-v2 header (gated there).
-	var sessionIP netip.Addr
-	if !peerTrusted {
-		ip := ipOf(c.RemoteAddr())
-		if ok, status := h.l4Admit(l, ip); !ok {
-			logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, status, 0, 0, 0)
+	// A trusted relay names the real client in the PROXY-v2 header of every
+	// datagram, which OnData checks. Until a valid header names a client the
+	// policy admits, the session holds no session slot, no backend slot and
+	// no backend connection (H5): a datagram without one ends it at once, so
+	// a source forged to look like a relay cannot hold capacity. The timer
+	// ends a session whose first datagram never reaches OnData.
+	if peerTrusted {
+		// Such sessions hold no session slot, so they have a cap of their
+		// own; a session no header reaches (an empty datagram) ends after
+		// udpRelayPendingTimeout.
+		if reason := h.udpSessions.acquirePending(); reason != "" {
+			h.udpDrops.note(reason, l.Name, c.RemoteAddr())
 			closeOnOpen(c)
 			return
 		}
-		sessionIP = addrKey(ip)
+		h.engine.ActiveConns.Add(1)
+		relayCtx := &ConnContext{
+			IsBackend:    false,
+			StartTime:    time.Now(),
+			Proto:        l.Protocol,
+			DstPort:      dstPort,
+			RealClientIP: ipStrOf(c.RemoteAddr()), // the relay until a header names the client
+			PeerTrusted:  true,
+			StripInbound: true,
+			LocalAddr:    c.LocalAddr(),
+			listener:     l,
+			relayPending: true,
+			pendingHeld:  true,
+			viaInterface: viaListedInterface,
+		}
+		h.setCtx(c, relayCtx)
+		relayCtx.Mu.Lock()
+		relayCtx.pendingTimer = time.AfterFunc(h.engine.udpRelayPendingTimeout, func() {
+			relayCtx.Mu.Lock()
+			pending := relayCtx.relayPending && !relayCtx.closed
+			relayCtx.Mu.Unlock()
+			if pending {
+				_ = c.Close()
+			}
+		})
+		relayCtx.Mu.Unlock()
+		return
 	}
 
-	// Session limits: a global cap and a per-client-IP cap (a trusted relay's
-	// client is charged in OnData).
+	// Access policy (ip_denylist, the dynamic admin-API denylist,
+	// ip_allowlist, acl) on the immediate peer, which IS the client.
+	ip := ipOf(c.RemoteAddr())
+	if ok, status := h.l4Admit(l, ip); !ok {
+		logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, status, 0, 0, 0)
+		closeOnOpen(c)
+		return
+	}
+	sessionIP := addrKey(ip)
+
+	// Session limits: a global cap and a per-client-IP cap.
 	if reason := h.udpSessions.acquire(sessionIP); reason != "" {
 		h.udpDrops.note(reason, l.Name, c.RemoteAddr())
-		if reason == udpDropSourceLimit && !peerTrusted {
+		if reason == udpDropSourceLimit {
 			logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, l4StatusRateLimited, 0, 0, 0)
 		}
 		closeOnOpen(c)
@@ -195,9 +259,7 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 		if !cl.Acquire() {
 			h.udpSessions.release(sessionIP)
 			logging.Warn("[CONN] listener %s: backend %s at max_connections — refusing %s", l.Name, l.Backend, c.RemoteAddr())
-			if !peerTrusted {
-				logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, l4StatusRateLimited, 0, 0, 0)
-			}
+			logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, l4StatusRateLimited, 0, 0, 0)
 			closeOnOpen(c)
 			return
 		}
@@ -213,13 +275,23 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 		StartTime:    time.Now(),
 		Proto:        l.Protocol,
 		DstPort:      dstPort,
-		RealClientIP: ipStrOf(c.RemoteAddr()), // upgraded to the PROXY-v2 client if a trusted header resolves
-		PeerTrusted:  peerTrusted,
+		RealClientIP: ipStrOf(c.RemoteAddr()),
 		listener:     l,
+		slotHeld:     true,
 		sessionIP:    sessionIP,
 		limiter:      limiter,
+		viaInterface: viaListedInterface,
 	}
 	h.setCtx(c, clientCtx)
+	// A block added after the access check above, before the session was
+	// visible to the denylist's close pass (closeSessionsOf), is caught here.
+	if h.denylisted(ip) {
+		clientCtx.Mu.Lock()
+		clientCtx.refused = l4StatusDenylisted
+		clientCtx.Mu.Unlock()
+		closeOnOpen(c)
+		return
+	}
 
 	h.connectBackend(c, l)
 }
@@ -258,7 +330,12 @@ func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
 	peerTrusted := ctx.PeerTrusted
 	clientResolved := ctx.ClientResolved
 	refused := ctx.refused
-	sessionIP, limiter := ctx.sessionIP, ctx.limiter
+	slotHeld, sessionIP, limiter := ctx.slotHeld, ctx.sessionIP, ctx.limiter
+	pendingHeld := ctx.pendingHeld
+	ctx.pendingHeld = false
+	if ctx.pendingTimer != nil {
+		ctx.pendingTimer.Stop()
+	}
 	ctx.PeerConn = nil // prevent double-close
 	ctx.closed = true  // a late OnData must not charge the released session
 	ctx.limiter = nil
@@ -274,7 +351,12 @@ func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
 	}
 
 	if !isBackend {
-		h.udpSessions.release(sessionIP)
+		if slotHeld {
+			h.udpSessions.release(sessionIP)
+		}
+		if pendingHeld {
+			h.udpSessions.releasePending()
+		}
 		if limiter != nil {
 			limiter.Release()
 		}
@@ -286,7 +368,7 @@ func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
 		// are not accumulated in v1.
 		// SUPPRESS when the peer is a trusted relay whose real client we never resolved
 		// (connection died before its inbound PROXY-v2 header was read): attributing the
-		// record to the relay could get a peer-region relay scored/blocked. A direct
+		// record to the relay could get the relay itself blocked. A direct
 		// (untrusted) peer IS the client, so it always emits.
 		if !peerTrusted || clientResolved {
 			status := "no_route"
@@ -309,29 +391,53 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 		return
 	}
 
-	// Cross-region UDP inbound (#77 / N1): when this listener trusts the immediate
-	// peer (a peer-region relay), each datagram carries a leading PROXY-v2 DGRAM
+	// UDP behind a relay: when this listener trusts the immediate peer
+	// (accept_proxy_from), each datagram carries a leading PROXY-v2 DGRAM
 	// header naming the REAL client. Strip it and build the OUTBOUND send_proxy_v2
 	// header from that real client (once — it's stable per conn), so the backend
-	// (tunnel-server) sees the client, not the relay. The header's dst is our
+	// sees the client, not the relay. The header's dst is our
 	// LocalAddr (the dedicated port the relay dialed) — already correct.
 	ctx.Mu.Lock()
 	stripInbound := ctx.StripInbound
-	sendProxyV2 := ctx.SendProxyV2
 	localAddr := ctx.LocalAddr
 	l := ctx.listener
 	ctx.Mu.Unlock()
 	if stripInbound {
-		src, consumed, isProxy := parseInboundProxyV2Datagram(data)
+		hdr, consumed, isProxy := parseInboundProxyV2DatagramHeader(data)
+		var src net.Addr
+		if hdr != nil {
+			src = hdr.SourceAddr
+			// With accept_proxy_key_file the header must be signed over this
+			// datagram: a forged relay datagram cannot name a client.
+			if err := l.proxyTrust.verify(hdr, data[consumed:], true); err != nil {
+				h.udpDrops.note(udpDropBadSignature, listenerName(l), c.RemoteAddr())
+				ctx.Mu.Lock()
+				pending := ctx.relayPending
+				ctx.Mu.Unlock()
+				if pending {
+					c.Close()
+				}
+				return
+			}
+		}
 		if !isProxy || src == nil {
 			// A trusted relay must name the client in EVERY datagram. One
 			// without a (valid, non-LOCAL) header would be forwarded with no
 			// client to check against the access policy or to attribute in
-			// the access log: drop it.
+			// the access log: drop it. A session no header has admitted yet
+			// ends here (H5): it holds nothing, and nothing proves its
+			// source is the relay.
 			h.udpDrops.note(udpDropNoProxyHeader, listenerName(l), c.RemoteAddr())
+			ctx.Mu.Lock()
+			pending := ctx.relayPending
+			ctx.Mu.Unlock()
+			if pending {
+				c.Close()
+			}
 			return
 		}
 		data = data[consumed:]
+		admitted := false
 		ctx.Mu.Lock()
 		if ctx.closed {
 			ctx.Mu.Unlock()
@@ -339,20 +445,33 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 		}
 		if !ctx.ClientResolved {
 			// First datagram: the real UDP client (not the relay) is known.
-			// Admit it like a direct client — access policy (static lists, ACL,
-			// dynamic denylist; the OnOpen gate only saw the relay) and its
-			// per-client session limit — and record it for the access log.
+			// Admit it like a direct client — access policy (static lists,
+			// ACL, dynamic denylist), the session caps charged to it and the
+			// backend's max_connections — and record it for the access log.
+			// Only then does the session get its backend (H5).
 			ctx.RealClientIP = ipStrOf(src)
 			ctx.ClientResolved = true
 			ctx.resolvedSrc = src
 			ip := ipOf(src)
 			ok, status := h.l4Admit(l, ip)
 			if ok {
-				if key := addrKey(ip); key.IsValid() && h.udpSessions.chargeIP(key) {
-					ctx.sessionIP = key
-				} else {
+				key := addrKey(ip)
+				if reason := h.udpSessions.acquire(key); reason != "" {
 					ok, status = false, l4StatusRateLimited
-					h.udpDrops.note(udpDropSourceLimit, listenerName(l), src)
+					h.udpDrops.note(reason, listenerName(l), src)
+				} else {
+					ctx.slotHeld, ctx.sessionIP = true, key
+				}
+			}
+			bv := h.engine.backends()
+			if ok {
+				if cl, found := bv.ConnLimiters[l.Backend]; found {
+					if cl.Acquire() {
+						ctx.limiter = cl
+					} else {
+						ok, status = false, l4StatusRateLimited
+						logging.Warn("[CONN] listener %s: backend %s at max_connections — refusing %s", l.Name, l.Backend, src)
+					}
 				}
 			}
 			if !ok {
@@ -361,7 +480,18 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 				c.Close()
 				return
 			}
-			if sendProxyV2 && ctx.ProxyHeader == nil {
+			ctx.relayPending = false
+			if ctx.pendingHeld {
+				ctx.pendingHeld = false
+				h.udpSessions.releasePending()
+			}
+			if ctx.pendingTimer != nil {
+				ctx.pendingTimer.Stop()
+			}
+			admitted = true
+			// The outbound header names the client the relay named; the
+			// backend connection (dialed below) sends it with every datagram.
+			if be := bv.Backends[l.Backend]; be != nil && be.SendProxyV2 {
 				var buf bytes.Buffer
 				if err := proxy.WriteProxyHeaderV2(&buf, src, localAddr); err == nil {
 					ctx.ProxyHeader = buf.Bytes()
@@ -378,14 +508,19 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 			return
 		}
 		ctx.Mu.Unlock()
+		if admitted {
+			// This datagram is buffered below until the backend connects
+			// (or written at once to a pooled backend connection).
+			h.connectBackend(c, l)
+		}
 	}
 
 	ctx.Mu.Lock()
 	if ctx.PeerConn != nil {
 		peer := ctx.PeerConn
-		hdr := ctx.ProxyHeader
+		hdr, sl := ctx.ProxyHeader, ctx.listener
 		ctx.Mu.Unlock()
-		_, err := writeWithProxy(peer, hdr, data)
+		_, err := writeWithProxy(peer, hdr, h.sendKey(sl), data)
 		if err != nil {
 			logging.Error("[DATA] Write failed: %v", err)
 		}
@@ -422,8 +557,9 @@ func listenerName(l *ListenerConfig) string {
 }
 
 func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerConfig) {
-	// Runs inside OnOpen: every failure closes through closeOnOpen (a
-	// synchronous Close deadlocks the nbio poller — see closeOnOpen).
+	// Runs inside OnOpen (a direct client) or inside a relayed session's
+	// first OnData: every failure closes through closeOnOpen (a synchronous
+	// Close inside OnOpen deadlocks the nbio poller — see closeOnOpen).
 	bv := h.engine.backends() // one consistent view for this session (H6)
 	balancer, ok := bv.Balancers[l.Backend]
 	if !ok {
@@ -474,15 +610,20 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 
 	sendProxyV2 := backend != nil && backend.SendProxyV2
 	// acceptInbound: this listener trusts an inbound PROXY-v2 header from the
-	// immediate peer (a peer-region relay, cross-region #77 / N1). When set, the
+	// immediate peer (a relay in accept_proxy_from). When set, the
 	// REAL client isn't known until the first inbound datagram is parsed, so we do
 	// NOT build the outbound header here — OnData strips the inbound header and
 	// builds the outbound one from the parsed real client. Untrusted peers skip
-	// this entirely (a forged header can never spoof a source).
-	acceptInbound := l.proxyTrust.trusts(clientConn.RemoteAddr())
+	// this entirely: their headers are never parsed.
+	// Decided once, in OnOpen (address and, with accept_proxy_interfaces,
+	// arrival interface): a session OnOpen did not trust never strips a header.
+	clientCtx.Mu.Lock()
+	acceptInbound := clientCtx.PeerTrusted
+	clientCtx.Mu.Unlock()
 
 	// Snapshot what OnData needs to do the strip + outbound-header build. Set
-	// synchronously (this runs inside OnOpen, before any OnData for this conn).
+	// before any datagram of this session is forwarded (this runs inside
+	// OnOpen, or inside the relayed session's first OnData).
 	clientCtx.Mu.Lock()
 	clientCtx.StripInbound = acceptInbound
 	clientCtx.SendProxyV2 = sendProxyV2
@@ -511,8 +652,14 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 	// nbio races on). Under a range-funnel ALL dedicated ports share one backend
 	// name, so without the local port two clients with the same source IP:port
 	// (CGNAT) hitting DIFFERENT dedicated ports would collide on one backend conn
-	// and their replies would cross. (UDP cross-region MUX, task #77 / N2.)
-	poolKey := fmt.Sprintf("%s|%d|%s", clientConn.RemoteAddr().String(), portOf(clientConn.LocalAddr()), clientCtx.BackendServer)
+	// and their replies would cross.
+	//
+	// With accept_proxy_interfaces one relay address can have two sessions
+	// on one port at once: a trusted one that arrived on a listed interface
+	// and an ordinary one (perhaps a forged source) that arrived elsewhere.
+	// The arrival path is part of the key, so they never share a backend
+	// socket (one could write into, or close, the other's flow).
+	poolKey := fmt.Sprintf("%s|%d|%t|%s", clientConn.RemoteAddr().String(), portOf(clientConn.LocalAddr()), clientCtx.viaInterface, clientCtx.BackendServer)
 	if session := h.engine.UDPPool.Get(poolKey); session != nil {
 		// Reuse existing backend connection
 		clientCtx.Mu.Lock()
@@ -524,7 +671,7 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 			clientCtx.BalancerRef.OnConnect(clientCtx.BackendServer)
 		}
 		if len(clientCtx.Buffer) > 0 {
-			writeWithProxy(session.BackendConn, clientCtx.ProxyHeader, clientCtx.Buffer)
+			writeWithProxy(session.BackendConn, clientCtx.ProxyHeader, h.sendKey(l), clientCtx.Buffer)
 			clientCtx.Buffer = nil
 		}
 		clientCtx.Mu.Unlock()
@@ -588,7 +735,7 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 
 		// Flush any buffered data
 		if len(clientCtx.Buffer) > 0 {
-			_, writeErr := writeWithProxy(backendConn, clientCtx.ProxyHeader, clientCtx.Buffer)
+			_, writeErr := writeWithProxy(backendConn, clientCtx.ProxyHeader, h.sendKey(l), clientCtx.Buffer)
 			if writeErr != nil {
 				logging.Error("Failed to flush UDP buffer: %v", writeErr)
 				clientCtx.Mu.Unlock()
@@ -606,7 +753,7 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 		// Replies up to 65535 B (the max UDP payload) are relayed whole: a 4096
 		// buffer silently truncated any backend datagram >4 KB (the kernel
 		// discards the remainder of that datagram) — large DNS/QUIC/jumbo
-		// responses lost data. (UDP cross-region MUX, task #77 / N3.)
+		// responses lost data.
 		timeout := noReply
 		var writeErr error
 		deliver := func(b []byte) { _, writeErr = clientConn.Write(b) }
@@ -687,12 +834,33 @@ func ipStrOf(addr net.Addr) string {
 	return ""
 }
 
+// sendKey is the key a datagram of a session of listener l is signed with
+// now: its backend's current send_proxy_key_file (a reload may have rotated
+// it since the session began), nil for none.
+func (h *ProxyEventHandler) sendKey(l *ListenerConfig) []byte {
+	if l == nil {
+		return nil
+	}
+	if be := h.engine.backends().Backends[l.Backend]; be != nil {
+		return be.SendProxyKey
+	}
+	return nil
+}
+
 // writeWithProxy writes data to peer, optionally prepending a PROXY v2
-// header. When hdr is empty this is a plain peer.Write(data) — the hot
-// path for backends without send_proxy_v2.
-func writeWithProxy(peer net.Conn, hdr, data []byte) (int, error) {
+// header, signed over data when key is set (send_proxy_key_file). When hdr
+// is empty this is a plain peer.Write(data) — the hot path for backends
+// without send_proxy_v2.
+func writeWithProxy(peer net.Conn, hdr, key, data []byte) (int, error) {
 	if len(hdr) == 0 {
 		return peer.Write(data)
+	}
+	if len(key) > 0 {
+		signed, err := proxy.SignedHeaderBytes(hdr, key, data, time.Now())
+		if err != nil {
+			return 0, err
+		}
+		hdr = signed
 	}
 	out := make([]byte, len(hdr)+len(data))
 	copy(out, hdr)

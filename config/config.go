@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -79,9 +78,10 @@ type RequestIDConfig struct {
 }
 
 type ServerConfig struct {
-	// User, Group, PidFile and Workers are accepted for config compatibility
-	// but NOT IMPLEMENTED: nvelox never drops privileges, writes no pid file
-	// and always runs one process. ServerWarnings reports them at startup.
+	// User and Group: started as root, nvelox switches to them once it has
+	// bound its ports (core/privdrop). PidFile and Workers are accepted for
+	// config compatibility but not implemented: nvelox writes no pid file and
+	// always runs one process; ServerWarnings reports them at startup.
 	User    string `yaml:"user"`
 	Group   string `yaml:"group"`
 	PidFile string `yaml:"pid_file"`
@@ -183,15 +183,32 @@ type Listener struct {
 	TrustedProxies []string `yaml:"trusted_proxies,omitempty"`
 
 	// AcceptProxyFrom: CIDRs whose INBOUND PROXY-protocol-v2 header is trusted
-	// and used as the real client address at L4 (tcp / https-passthrough
-	// listeners). Connections from peers OUTSIDE this list have any inbound
-	// PROXY header IGNORED — the real TCP/UDP peer is used — so a direct client
-	// can never spoof its source. Empty (default) = trust nobody = inbound PROXY
-	// headers are never honored (behaviour unchanged). Distinct from
-	// trusted_proxies (L7 XFF/X-Real-IP trust). Used by cross-region proxying:
-	// a peer region's relay prepends a PROXY-v2 header with the real client, and
-	// this list lets the owner region's nvelox accept + forward it to the backend.
+	// and used as the real client address at L4 (tcp, https-passthrough and
+	// udp listeners). Peers OUTSIDE this list have any inbound PROXY header
+	// IGNORED and are the client themselves. Empty (default) = trust nobody.
+	// Distinct from trusted_proxies (L7 XFF/X-Real-IP trust). Used behind a
+	// relay (another nvelox, HAProxy, ...) that prepends a PROXY-v2 header
+	// with the real client. A TCP handshake proves the peer address; a UDP
+	// datagram's source can be forged, so a udp listener should also set
+	// AcceptProxyKeyFile or AcceptProxyInterfaces (startup warning otherwise).
 	AcceptProxyFrom []string `yaml:"accept_proxy_from,omitempty"`
+	// AcceptProxyKeyFile: shared keys, one per line (at least 32 characters,
+	// "#" starts a comment), that a trusted peer's PROXY header must be signed
+	// with (proxy/signature.go; nvelox signs with send_proxy_key_file). A
+	// header without a valid signature is refused (TCP) or dropped (UDP).
+	// Every key in the file is accepted, so keys can be rotated: add the new
+	// key here, then sign with it, then remove the old one.
+	AcceptProxyKeyFile string `yaml:"accept_proxy_key_file,omitempty"`
+	// AcceptProxyKeys is loaded from AcceptProxyKeyFile by Load.
+	AcceptProxyKeys [][]byte `yaml:"-"`
+	// AcceptProxyInterfaces (udp listeners, Linux): a PROXY header is trusted
+	// only on datagrams that arrived on one of these network interfaces (a
+	// second network card, a VLAN or a tunnel that only the relays reach),
+	// addressed to one of the interface's addresses. The listener gets one
+	// socket per address of each interface (a listener bound to one address:
+	// its own socket, on the interface that has the address), sharing its
+	// port. Interfaces and addresses are read at start (core/udpdevice.go).
+	AcceptProxyInterfaces []string `yaml:"accept_proxy_interfaces,omitempty"`
 
 	// L7 fields
 	HTTP3       bool              `yaml:"http3,omitempty"`
@@ -325,7 +342,7 @@ type FastCGIConfig struct {
 type StaticConfig struct {
 	Root      string   `yaml:"root"`                // Document root directory
 	Index     []string `yaml:"index,omitempty"`     // Index files (default: ["index.html"])
-	Autoindex bool     `yaml:"autoindex,omitempty"` // Directory listing
+	Autoindex bool     `yaml:"autoindex,omitempty"` // List a directory without an index file (core/httpproxy/autoindex.go)
 }
 
 // TryFilesConfig defines try_files behavior.
@@ -470,9 +487,14 @@ type HeadersConfig struct {
 
 // Backend defines a server pool.
 type Backend struct {
-	Name           string   `yaml:"name"`
-	Balance        string   `yaml:"balance"`         // "roundrobin", "leastconn", "random"
-	SendProxyV2    bool     `yaml:"send_proxy_v2"`   // Send PROXY Protocol v2 header to backend
+	Name        string `yaml:"name"`
+	Balance     string `yaml:"balance"`       // "roundrobin", "leastconn", "random"
+	SendProxyV2 bool   `yaml:"send_proxy_v2"` // Send PROXY Protocol v2 header to backend
+	// SendProxyKeyFile: sign the PROXY v2 header with the first key of this
+	// file (same format as a listener's accept_proxy_key_file).
+	SendProxyKeyFile string `yaml:"send_proxy_key_file,omitempty"`
+	// SendProxyKey is loaded from SendProxyKeyFile by Load.
+	SendProxyKey   []byte   `yaml:"-"`
 	Servers        []string `yaml:"servers"`         // List of server addresses
 	MaxConnections int      `yaml:"max_connections"` // Max concurrent HTTP requests / TCP connections / UDP sessions (0 = unlimited)
 
@@ -609,8 +631,73 @@ func Load(path string) (*Config, error) {
 	if err := validate(&cfg); err != nil {
 		return nil, fmt.Errorf("config validation failed: %w", err)
 	}
+	if err := loadProxyKeys(&cfg); err != nil {
+		return nil, fmt.Errorf("config validation failed: %w", err)
+	}
 
 	return &cfg, nil
+}
+
+// minProxyKeyLen is the shortest PROXY signing key accepted (characters).
+const minProxyKeyLen = 32
+
+// loadProxyKeys reads the accept_proxy_key_file and send_proxy_key_file of
+// every listener and backend.
+func loadProxyKeys(cfg *Config) error {
+	for i := range cfg.Listeners {
+		l := &cfg.Listeners[i]
+		if l.AcceptProxyKeyFile == "" {
+			continue
+		}
+		keys, err := readProxyKeyFile(l.AcceptProxyKeyFile)
+		if err != nil {
+			return fmt.Errorf("listener %s: accept_proxy_key_file: %v", l.Name, err)
+		}
+		l.AcceptProxyKeys = keys
+	}
+	for i := range cfg.Backends {
+		b := &cfg.Backends[i]
+		if b.SendProxyKeyFile == "" {
+			continue
+		}
+		if !b.SendProxyV2 {
+			return fmt.Errorf("backend %s: send_proxy_key_file needs send_proxy_v2: true", b.Name)
+		}
+		keys, err := readProxyKeyFile(b.SendProxyKeyFile)
+		if err != nil {
+			return fmt.Errorf("backend %s: send_proxy_key_file: %v", b.Name, err)
+		}
+		b.SendProxyKey = keys[0]
+	}
+	return nil
+}
+
+// readProxyKeyFile returns the keys of a key file: one per line, surrounding
+// spaces trimmed, blank lines and "#" comments skipped, each at least
+// minProxyKeyLen characters. A file other users can read is reported.
+func readProxyKeyFile(path string) ([][]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if fi, err := os.Stat(path); err == nil && fi.Mode().Perm()&0o077 != 0 {
+		fmt.Fprintf(os.Stderr, "[CONFIG] WARNING: key file %s has mode %#o; other users should not read it (chmod 600)\n", path, fi.Mode().Perm())
+	}
+	var keys [][]byte
+	for n, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if len(line) < minProxyKeyLen {
+			return nil, fmt.Errorf("%s line %d: key shorter than %d characters", path, n+1, minProxyKeyLen)
+		}
+		keys = append(keys, []byte(line))
+	}
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("%s: no key", path)
+	}
+	return keys, nil
 }
 
 func validate(cfg *Config) error {
@@ -708,6 +795,22 @@ func validate(cfg *Config) error {
 		for _, c := range l.AcceptProxyFrom {
 			if _, _, err := net.ParseCIDR(strings.TrimSpace(c)); err != nil {
 				return fmt.Errorf("listener %s: invalid accept_proxy_from CIDR %q: %v", l.Name, c, err)
+			}
+		}
+		if l.AcceptProxyKeyFile != "" && len(l.AcceptProxyFrom) == 0 {
+			return fmt.Errorf("listener %s: accept_proxy_key_file needs accept_proxy_from (the peers whose signed headers are trusted)", l.Name)
+		}
+		if len(l.AcceptProxyInterfaces) > 0 {
+			if l.Protocol != "udp" {
+				return fmt.Errorf("listener %s: accept_proxy_interfaces applies to udp listeners (a TCP handshake already proves the peer address)", l.Name)
+			}
+			if len(l.AcceptProxyFrom) == 0 {
+				return fmt.Errorf("listener %s: accept_proxy_interfaces needs accept_proxy_from", l.Name)
+			}
+			for _, name := range l.AcceptProxyInterfaces {
+				if strings.TrimSpace(name) == "" {
+					return fmt.Errorf("listener %s: accept_proxy_interfaces has an empty name", l.Name)
+				}
 			}
 		}
 
@@ -826,6 +929,11 @@ func validate(cfg *Config) error {
 		return err
 	}
 
+	// One udp listener per port (before the bind-group rules, whose
+	// server_name rules are about HTTP sites).
+	if err := validateUDPPorts(cfg.Listeners); err != nil {
+		return err
+	}
 	// Cross-listener bind-group rules (nginx-style multi-server-per-port).
 	if err := validateBindGroups(cfg.Listeners); err != nil {
 		return err
@@ -973,16 +1081,45 @@ func validateACL(rules []ACLRule, l4 bool) error {
 	return nil
 }
 
+// StartupWarnings returns what main prints on stderr at startup, whatever the
+// log level: server.* keys that do nothing, and settings that are accepted but
+// expose something.
+func StartupWarnings(cfg *Config) []string {
+	out := ServerWarnings(cfg.Server)
+	for _, l := range cfg.Listeners {
+		if l.Protocol == "udp" && len(l.AcceptProxyFrom) > 0 && l.AcceptProxyKeyFile == "" && len(l.AcceptProxyInterfaces) == 0 {
+			out = append(out, fmt.Sprintf("listener %s: accept_proxy_from on a udp listener trusts the source address alone, which a datagram can forge: set accept_proxy_key_file or accept_proxy_interfaces, or make sure the network drops packets that claim those addresses", l.Name))
+		}
+	}
+	if cfg.Metrics.Enabled && everyAddress(cfg.Metrics.Bind) {
+		out = append(out, fmt.Sprintf("metrics.bind %q listens on every address, and the metrics endpoint has no authentication: bind a specific address or restrict the port with a firewall", cfg.Metrics.Bind))
+	}
+	return out
+}
+
+// everyAddress reports whether bind (host:port) leaves the host empty or names
+// the IPv4 or IPv6 unspecified address. An empty bind is not one of them: it
+// means each server's loopback default.
+func everyAddress(bind string) bool {
+	if bind == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(bind)
+	if err != nil {
+		return false // validation reports a malformed bind
+	}
+	if host == "" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsUnspecified()
+}
+
 // ServerWarnings returns one warning per server.* key that is set but not
-// implemented. user / group are reported only when the process does not
-// already run as them (nvelox never drops privileges itself); pid_file and
-// workers whenever they are set. main prints these at startup. They are
+// implemented: pid_file and workers. main prints these at startup. They are
 // warnings, not errors, because deployed configs carry these keys.
 func ServerWarnings(s ServerConfig) []string {
 	var out []string
-	if msg := privilegeDropWarning(s.User, s.Group, os.Getuid(), os.Getgid()); msg != "" {
-		out = append(out, msg)
-	}
 	if s.PidFile != "" {
 		out = append(out, fmt.Sprintf("server.pid_file (%q) is set but not implemented: nvelox does not write a pid file", s.PidFile))
 	}
@@ -990,50 +1127,6 @@ func ServerWarnings(s ServerConfig) []string {
 		out = append(out, fmt.Sprintf("server.workers (%d) is set but not implemented: nvelox always runs as one process", s.Workers))
 	}
 	return out
-}
-
-// privilegeDropWarning reports server.user / server.group values the process
-// (uid, gid) is not running as. A name that does not resolve counts as
-// different.
-func privilegeDropWarning(userName, groupName string, uid, gid int) string {
-	var set []string
-	if userName != "" {
-		if id, ok := lookupUID(userName); !ok || id != uid {
-			set = append(set, fmt.Sprintf("server.user=%q", userName))
-		}
-	}
-	if groupName != "" {
-		if id, ok := lookupGID(groupName); !ok || id != gid {
-			set = append(set, fmt.Sprintf("server.group=%q", groupName))
-		}
-	}
-	if len(set) == 0 {
-		return ""
-	}
-	return fmt.Sprintf("%s set but privilege drop is not implemented: nvelox is running as uid %d gid %d. Run nvelox under systemd User=/Group= with CAP_NET_BIND_SERVICE (AmbientCapabilities) instead",
-		strings.Join(set, " and "), uid, gid)
-}
-
-func lookupUID(name string) (int, bool) {
-	u, err := user.Lookup(name)
-	if err != nil {
-		if u, err = user.LookupId(name); err != nil {
-			return 0, false
-		}
-	}
-	id, err := strconv.Atoi(u.Uid)
-	return id, err == nil
-}
-
-func lookupGID(name string) (int, bool) {
-	g, err := user.LookupGroup(name)
-	if err != nil {
-		if g, err = user.LookupGroupId(name); err != nil {
-			return 0, false
-		}
-	}
-	id, err := strconv.Atoi(g.Gid)
-	return id, err == nil
 }
 
 // validateServerName checks a server_names entry. Allows exact hostnames and
@@ -1171,43 +1264,75 @@ func validateBindGroups(listeners []Listener) error {
 	return nil
 }
 
+// validateUDPPorts refuses two udp listeners on one port, also on different
+// addresses or through overlapping ranges: a datagram is matched to its udp
+// listener by the port it arrived on, so one listener's settings (backend,
+// IP lists, ACL, PROXY trust) would silently apply to the other's traffic.
+func validateUDPPorts(listeners []Listener) error {
+	owner := make(map[int]string) // port -> udp listener
+	for _, l := range listeners {
+		if l.Protocol != "udp" {
+			continue
+		}
+		first, last, err := bindPortRange(l.Bind)
+		if err != nil {
+			continue // reported by validateBindAddress
+		}
+		for p := first; p <= last; p++ {
+			if other, taken := owner[p]; taken {
+				return fmt.Errorf("listeners %s and %s: two udp listeners cannot share port %d, also not on different addresses",
+					other, l.Name, p)
+			}
+			owner[p] = l.Name
+		}
+	}
+	return nil
+}
+
 func validateBindAddress(addr string) error {
+	_, _, err := bindPortRange(addr)
+	return err
+}
+
+// bindPortRange returns the port of a bind address, or the first and last
+// port of a range ("10.0.0.1:7000", ":17000-17100").
+func bindPortRange(addr string) (first, last int, err error) {
 	lastColon := strings.LastIndex(addr, ":")
 	if lastColon == -1 {
-		return fmt.Errorf("missing port")
+		return 0, 0, fmt.Errorf("missing port")
 	}
 	portStr := addr[lastColon+1:]
 
 	if strings.Contains(portStr, "-") {
 		parts := strings.Split(portStr, "-")
 		if len(parts) != 2 {
-			return fmt.Errorf("invalid port range format")
+			return 0, 0, fmt.Errorf("invalid port range format")
 		}
 		start, err := strconv.Atoi(parts[0])
 		if err != nil {
-			return fmt.Errorf("invalid range start port: %v", err)
+			return 0, 0, fmt.Errorf("invalid range start port: %v", err)
 		}
 		end, err := strconv.Atoi(parts[1])
 		if err != nil {
-			return fmt.Errorf("invalid range end port: %v", err)
+			return 0, 0, fmt.Errorf("invalid range end port: %v", err)
 		}
 		if start < 1 || start > 65535 || end < 1 || end > 65535 {
-			return fmt.Errorf("port out of range (1-65535)")
+			return 0, 0, fmt.Errorf("port out of range (1-65535)")
 		}
 		if start > end {
-			return fmt.Errorf("port range start (%d) is greater than end (%d)", start, end)
+			return 0, 0, fmt.Errorf("port range start (%d) is greater than end (%d)", start, end)
 		}
-		return nil
+		return start, end, nil
 	}
 
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		return fmt.Errorf("invalid port: %v", err)
+		return 0, 0, fmt.Errorf("invalid port: %v", err)
 	}
 	if port < 1 || port > 65535 {
-		return fmt.Errorf("port %d out of range (1-65535)", port)
+		return 0, 0, fmt.Errorf("port %d out of range (1-65535)", port)
 	}
-	return nil
+	return port, port, nil
 }
 
 // resolveIncludeGlob expands an `include:` pattern and enforces that every
@@ -1281,6 +1406,18 @@ func validatePathRegex(re string) error {
 // validateFastCGI checks a route's fastcgi block. document_root is required:
 // without it the script path was joined onto the process working directory
 // ("/" in the container image). script_name must not climb out of it.
+// fastCGIReservedParams are the FastCGI params that choose the script PHP-FPM
+// runs. nvelox sets them from the script it confined to document_root; a
+// route's params may not override them (an override such as
+// SCRIPT_FILENAME: $request_uri would hand PHP-FPM an unchecked file).
+var fastCGIReservedParams = map[string]bool{
+	"SCRIPT_FILENAME": true,
+	"SCRIPT_NAME":     true,
+	"DOCUMENT_ROOT":   true,
+	"PATH_INFO":       true,
+	"PATH_TRANSLATED": true,
+}
+
 func validateFastCGI(f FastCGIConfig) error {
 	if f.DocumentRoot == "" {
 		return fmt.Errorf("document_root is required")
@@ -1288,6 +1425,11 @@ func validateFastCGI(f FastCGIConfig) error {
 	if f.SplitPathInfo != "" {
 		if err := validatePathRegex(f.SplitPathInfo); err != nil {
 			return fmt.Errorf("split_path_info: %v", err)
+		}
+	}
+	for k := range f.Params {
+		if fastCGIReservedParams[strings.ToUpper(strings.TrimSpace(k))] {
+			return fmt.Errorf("params: %s is set by nvelox (the script it checked under document_root) and cannot be overridden", k)
 		}
 	}
 	if f.ScriptName != "" {

@@ -3,30 +3,71 @@ package core
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"net"
-
-	"nvelox/core/acl"
+	"sync/atomic"
+	"time"
 
 	"github.com/pires/go-proxyproto"
+
+	"nvelox/core/acl"
+	"nvelox/proxy"
 )
 
 // proxyTrust decides, per inbound connection, whether nvelox should TRUST an
 // inbound PROXY-protocol-v2 header and use its source as the real client. Only
 // peers whose address falls in one of the configured `accept_proxy_from` CIDRs
 // are trusted; everyone else (direct clients, attackers) has any inbound PROXY
-// header IGNORED, so a forged header can never spoof a source IP. Empty list =>
-// trust nobody => behaves exactly as before (no inbound PROXY acceptance).
+// header IGNORED. Over TCP the handshake proves the peer address, so only a
+// listed peer can name a client. Over UDP the source address of a datagram
+// can be forged: a UDP relay may be listed only where the network drops
+// packets that claim its address from anywhere else (see accept_proxy_from in
+// nvelox.example.yaml). Empty list => trust nobody => behaves exactly as
+// before (no inbound PROXY acceptance).
 //
-// This is the receiving half of cross-region client-IP preservation: a peer
-// region's relay prepends a PROXY-v2 header carrying the real client; the
-// trusted accept here recovers it so the existing send_proxy_v2 forwards the
-// real client to the backend (tunnel-server) instead of the relay pod.
+// This is the receiving half of client-IP preservation across a relay: the
+// relay prepends a PROXY-v2 header carrying the real client; the trusted
+// accept here recovers it so send_proxy_v2 forwards the real client to the
+// backend instead of the relay.
 type proxyTrust struct {
 	nets []*net.IPNet // nil/empty => trust nobody
+	// keys (accept_proxy_key_file): a trusted peer's header must carry a
+	// valid signature made with one of them. Swapped by a reload (rotation).
+	keys atomic.Pointer[[][]byte]
 }
 
-func newProxyTrust(cidrs []string) *proxyTrust {
-	return &proxyTrust{nets: acl.ParseCIDRList(cidrs)} // reuse the shared CIDR parser
+func newProxyTrust(cidrs []string, keys [][]byte) *proxyTrust {
+	p := &proxyTrust{nets: acl.ParseCIDRList(cidrs)} // reuse the shared CIDR parser
+	p.setKeys(keys)
+	return p
+}
+
+// setKeys replaces the signing keys (nil: headers need no signature).
+func (p *proxyTrust) setKeys(keys [][]byte) {
+	if len(keys) == 0 {
+		p.keys.Store(nil)
+		return
+	}
+	p.keys.Store(&keys)
+}
+
+// verify checks a trusted peer's header h, which arrived in a datagram or
+// on a stream: with keys configured it must name that transport (a signed
+// stream header replayed as a datagram is refused) and carry a valid
+// signature over payload (the datagram after the header; nil for a stream).
+// Without keys every header passes, as before.
+func (p *proxyTrust) verify(h *proxyproto.Header, payload []byte, datagram bool) error {
+	if p == nil {
+		return nil
+	}
+	keys := p.keys.Load()
+	if keys == nil {
+		return nil
+	}
+	if datagram && !h.TransportProtocol.IsDatagram() || !datagram && !h.TransportProtocol.IsStream() {
+		return fmt.Errorf("%w: its transport protocol is not the connection's", proxy.ErrSignatureMalformed)
+	}
+	return proxy.Verify(h, *keys, payload, time.Now())
 }
 
 func (p *proxyTrust) enabled() bool { return p != nil && len(p.nets) > 0 }
@@ -94,6 +135,16 @@ var proxyV2Signature = []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x
 //   - done=true, src!=nil, consumed=N => header parsed; src is the real client
 //     and the first N bytes of buf must be dropped before forwarding payload.
 func tryParseInboundProxyV2(buf []byte) (done bool, src net.Addr, consumed int) {
+	done, hdr, consumed := tryParseInboundProxyV2Header(buf)
+	if hdr != nil {
+		src = hdr.SourceAddr
+	}
+	return done, src, consumed
+}
+
+// tryParseInboundProxyV2Header is tryParseInboundProxyV2 returning the parsed
+// header (nil when there is no usable one) for a signature check.
+func tryParseInboundProxyV2Header(buf []byte) (done bool, hdr *proxyproto.Header, consumed int) {
 	// Match the signature incrementally so a short raw read (e.g. a TLS
 	// ClientHello, or any non-PROXY payload) is detected as raw immediately.
 	if len(buf) < len(proxyV2Signature) {
@@ -118,11 +169,11 @@ func tryParseInboundProxyV2(buf []byte) (done bool, src net.Addr, consumed int) 
 		// the real peer addr. Consuming avoids leaking header bytes as payload.
 		return true, nil, total
 	}
-	return true, hdr.SourceAddr, total
+	return true, hdr, total
 }
 
 // parseInboundProxyV2Datagram is the DATAGRAM-oriented counterpart of
-// tryParseInboundProxyV2, for the UDP plane (cross-region UDP #77 / N1). A UDP
+// tryParseInboundProxyV2, for UDP listeners. A UDP
 // datagram is atomic — the whole PROXY-v2 header is present in this one datagram
 // or it isn't, so there is no cross-read reassembly (no "need more bytes" state).
 //
@@ -134,6 +185,16 @@ func tryParseInboundProxyV2(buf []byte) (done bool, src net.Addr, consumed int) 
 //   - isProxy=true, src=nil, consumed=N  => malformed/LOCAL header: still strip N
 //     bytes (don't leak them as payload) but fall back to the peer addr.
 func parseInboundProxyV2Datagram(data []byte) (src net.Addr, consumed int, isProxy bool) {
+	hdr, consumed, isProxy := parseInboundProxyV2DatagramHeader(data)
+	if hdr != nil {
+		src = hdr.SourceAddr
+	}
+	return src, consumed, isProxy
+}
+
+// parseInboundProxyV2DatagramHeader is parseInboundProxyV2Datagram returning
+// the parsed header (nil when there is no usable one) for a signature check.
+func parseInboundProxyV2DatagramHeader(data []byte) (hdr *proxyproto.Header, consumed int, isProxy bool) {
 	if len(data) < 16 || !bytes.Equal(data[:len(proxyV2Signature)], proxyV2Signature) {
 		return nil, 0, false
 	}
@@ -145,5 +206,5 @@ func parseInboundProxyV2Datagram(data []byte) (src net.Addr, consumed int, isPro
 	if err != nil || hdr == nil || hdr.Command == proxyproto.LOCAL || hdr.SourceAddr == nil {
 		return nil, total, true
 	}
-	return hdr.SourceAddr, total, true
+	return hdr, total, true
 }

@@ -9,9 +9,7 @@ import (
 	"encoding/pem"
 	"math/big"
 	"os"
-	"os/user"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -209,6 +207,38 @@ func TestValidation_UDPWithTLSRejected(t *testing.T) {
 	wantErr(t, validate(baseCfg(l)), "not supported on udp")
 }
 
+// TestValidation_UDPListenersCannotSharePort: a datagram is matched to its
+// udp listener by port, so two udp listeners on one port — also on different
+// addresses or through overlapping ranges — are refused; a tcp listener on
+// the same port and udp listeners on other ports are not.
+func TestValidation_UDPListenersCannotSharePort(t *testing.T) {
+	udp := func(name, bind string) Listener {
+		return Listener{Name: name, Bind: bind, Protocol: "udp", Backend: "be"}
+	}
+	refused := map[string][]Listener{
+		"same address":       {udp("a", ":7000"), udp("b", ":7000")},
+		"different address":  {udp("a", "10.0.0.1:7000"), udp("b", "192.0.2.1:7000")},
+		"range and port":     {udp("a", ":17000-17100"), udp("b", "10.0.0.1:17050")},
+		"overlapping ranges": {udp("a", ":17000-17100"), udp("b", ":17100-17200")},
+	}
+	for name, ls := range refused {
+		t.Run(name, func(t *testing.T) {
+			wantErr(t, validate(baseCfg(ls...)), "two udp listeners cannot share port", "listeners a and b")
+		})
+	}
+	allowed := map[string][]Listener{
+		"other ports":     {udp("a", ":7000"), udp("b", ":7001")},
+		"adjacent ranges": {udp("a", ":17000-17100"), udp("b", ":17101-17200")},
+		"tcp on the same port": {udp("a", ":7000"),
+			{Name: "b", Bind: ":7000", Protocol: "tcp", Backend: "be"}},
+	}
+	for name, ls := range allowed {
+		if err := validate(baseCfg(ls...)); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
 func TestValidation_ClientAuth(t *testing.T) {
 	dir := t.TempDir()
 	cert, key := writePEMPair(t, dir, "srv")
@@ -320,41 +350,102 @@ func TestServerWarnings(t *testing.T) {
 	}
 }
 
-func TestPrivilegeDropWarning(t *testing.T) {
-	me, err := user.Current()
+// TestStartupWarnings_MetricsEveryAddress: metrics bound to every address
+// starts, with a warning; loopback, a specific address and the empty default
+// do not warn.
+func TestStartupWarnings_MetricsEveryAddress(t *testing.T) {
+	for bind, want := range map[string]bool{
+		":9090": true, "0.0.0.0:9090": true, "[::]:9090": true,
+		"": false, "127.0.0.1:9090": false, "[::1]:9090": false, "10.20.0.10:9090": false,
+	} {
+		cfg := &Config{Metrics: MetricsConfig{Enabled: true, Bind: bind}}
+		got := strings.Contains(strings.Join(StartupWarnings(cfg), "\n"), "every address")
+		if got != want {
+			t.Errorf("metrics.bind %q: warning=%v, want %v", bind, got, want)
+		}
+	}
+	cfg := &Config{Metrics: MetricsConfig{Enabled: false, Bind: ":9090"}}
+	if w := StartupWarnings(cfg); len(w) != 0 {
+		t.Errorf("metrics disabled: want no warning, got %q", w)
+	}
+}
+
+// TestProxyKeysAndInterfaces: key files load (several keys, comments),
+// short, empty or missing files fail the load, and the settings need their
+// counterparts: a key needs accept_proxy_from, a send key needs
+// send_proxy_v2, interfaces need a udp listener and accept_proxy_from.
+func TestProxyKeysAndInterfaces(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	good := write("good.keys", "# rotation: new key first\n  "+strings.Repeat("n", 40)+"  \n\n"+strings.Repeat("o", 32)+"\n")
+	short := write("short.keys", "too-short\n")
+	empty := write("empty.keys", "# nothing\n\n")
+	load := func(extra string) (*Config, error) {
+		p := filepath.Join(dir, "c.yaml")
+		cfg := "version: \"2\"\n" + extra
+		if err := os.WriteFile(p, []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Load(p)
+	}
+	udp := func(fields string) string {
+		return "listeners:\n  - name: relay\n    bind: \":7000\"\n    protocol: udp\n    backend: b\n" + fields +
+			"backends:\n  - name: b\n    servers: [\"127.0.0.1:1\"]\n"
+	}
+	cfg, err := load(udp("    accept_proxy_from: [\"10.0.0.0/8\"]\n    accept_proxy_key_file: \"" + good + "\"\n"))
 	if err != nil {
-		t.Skipf("no current user: %v", err)
+		t.Fatal(err)
 	}
-	uid, gid := os.Getuid(), os.Getgid()
-	grp, gerr := user.LookupGroupId(strconv.Itoa(gid))
-
-	// Already running as the configured user / group: nothing to warn about.
-	group := ""
-	if gerr == nil {
-		group = grp.Name
+	if k := cfg.Listeners[0].AcceptProxyKeys; len(k) != 2 || string(k[0]) != strings.Repeat("n", 40) {
+		t.Fatalf("keys %q", k)
 	}
-	if msg := privilegeDropWarning(me.Username, group, uid, gid); msg != "" {
-		t.Errorf("running as %s/%s: want no warning, got %q", me.Username, group, msg)
+	cfg, err = load("listeners:\n  - name: l\n    bind: \":7001\"\n    protocol: tcp\n    backend: b\n" +
+		"backends:\n  - name: b\n    servers: [\"127.0.0.1:1\"]\n    send_proxy_v2: true\n    send_proxy_key_file: \"" + good + "\"\n")
+	if err != nil || string(cfg.Backends[0].SendProxyKey) != strings.Repeat("n", 40) {
+		t.Fatalf("send key: %v %q", err, cfg.Backends[0].SendProxyKey)
 	}
-	// Numeric ids work too.
-	if msg := privilegeDropWarning(strconv.Itoa(uid), strconv.Itoa(gid), uid, gid); msg != "" {
-		t.Errorf("numeric uid/gid of the process: want no warning, got %q", msg)
-	}
-
-	// A user the process is not running as (or that does not exist): warn,
-	// with the operator's way out.
-	for _, name := range []string{"nvelox-no-such-user", "root"} {
-		if name == me.Username {
-			continue
-		}
-		msg := privilegeDropWarning(name, "", uid, gid)
-		for _, part := range []string{"server.user=", "privilege drop is not implemented", "User=", "CAP_NET_BIND_SERVICE"} {
-			if !strings.Contains(msg, part) {
-				t.Errorf("user %q: warning %q lacks %q", name, msg, part)
-			}
+	for name, c := range map[string]struct{ extra, want string }{
+		"short key":         {udp("    accept_proxy_from: [\"10.0.0.0/8\"]\n    accept_proxy_key_file: \"" + short + "\"\n"), "shorter than 32"},
+		"no key":            {udp("    accept_proxy_from: [\"10.0.0.0/8\"]\n    accept_proxy_key_file: \"" + empty + "\"\n"), "no key"},
+		"missing file":      {udp("    accept_proxy_from: [\"10.0.0.0/8\"]\n    accept_proxy_key_file: \"" + dir + "/nope\"\n"), "no such file"},
+		"key without trust": {udp("    accept_proxy_key_file: \"" + good + "\"\n"), "needs accept_proxy_from"},
+		"interfaces on tcp": {"listeners:\n  - name: l\n    bind: \":7002\"\n    protocol: tcp\n    backend: b\n    accept_proxy_from: [\"10.0.0.0/8\"]\n    accept_proxy_interfaces: [\"eth1\"]\n" +
+			"backends:\n  - name: b\n    servers: [\"127.0.0.1:1\"]\n", "applies to udp listeners"},
+		"interfaces without trust": {udp("    accept_proxy_interfaces: [\"eth1\"]\n"), "needs accept_proxy_from"},
+		"send key without send_proxy_v2": {"listeners:\n  - name: l\n    bind: \":7003\"\n    protocol: tcp\n    backend: b\n" +
+			"backends:\n  - name: b\n    servers: [\"127.0.0.1:1\"]\n    send_proxy_key_file: \"" + good + "\"\n", "needs send_proxy_v2"},
+	} {
+		if _, err := load(c.extra); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err %v, want %q", name, err, c.want)
 		}
 	}
-	if msg := privilegeDropWarning("", "nvelox-no-such-group", uid, gid); !strings.Contains(msg, "server.group=") {
-		t.Errorf("unknown group: got %q", msg)
+}
+
+// TestStartupWarnings_UDPAddressOnlyTrust: a udp listener that trusts
+// PROXY headers by source address alone warns; a key or interfaces, or a tcp
+// listener, do not.
+func TestStartupWarnings_UDPAddressOnlyTrust(t *testing.T) {
+	warn := func(l Listener) bool {
+		return strings.Contains(strings.Join(StartupWarnings(&Config{Listeners: []Listener{l}}), "\n"), "trusts the source address alone")
+	}
+	trust := []string{"10.0.0.0/8"}
+	if !warn(Listener{Name: "u", Protocol: "udp", AcceptProxyFrom: trust}) {
+		t.Error("udp, address only: no warning")
+	}
+	for name, l := range map[string]Listener{
+		"udp with key":        {Name: "u", Protocol: "udp", AcceptProxyFrom: trust, AcceptProxyKeyFile: "/k"},
+		"udp with interfaces": {Name: "u", Protocol: "udp", AcceptProxyFrom: trust, AcceptProxyInterfaces: []string{"eth1"}},
+		"tcp":                 {Name: "t", Protocol: "tcp", AcceptProxyFrom: trust},
+		"udp without trust":   {Name: "u", Protocol: "udp"},
+	} {
+		if warn(l) {
+			t.Errorf("%s: unexpected warning", name)
+		}
 	}
 }

@@ -351,8 +351,8 @@ func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes in
 //	<clientIP> - l4 <proto>/<dstPort> <status> <bytesIn> <bytesOut> <durMs>ms
 //	  e.g. 203.0.113.5 - l4 tcp/7000 no_route 0 0 0.400ms
 //
-// clientIP MUST be the real client (the PROXY-protocol-decoded source for
-// cross-region, not the relay). proto is "tcp"|"udp"; status is a short token
+// clientIP MUST be the real client (the PROXY-protocol-decoded source behind
+// a relay, not the relay). proto is "tcp"|"udp"; status is a short token
 // (ok|no_route|refused|ratelimited|timeout|error). Fields are CRLF-sanitized.
 func AccessL4(clientIP, proto string, dstPort int, status string, bytesIn, bytesOut int64, durationMs float64) {
 	current.Load().accessLog.Printf("%s - l4 %s/%d %s %d %d %.3fms",
