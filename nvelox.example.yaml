@@ -138,9 +138,9 @@ listeners:
     #   PROXY-v2 header and uses its source as the real client (then forwards
     #   it via send_proxy_v2 to the backend). Peers OUTSIDE the list have any
     #   inbound PROXY header IGNORED and are the client themselves. Empty
-    #   (default) = trust nobody. Use this on a region's edge to accept the
-    #   PROXY-v2 header that a PEER region's tunnel-server relay prepends,
-    #   preserving the real client IP across a cross-region hop.
+    #   (default) = trust nobody. Use this behind a relay (another nvelox,
+    #   HAProxy, a load balancer) that prepends a PROXY-v2 header, to keep the
+    #   real client IP across the hop.
     #   TCP: the handshake proves the peer's address, so only a listed peer
     #   can supply a header. UDP: a datagram's source address can be forged,
     #   so anyone who can send packets claiming a listed address can name any
@@ -302,17 +302,17 @@ listeners:
   # PROXY-v2 header's DESTINATION is the port the client actually hit (the
   # dedicated port), so the single backend listener can de-multiplex the whole
   # range from one socket — no per-port listener. accept_proxy_from lets the
-  # backend also trust a relayed inbound header (cross-region). This is how the
-  # tunnel-server serves 10k–100k dedicated ports without 10k–100k listeners.
+  # listener also trust a relayed inbound header. A PROXY-aware backend can
+  # serve 10k–100k dedicated ports this way without 10k–100k listeners.
   # - name: "dedicated-mux"
   #   bind: ":17000-17100"          # the dedicated range (grow as needed)
   #   protocol: "tcp"
   #   zero_copy: true
-  #   backend: "tunnel-mux"         # backend MUST specify an explicit port (the mux port)
-  #   accept_proxy_from: ["10.50.0.0/16"]   # trust relayed PROXY headers from peer regions
+  #   backend: "port-mux"           # backend MUST specify an explicit port (the mux port)
+  #   accept_proxy_from: ["10.50.0.0/16"]   # trust PROXY headers from your relays
   # (and a matching backend, e.g.)
   # backends:
-  #   - name: "tunnel-mux"
+  #   - name: "port-mux"
   #     servers: ["10.1.0.5:17999"]  # explicit mux port → all range ports land here
   #     send_proxy_v2: true
 
@@ -352,24 +352,25 @@ listeners:
     backend: "dns-servers"
 
   # ─── Dedicated-UDP MUX (range → one backend UDP port) ──
-  # The UDP counterpart of "dedicated-mux" above (cross-region UDP). Funnel the
+  # The UDP counterpart of "dedicated-mux" above. Funnel the
   # whole dedicated UDP range to ONE backend UDP port (give the backend an
   # explicit port so nvelox does NOT append the listener port). With
   # send_proxy_v2 the per-datagram PROXY-v2 DGRAM header's DESTINATION is the
-  # dedicated port the client hit, so the tunnel-server UDP mux de-multiplexes the
-  # whole range from one socket. accept_proxy_from trusts a peer-region relay's
-  # inbound header so the REAL client (not the relay) is preserved end-to-end.
-  # NOTE: the mux backend port must be firewalled to nvelox/peer-regions only —
-  # it trusts the PROXY header. See docs/CROSS_REGION_TCP_UDP_PROXY.md (#77).
+  # dedicated port the client hit, so a PROXY-aware backend de-multiplexes the
+  # whole range from one socket. accept_proxy_from trusts a relay's inbound
+  # header so the REAL client (not the relay) is preserved end-to-end — over
+  # UDP only where the network drops forged relay addresses (see
+  # accept_proxy_from above). NOTE: the mux backend port must be firewalled to
+  # nvelox only — it trusts the PROXY header.
   # - name: "dedicated-udp-mux"
   #   bind: ":17000-17100"          # the dedicated UDP range
   #   protocol: "udp"
-  #   backend: "tunnel-udp-mux"     # backend MUST specify an explicit port (the UDP mux port)
-  #   accept_proxy_from: ["10.50.0.0/16"]   # trust relayed PROXY headers from peer regions
+  #   backend: "udp-port-mux"       # backend MUST specify an explicit port (the UDP mux port)
+  #   accept_proxy_from: ["10.50.0.0/16"]   # trust PROXY headers from your relays
   # (and a matching backend, e.g.)
   # backends:
-  #   - name: "tunnel-udp-mux"
-  #     servers: ["10.1.0.5:7444"]  # explicit UDP mux port (TUNNEL_SERVER_UDP_MUX_PORT)
+  #   - name: "udp-port-mux"
+  #     servers: ["10.1.0.5:7444"]  # explicit UDP mux port
   #     send_proxy_v2: true
 
 # ═══════════════════════════════════════════════════════════

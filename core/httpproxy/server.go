@@ -526,7 +526,7 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Dynamic (runtime) denylist — TTL-bearing blocks pushed via the admin
-	// API (e.g. by ngris-sentinel abuse detection). Consulted on every request
+	// API (e.g. by an abuse detector). Consulted on every request
 	// using the same trusted-proxy-resolved client IP; process-global so it
 	// survives SIGHUP config reloads.
 	if s.DynDenylist != nil {

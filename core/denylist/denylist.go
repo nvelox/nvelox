@@ -4,8 +4,8 @@
 //
 // It is deliberately separate from the static per-listener ip_denylist
 // (config-driven, compiled at boot). This one is for DYNAMIC, EXPIRING blocks
-// pushed by an external controller — e.g. ngris-sentinel's AI/heuristic abuse
-// detection — without a config reload or process restart. Because the Default
+// pushed by an external controller — e.g. an abuse detector reading the
+// access log — without a config reload or process restart. Because the Default
 // instance is process-global, blocks apply to every listener/site and survive
 // SIGHUP config reloads (which rebuild HTTPServers but not this set).
 //

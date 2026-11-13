@@ -38,11 +38,11 @@ func TestValidation_AdminRequiresAPIKey(t *testing.T) {
 	}
 }
 
-// TestValidation_AdminProductionShape: the shape the ngris gateways run —
-// admin on a private or WireGuard IP with a key — still loads, and so does an
+// TestValidation_AdminProductionShape: a typical production shape — admin on
+// a private or VPN address with a key — still loads, and so does an
 // empty bind (loopback default at runtime).
 func TestValidation_AdminProductionShape(t *testing.T) {
-	for _, bind := range []string{"10.0.0.130:9091", "10.10.0.2:9091", "127.0.0.1:9091", "[::1]:9091", "localhost:9091", ":9091", ""} {
+	for _, bind := range []string{"10.20.0.10:9091", "10.40.0.2:9091", "127.0.0.1:9091", "[::1]:9091", "localhost:9091", ":9091", ""} {
 		cfg, err := loadYAML(t, "version: \"2\"\nadmin:\n  enabled: true\n  bind: \""+bind+"\"\n  api_key: \"0123456789abcdef0123456789abcdef\"\n")
 		if err != nil {
 			t.Errorf("bind %q: %v", bind, err)
@@ -65,7 +65,7 @@ func TestValidation_ControlPlaneBind(t *testing.T) {
 			t.Errorf("metrics bind %q: want a metrics.bind error, got %v", bind, err)
 		}
 	}
-	for _, bind := range []string{"", "127.0.0.1:9090", ":9090", "10.0.0.130:9090"} {
+	for _, bind := range []string{"", "127.0.0.1:9090", ":9090", "10.20.0.10:9090"} {
 		if _, err := loadYAML(t, "version: \"2\"\nmetrics:\n  enabled: true\n  bind: \""+bind+"\"\n"); err != nil {
 			t.Errorf("metrics bind %q: %v", bind, err)
 		}

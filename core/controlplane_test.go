@@ -26,7 +26,7 @@ func TestNewMetricsServer_Hardened(t *testing.T) {
 	if s.MaxHeaderBytes != 8<<10 {
 		t.Errorf("MaxHeaderBytes = %d, want 8192", s.MaxHeaderBytes)
 	}
-	if got := newMetricsServer("10.0.0.130:9090", http.NotFoundHandler()).Addr; got != "10.0.0.130:9090" {
+	if got := newMetricsServer("10.20.0.10:9090", http.NotFoundHandler()).Addr; got != "10.20.0.10:9090" {
 		t.Errorf("explicit bind rewritten to %q", got)
 	}
 }

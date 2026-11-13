@@ -104,10 +104,10 @@ func (e *Engine) closeL4Conns() {
 func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 	e := h.engine
 	dstPort := portOf(clientConn.LocalAddr())
-	// Is the immediate peer a TRUSTED relay (cross-region)? Its inbound PROXY-v2
+	// Is the immediate peer a TRUSTED relay (accept_proxy_from)? Its inbound PROXY-v2
 	// header names the REAL client, which isn't known until it is parsed below —
 	// until then an L4 record could only carry the relay IP, so the emit paths
-	// suppress a relay-misattributed record (cross-region-outage risk).
+	// suppress a record that would blame the relay for its clients.
 	peerTrusted := l.proxyTrust.trusts(clientConn.RemoteAddr())
 
 	if rl, ok := e.RateLimiters[l.Name]; ok && !rl.Allow() {

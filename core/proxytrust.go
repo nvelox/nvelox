@@ -21,10 +21,10 @@ import (
 // nvelox.example.yaml). Empty list => trust nobody => behaves exactly as
 // before (no inbound PROXY acceptance).
 //
-// This is the receiving half of cross-region client-IP preservation: a peer
-// region's relay prepends a PROXY-v2 header carrying the real client; the
-// trusted accept here recovers it so the existing send_proxy_v2 forwards the
-// real client to the backend (tunnel-server) instead of the relay pod.
+// This is the receiving half of client-IP preservation across a relay: the
+// relay prepends a PROXY-v2 header carrying the real client; the trusted
+// accept here recovers it so send_proxy_v2 forwards the real client to the
+// backend instead of the relay.
 type proxyTrust struct {
 	nets []*net.IPNet // nil/empty => trust nobody
 }
@@ -126,7 +126,7 @@ func tryParseInboundProxyV2(buf []byte) (done bool, src net.Addr, consumed int) 
 }
 
 // parseInboundProxyV2Datagram is the DATAGRAM-oriented counterpart of
-// tryParseInboundProxyV2, for the UDP plane (cross-region UDP #77 / N1). A UDP
+// tryParseInboundProxyV2, for UDP listeners. A UDP
 // datagram is atomic — the whole PROXY-v2 header is present in this one datagram
 // or it isn't, so there is no cross-read reassembly (no "need more bytes" state).
 //

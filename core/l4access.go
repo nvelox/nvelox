@@ -11,7 +11,7 @@ import (
 )
 
 // L4 access control: the static ip_denylist / ip_allowlist / source_ip ACL
-// and the dynamic (sentinel) denylist, enforced on every L4 entry point —
+// and the dynamic (admin API) denylist, enforced on every L4 entry point —
 // plain TCP, TLS-terminating TCP and UDP — on the RESOLVED client: the
 // PROXY-v2 source when a trusted accept_proxy_from relay names one, else the
 // connection peer. The HTTP path enforces the same lists per request in
@@ -20,7 +20,7 @@ import (
 // L4 access-log status tokens for a refused connection / UDP session.
 const (
 	l4StatusRefused     = "refused"     // static ip_denylist, ip_allowlist or acl deny
-	l4StatusDenylisted  = "denylisted"  // dynamic denylist (admin API / sentinel)
+	l4StatusDenylisted  = "denylisted"  // dynamic denylist (admin API)
 	l4StatusRateLimited = "ratelimited" // a limit: listener rate, backend max_connections, UDP session caps
 )
 

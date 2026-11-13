@@ -55,14 +55,14 @@ type ConnContext struct {
 	BalancerRef   lb.Balancer // Reference for OnDisconnect in OnClose
 	// L4 access logging (one record per connection at close, via logging.AccessL4):
 	// the protocol, the dialed (listener) port, and the REAL client — the
-	// PROXY-v2-decoded source for a cross-region/trusted peer, NOT the relay. Proto
+	// PROXY-v2-decoded source behind a trusted relay, NOT the relay. Proto
 	// and DstPort are set once at OnOpen; RealClientIP defaults to the peer and is
 	// upgraded to the parsed client when a trusted inbound PROXY-v2 header resolves.
 	// PeerTrusted: the immediate peer is a trusted relay (its inbound PROXY-v2 header
 	// names the real client). ClientResolved: that header was actually parsed, so
 	// RealClientIP is the real client. When PeerTrusted && !ClientResolved we must NOT
-	// emit an L4 record — attributing it to the relay could get a peer-region relay
-	// scored/blocked (a cross-region outage).
+	// emit an L4 record — attributing it to the relay could get the relay itself
+	// blocked by whatever acts on the access log (cutting off all its clients).
 	Proto          string
 	DstPort        int
 	RealClientIP   string
@@ -73,8 +73,8 @@ type ConnContext struct {
 	// backend has send_proxy_v2: true (or, for StripInbound conns, in OnData
 	// once the real client is recovered from the inbound header).
 	ProxyHeader []byte
-	// StripInbound (UDP, cross-region #77 / N1): this listener trusts an inbound
-	// PROXY-v2 header from the immediate peer (a peer-region relay). OnData then
+	// StripInbound (UDP): this listener trusts an inbound PROXY-v2 header from
+	// the immediate peer (a relay). OnData then
 	// strips a per-datagram DGRAM header and builds the OUTBOUND header from the
 	// parsed REAL client instead of the relay's address. SendProxyV2/LocalAddr are
 	// snapshotted so OnData can build that header (src = real client, dst =
@@ -147,10 +147,10 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 	}
 
 	dstPort := portOf(localAddr)
-	// Is the immediate peer a TRUSTED relay (cross-region)? Its inbound PROXY-v2
+	// Is the immediate peer a TRUSTED relay (accept_proxy_from)? Its inbound PROXY-v2
 	// header names the REAL client — but that isn't parsed until after the backend
 	// dial, so until then an L4 record can only carry the relay IP. Track it so the
-	// emit paths can suppress a relay-misattributed record (cross-region-outage risk).
+	// emit paths can suppress a record that would blame the relay for its clients.
 	peerTrusted := l.proxyTrust != nil && l.proxyTrust.trusts(c.RemoteAddr())
 
 	// Check rate limit
@@ -200,7 +200,7 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 		return
 	}
 
-	// Access policy (ip_denylist, the dynamic sentinel-pushed denylist,
+	// Access policy (ip_denylist, the dynamic admin-API denylist,
 	// ip_allowlist, acl) on the immediate peer, which IS the client.
 	ip := ipOf(c.RemoteAddr())
 	if ok, status := h.l4Admit(l, ip); !ok {
@@ -316,7 +316,7 @@ func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
 		// are not accumulated in v1.
 		// SUPPRESS when the peer is a trusted relay whose real client we never resolved
 		// (connection died before its inbound PROXY-v2 header was read): attributing the
-		// record to the relay could get a peer-region relay scored/blocked. A direct
+		// record to the relay could get the relay itself blocked. A direct
 		// (untrusted) peer IS the client, so it always emits.
 		if !peerTrusted || clientResolved {
 			status := "no_route"
@@ -339,11 +339,11 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 		return
 	}
 
-	// Cross-region UDP inbound (#77 / N1): when this listener trusts the immediate
-	// peer (a peer-region relay), each datagram carries a leading PROXY-v2 DGRAM
+	// UDP behind a relay: when this listener trusts the immediate peer
+	// (accept_proxy_from), each datagram carries a leading PROXY-v2 DGRAM
 	// header naming the REAL client. Strip it and build the OUTBOUND send_proxy_v2
 	// header from that real client (once — it's stable per conn), so the backend
-	// (tunnel-server) sees the client, not the relay. The header's dst is our
+	// sees the client, not the relay. The header's dst is our
 	// LocalAddr (the dedicated port the relay dialed) — already correct.
 	ctx.Mu.Lock()
 	stripInbound := ctx.StripInbound
@@ -535,7 +535,7 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 
 	sendProxyV2 := backend != nil && backend.SendProxyV2
 	// acceptInbound: this listener trusts an inbound PROXY-v2 header from the
-	// immediate peer (a peer-region relay, cross-region #77 / N1). When set, the
+	// immediate peer (a relay in accept_proxy_from). When set, the
 	// REAL client isn't known until the first inbound datagram is parsed, so we do
 	// NOT build the outbound header here — OnData strips the inbound header and
 	// builds the outbound one from the parsed real client. Untrusted peers skip
@@ -573,7 +573,7 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 	// nbio races on). Under a range-funnel ALL dedicated ports share one backend
 	// name, so without the local port two clients with the same source IP:port
 	// (CGNAT) hitting DIFFERENT dedicated ports would collide on one backend conn
-	// and their replies would cross. (UDP cross-region MUX, task #77 / N2.)
+	// and their replies would cross.
 	poolKey := fmt.Sprintf("%s|%d|%s", clientConn.RemoteAddr().String(), portOf(clientConn.LocalAddr()), clientCtx.BackendServer)
 	if session := h.engine.UDPPool.Get(poolKey); session != nil {
 		// Reuse existing backend connection
@@ -668,7 +668,7 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 		// Replies up to 65535 B (the max UDP payload) are relayed whole: a 4096
 		// buffer silently truncated any backend datagram >4 KB (the kernel
 		// discards the remainder of that datagram) — large DNS/QUIC/jumbo
-		// responses lost data. (UDP cross-region MUX, task #77 / N3.)
+		// responses lost data.
 		timeout := noReply
 		var writeErr error
 		deliver := func(b []byte) { _, writeErr = clientConn.Write(b) }

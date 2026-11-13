@@ -106,13 +106,13 @@ func TestTryParseInboundProxyV2(t *testing.T) {
 }
 
 // TestParseInboundProxyV2Datagram exercises the UDP (datagram) inbound parser
-// used by the owner-region nvelox to recover the real client from a peer-region
-// relay's per-datagram header (cross-region UDP #77 / N1). It round-trips against
+// used to recover the real client from a relay's per-datagram header. It
+// round-trips against
 // the SAME WriteProxyHeaderV2 the relay/send path uses, so writer↔parser stay
 // symmetric.
 func TestParseInboundProxyV2Datagram(t *testing.T) {
 	// UDP DGRAM header (real client + the dedicated dst port), built exactly as
-	// the tunnel-server relay / nvelox send path builds it.
+	// the nvelox send path builds it.
 	client := &net.UDPAddr{IP: net.ParseIP("203.0.113.7"), Port: 5555}
 	dest := &net.UDPAddr{IP: net.ParseIP("198.51.100.1"), Port: 17042}
 	hdr := proxyproto.HeaderProxyFromAddrs(2, client, dest)

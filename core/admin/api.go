@@ -145,7 +145,7 @@ func NewServer(bind string, apiKey string, balancers map[string]lb.Balancer, dyn
 	// Before routing: the peer and Host checks, then the browser cross-origin
 	// (CSRF) check, which refuses a state-changing request that a browser
 	// marks cross-site (Sec-Fetch-Site) or whose Origin is not this host.
-	// Clients that send neither header (curl, ngris-sentinel) pass it.
+	// Clients that send neither header (curl, scripts, controllers) pass it.
 	s.httpServer = &http.Server{
 		Addr:              bind,
 		Handler:           s.guard(http.NewCrossOriginProtection().Handler(mux)),

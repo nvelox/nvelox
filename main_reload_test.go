@@ -24,7 +24,7 @@ import (
 )
 
 // TestRun_SIGHUPRotatesCertWithoutDroppingConnections drives the exact path a
-// certificate rotation takes in production (ngris cert-sync on public-gw):
+// certificate rotation takes in production (an ACME client or cert sync):
 // replace the cert/key files by atomic rename, send SIGHUP, and nvelox must
 //   - present the NEW certificate to new TLS handshakes,
 //   - keep serving the already-established keep-alive connection (no drop),

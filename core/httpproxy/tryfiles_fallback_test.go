@@ -15,7 +15,7 @@ import (
 
 // TestTryFiles_FallbackServedBySameRoute: an SPA route whose try_files
 // fallback is "/" serves its own index.html, also where "/" itself is routed
-// to a backend (ngris-board's layout: "/" is the landing page of the API, the
+// to a backend (a common layout: "/" is a server-rendered landing page, the
 // app's deep links are static). The fallback used to go through the router
 // again and reached the backend.
 func TestTryFiles_FallbackServedBySameRoute(t *testing.T) {

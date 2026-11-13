@@ -188,9 +188,9 @@ type Listener struct {
 	// PROXY header IGNORED — the real TCP/UDP peer is used — so a direct client
 	// can never spoof its source. Empty (default) = trust nobody = inbound PROXY
 	// headers are never honored (behaviour unchanged). Distinct from
-	// trusted_proxies (L7 XFF/X-Real-IP trust). Used by cross-region proxying:
-	// a peer region's relay prepends a PROXY-v2 header with the real client, and
-	// this list lets the owner region's nvelox accept + forward it to the backend.
+	// trusted_proxies (L7 XFF/X-Real-IP trust). Used behind a relay (another
+	// nvelox, HAProxy, ...) that prepends a PROXY-v2 header with the real
+	// client: this list lets nvelox accept it and forward it to the backend.
 	AcceptProxyFrom []string `yaml:"accept_proxy_from,omitempty"`
 
 	// L7 fields
