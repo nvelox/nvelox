@@ -82,6 +82,9 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 
 	engine := core.NewEngine(cfg)
 	engine.Listeners = expandedListeners
+	// Bind as root, serve only as server.user: nothing is answered before
+	// the switch below.
+	engine.HoldServing()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -106,6 +109,7 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 		if info != "" {
 			logging.Info("[SERVER] %s", info)
 		}
+		engine.Serve()
 	case err, ok := <-errCh:
 		if ok && err != nil && err != context.Canceled {
 			return fmt.Errorf("engine stopped: %v", err)

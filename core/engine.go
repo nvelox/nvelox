@@ -23,6 +23,7 @@ import (
 	"nvelox/core/httpproxy"
 	"nvelox/core/logging"
 	"nvelox/core/metrics"
+	"nvelox/core/servegate"
 	"nvelox/core/sticky"
 	"nvelox/core/tlsutil"
 	"nvelox/lb"
@@ -64,6 +65,7 @@ type Engine struct {
 	reloadMu        sync.Mutex                  // serializes concurrent SIGHUPs
 	view            atomic.Pointer[backendView] // what request paths read (backendview.go)
 	ready           chan struct{}               // closed once Start holds every listening socket
+	serveGate       *servegate.Gate             // HoldServing: sockets serve nothing until Serve
 	// l4Running: the L4 (tcp, udp) listener configs Start began serving,
 	// keyed by protocol, name and address. A reload does not rebuild them;
 	// it only swaps their PROXY signing keys (rotation).
@@ -123,6 +125,23 @@ func l4Key(l *ListenerConfig) string { return l.Protocol + "|" + l.Name + "|" + 
 // and HTTP/3, TCP, UDP, admin API, metrics). main switches to server.user /
 // server.group only then.
 func (e *Engine) Ready() <-chan struct{} { return e.ready }
+
+// HoldServing makes Start bind every socket but serve nothing until Serve:
+// main switches to server.user in between, so nothing is answered with root
+// rights. Call it before Start. Connections wait in the kernel's accept
+// queue meanwhile; a UDP datagram's session waits in OnOpen.
+func (e *Engine) HoldServing() { e.serveGate = servegate.New() }
+
+// Serve lets the sockets Start bound serve (after HoldServing).
+func (e *Engine) Serve() { e.serveGate.Open() }
+
+// runDone is closed when Start's context ends (nil before Start).
+func (e *Engine) runDone() <-chan struct{} {
+	if e.runCtx == nil {
+		return nil
+	}
+	return e.runCtx.Done()
+}
 
 func NewEngine(cfg *config.Config) *Engine {
 	e := &Engine{
@@ -197,6 +216,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	// on ctx; the shutdown path snapshots BindGroups under it again.
 	e.reloadMu.Lock()
 	startupLocked := true
+	e.runCtx = ctx
 	defer func() {
 		if startupLocked {
 			e.reloadMu.Unlock()
@@ -236,6 +256,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	if e.Config.Admin.Enabled {
 		e.AdminServer = admin.NewServer(e.Config.Admin.Bind, e.Config.Admin.APIKey, nil, denylist.Default)
 		e.AdminServer.SetBalancerSource(func() map[string]lb.Balancer { return e.backends().Balancers })
+		e.AdminServer.SetServeGate(e.serveGate, ctx.Done())
 		if err := e.AdminServer.Start(); err != nil {
 			return err
 		}
@@ -259,6 +280,10 @@ func (e *Engine) Start(ctx context.Context) error {
 			return fmt.Errorf("metrics endpoint: %w", err)
 		}
 		go func() {
+			if !e.serveGate.Wait(ctx.Done()) {
+				mln.Close()
+				return
+			}
 			if err := e.metricsServer.Serve(mln); err != nil && err != http.ErrServerClosed {
 				logging.Error("[METRICS] Server error: %v", err)
 			}
@@ -294,6 +319,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	for _, addr := range bindOrder {
 		group := bindGroups[addr]
 		bg := httpproxy.NewBindGroup(addr, group[0].listener.Protocol)
+		bg.SetServeGate(e.serveGate, ctx.Done())
 		for _, s := range group {
 			bg.AddSite(s.site)
 		}
@@ -316,8 +342,6 @@ func (e *Engine) Start(ctx context.Context) error {
 	// 2. Setup Handler
 	handler := NewProxyEventHandler(e)
 	e.l4Handler = handler
-
-	e.runCtx = ctx
 
 	// 3. L4 TCP listeners. Plain (non-TLS) listeners run a std accept loop
 	// with one relayL4 goroutine pair per connection; TLS-terminating
@@ -671,6 +695,7 @@ func (e *Engine) reloadL7Sites(expanded []*ListenerConfig) (swapped, added, remo
 	for _, addr := range newAddrs {
 		g := newGroups[addr]
 		bg := httpproxy.NewBindGroup(addr, g.protocol)
+		bg.SetServeGate(e.serveGate, e.runDone())
 		for _, s := range g.sites {
 			bg.AddSite(s)
 		}

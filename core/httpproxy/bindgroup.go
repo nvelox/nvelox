@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"nvelox/core/logging"
+	"nvelox/core/servegate"
 	"nvelox/core/tlsutil"
 
 	"github.com/quic-go/quic-go/http3"
@@ -46,6 +47,11 @@ type BindGroup struct {
 	// buildTLSConfig). Sites with client_auth get a clone of it carrying
 	// their client-certificate policy, chosen per handshake by SNI.
 	tlsBase *tls.Config
+
+	// serveGate holds serving back until it opens (nil: serve at once);
+	// gateDone ends the wait at shutdown (core/servegate).
+	serveGate *servegate.Gate
+	gateDone  <-chan struct{}
 
 	// tunnels holds the open WebSocket tunnels of every site of the group,
 	// replaced site instances included. ReplaceSites re-checks them against
@@ -86,6 +92,12 @@ func NewBindGroup(addr, protocol string) *BindGroup {
 	}
 	g.tunnels.recheck = g.recheckTunnel
 	return g
+}
+
+// SetServeGate makes Start bind but serve nothing until gate opens; done
+// (closed at shutdown) ends the wait. Call before Start.
+func (g *BindGroup) SetServeGate(gate *servegate.Gate, done <-chan struct{}) {
+	g.serveGate, g.gateDone = gate, done
 }
 
 // AddSite attaches a Site to this group. Idempotent during initial
@@ -567,6 +579,10 @@ func (g *BindGroup) Start() error {
 				TLSConfig: http3.ConfigureTLSConfig(tlsCfg.Clone()),
 			}
 			go func() {
+				if !g.serveGate.Wait(g.gateDone) {
+					pc.Close()
+					return
+				}
 				if err := g.http3Server.Serve(pc); err != nil && err != http.ErrServerClosed {
 					logging.Error("[HTTP3] Server error: %v", err)
 				}
@@ -574,6 +590,10 @@ func (g *BindGroup) Start() error {
 			logging.Info("[HTTP3] QUIC listener started on %s", g.addr)
 		}
 		go func() {
+			if !g.serveGate.Wait(g.gateDone) {
+				ln.Close()
+				return
+			}
 			if err := g.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 				logging.Error("[HTTP] Server error: %v", err)
 			}
@@ -584,6 +604,10 @@ func (g *BindGroup) Start() error {
 			return fmt.Errorf("listen %s: %w", g.addr, err)
 		}
 		go func() {
+			if !g.serveGate.Wait(g.gateDone) {
+				ln.Close()
+				return
+			}
 			if err := g.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 				logging.Error("[HTTP] Server error: %v", err)
 			}

@@ -44,6 +44,9 @@ func (e *Engine) startAcceptLoop(ln net.Listener, name string, serve func(net.Co
 	e.acceptWG.Add(1)
 	go func() {
 		defer e.acceptWG.Done()
+		if !e.serveGate.Wait(e.runDone()) {
+			return // shutting down before serving began (Stop closes ln)
+		}
 		var backoff time.Duration
 		for {
 			c, err := ln.Accept()

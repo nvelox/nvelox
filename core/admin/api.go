@@ -17,6 +17,7 @@ import (
 
 	"nvelox/core/denylist"
 	"nvelox/core/logging"
+	"nvelox/core/servegate"
 	"nvelox/lb"
 )
 
@@ -88,6 +89,8 @@ func parseBind(bind string) bindInfo {
 // Server provides a REST API for runtime management.
 type Server struct {
 	httpServer *http.Server
+	serveGate  *servegate.Gate // Start serves once it opens (nil: at once)
+	gateDone   <-chan struct{}
 	balancers  map[string]lb.Balancer
 	// balancerSource, when set, returns the engine's current backend view: a
 	// map a reload never writes again (the engine publishes a fresh one), so
@@ -361,6 +364,12 @@ func (s *Server) clearAuthFailures(ip string) {
 // background. A missing API key or an unparsable bind is an error: the
 // admin API never runs unauthenticated. A listen failure (port taken,
 // address not yet up) is logged and does not stop the proxy.
+// SetServeGate makes Start bind but serve nothing until gate opens; done
+// (closed at shutdown) ends the wait. Call before Start.
+func (s *Server) SetServeGate(gate *servegate.Gate, done <-chan struct{}) {
+	s.serveGate, s.gateDone = gate, done
+}
+
 func (s *Server) Start() error {
 	if s.apiKey == "" {
 		return errors.New("admin API: api_key is required (set admin.api_key)")
@@ -375,6 +384,10 @@ func (s *Server) Start() error {
 		return fmt.Errorf("admin API: %w", err)
 	}
 	go func() {
+		if !s.serveGate.Wait(s.gateDone) {
+			ln.Close()
+			return
+		}
 		if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 			logging.Error("[ADMIN] Server error: %v", err)
 		}

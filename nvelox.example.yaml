@@ -7,7 +7,8 @@ version: "2"
 server:
   # gateway_id: "gw-1"  # gw=<id> on HTTP access-log lines (default: hostname)
   # user / group: started as root, nvelox binds every port, hands its log
-  # files to this user and then runs as it (like nginx). It exits if it
+  # files to this user and then runs as it (like nginx); nothing is served
+  # before the switch. It exits if it
   # cannot switch. Not root: a startup WARNING, and it runs as it is. The
   # config, certificates and log directory must be readable by this user for
   # reloads and log reopens; a reload cannot add a port below 1024 (restart

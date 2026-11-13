@@ -138,6 +138,11 @@ func (h *ProxyEventHandler) onOpen(c *nbio.Conn, viaListedInterface bool) {
 	if h.getCtx(c) != nil {
 		return
 	}
+	// Nothing is served before the process gave up root (Engine.HoldServing).
+	if h.engine != nil && !h.engine.serveGate.Wait(h.engine.runDone()) {
+		closeOnOpen(c)
+		return
+	}
 
 	localAddr := c.LocalAddr()
 	if localAddr == nil {
