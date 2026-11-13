@@ -162,9 +162,9 @@ func buildSiteSet(all []*HTTPServer) *siteSet {
 	return ss
 }
 
-// Defaults preserved when a listener doesn't configure timeouts. Mirrors
-// the original hard-coded http.Server values so unconfigured listeners
-// keep their pre-per-listener-timeouts behavior.
+// Defaults when a listener doesn't configure timeouts. Read and write are the
+// stall limits of stall.go: how long the client may stall sending its body or
+// taking the response.
 const (
 	defaultReadHeaderTimeout = 10 * time.Second
 	defaultReadTimeout       = 60 * time.Second
@@ -174,9 +174,8 @@ const (
 
 // ServeHTTP picks the Site that owns r.Host and delegates. Single-site
 // bind groups skip the lookup entirely (zero overhead for the common case).
-// Per-listener Read/Write timeouts are applied here, after the site is
-// known, via http.ResponseController so two sites sharing the same bind
-// port can carry different request budgets.
+// The site applies its own read/write limits (stall.go), so two sites
+// sharing the same bind port can carry different values.
 func (g *BindGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ss := g.sites.Load()
 	if ss == nil || len(ss.all) == 0 {
@@ -188,7 +187,6 @@ func (g *BindGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		site.serveError(w, http.StatusMisdirectedRequest)
 		return
 	}
-	applySiteDeadlines(w, site)
 	site.ServeHTTP(w, r)
 }
 
@@ -296,34 +294,6 @@ func (g *BindGroup) siteClientAuth(site *HTTPServer) *tlsutil.ClientAuth {
 		}
 	}
 	return nil
-}
-
-// applySiteDeadlines sets per-request read/write deadlines based on the
-// matched site's listener.timeouts. A configured "0" yields no deadline
-// (unlimited); an unconfigured field gets the bindgroup default (60s).
-// Errors from SetReadDeadline / SetWriteDeadline are intentionally
-// ignored — they indicate a wrapped ResponseWriter that doesn't surface
-// the underlying connection (e.g., a test fake), and the request will
-// still complete; we just won't enforce a per-request deadline in that
-// case.
-func applySiteDeadlines(w http.ResponseWriter, site *HTTPServer) {
-	if site == nil {
-		return
-	}
-	rc := http.NewResponseController(w)
-	readTO := site.Listener.Timeouts.ResolveRead(defaultReadTimeout)
-	writeTO := site.Listener.Timeouts.ResolveWrite(defaultWriteTimeout)
-	now := time.Now()
-	if readTO > 0 {
-		_ = rc.SetReadDeadline(now.Add(readTO))
-	} else {
-		_ = rc.SetReadDeadline(time.Time{}) // explicit "unlimited"
-	}
-	if writeTO > 0 {
-		_ = rc.SetWriteDeadline(now.Add(writeTO))
-	} else {
-		_ = rc.SetWriteDeadline(time.Time{})
-	}
 }
 
 // resolveHeaderAndIdleTimeouts derives the http.Server-level timeouts that
@@ -520,10 +490,11 @@ func (g *BindGroup) Start() error {
 
 	// http.Server has only one slot for ReadHeaderTimeout / IdleTimeout per
 	// bind, so those are derived from the site set (max across sites, with
-	// defaults). ReadTimeout / WriteTimeout are deliberately 0 here: Read
-	// and Write are applied per-request from the matched site's listener
-	// timeouts via http.ResponseController in ServeHTTP. ReadHeaderTimeout
-	// remains the slowloris guard for the pre-routing header-parse phase.
+	// defaults). ReadTimeout / WriteTimeout are deliberately 0 here: they
+	// would bound the whole request and response. The site's read and write
+	// limits bound only the time a transfer is stuck (stall.go).
+	// ReadHeaderTimeout remains the slowloris guard for the pre-routing
+	// header-parse phase.
 	readHeaderTO, idleTO := g.resolveHeaderAndIdleTimeouts()
 	g.httpServer = &http.Server{
 		Addr:              g.addr,

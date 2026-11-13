@@ -100,9 +100,12 @@ type HTTPServer struct {
 	ErrorPages       map[int][]byte // status code -> pre-loaded HTML content
 	ResponseCache    *Cache
 	BufferPool       *BufferPool
-	backendTransport *http.Transport // default transport (plaintext HTTP backends)
-	// backendTransports holds per-backend TLS-enabled transports. If a backend's
-	// name is absent here, the default backendTransport is used.
+	backendTransport *http.Transport // transport of a backend without a config entry
+	// plainTransports holds the transports of plaintext backends,
+	// backendTransports those of backend_tls backends: a backend_tls backend
+	// missing from backendTransports is refused (backendTLSReady), never
+	// sent in plaintext.
+	plainTransports   map[string]*http.Transport
 	backendTransports map[string]*http.Transport
 	backendSchemes    map[string]string // "https" when backend_tls is enabled
 	altSvcHeader      string
@@ -215,18 +218,12 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 		s.IPRateLimiter = middleware.NewIPRateLimiter(l.IPRateLimit.RequestsPerSecond, l.IPRateLimit.Burst)
 	}
 
-	// Shared transport with connection pooling to backends. Backend dials
-	// (WebSocket upgrades included) give up after backendDialTimeout.
-	s.backendTransport = &http.Transport{
-		DialContext:         backendDialer.DialContext,
-		MaxIdleConns:        1024,
-		MaxIdleConnsPerHost: 256,
-		MaxConnsPerHost:     0, // unlimited
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
-		DisableCompression:  true, // we handle compression ourselves
-		ForceAttemptHTTP2:   true,
-	}
+	// Backend transports, with connection pooling. Each backend gets its own,
+	// carrying its dial and response-header timeouts (backendTimeouts);
+	// backendTransport serves a backend without a config entry. WebSocket
+	// upgrades go through the same transports.
+	s.backendTransport = newBackendTransport(l, nil, nil)
+	s.plainTransports = make(map[string]*http.Transport)
 
 	// Per-backend TLS transports: a backend with backend_tls.enabled=true gets
 	// its own Transport with a TLSClientConfig built from the backend config.
@@ -238,7 +235,11 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 	s.backendTransports = make(map[string]*http.Transport)
 	s.backendSchemes = make(map[string]string)
 	for name, be := range backends {
-		if be == nil || !be.BackendTLS.Enabled {
+		if be == nil {
+			continue
+		}
+		if !be.BackendTLS.Enabled {
+			s.plainTransports[name] = newBackendTransport(l, be, nil)
 			continue
 		}
 		tlsCfg, err := buildBackendTLSConfig(be.BackendTLS)
@@ -246,16 +247,7 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 			logging.Error("[HTTP] backend %q: backend_tls invalid: %v — requests to it fail with 502 (never sent in plaintext)", name, err)
 			continue
 		}
-		s.backendTransports[name] = &http.Transport{
-			DialContext:         backendDialer.DialContext,
-			MaxIdleConns:        1024,
-			MaxIdleConnsPerHost: 256,
-			IdleConnTimeout:     90 * time.Second,
-			TLSHandshakeTimeout: 10 * time.Second,
-			TLSClientConfig:     tlsCfg,
-			DisableCompression:  true,
-			ForceAttemptHTTP2:   true,
-		}
+		s.backendTransports[name] = newBackendTransport(l, be, tlsCfg)
 		s.backendSchemes[name] = "https"
 	}
 
@@ -264,11 +256,49 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 	return s
 }
 
-// backendDialTimeout bounds a TCP connect to a backend server (the WebSocket
-// path had its own 10 s dial before it moved onto the Transport).
-const backendDialTimeout = 10 * time.Second
+// Timeouts of an HTTP backend that sets none (nor its listener, for connect).
+const (
+	defaultBackendConnect        = 10 * time.Second
+	defaultBackendResponseHeader = 60 * time.Second
+)
 
-var backendDialer = &net.Dialer{Timeout: backendDialTimeout, KeepAlive: 30 * time.Second}
+// backendTimeouts returns backend be's dial and response-header timeouts on
+// listener l: the backend's own timeouts.connect / timeouts.response_header,
+// else the listener's timeouts.connect, else the defaults. 0 means no limit.
+// be and l may be nil.
+func backendTimeouts(l *ListenerConfig, be *config.Backend) (connect, responseHeader time.Duration) {
+	connect, responseHeader = defaultBackendConnect, defaultBackendResponseHeader
+	if l != nil && l.Timeouts.Connect != "" {
+		connect = l.Timeouts.ParseConnect()
+	}
+	if be != nil {
+		if be.Timeouts.Connect != "" {
+			connect = be.Timeouts.ParseConnect()
+		}
+		responseHeader = be.Timeouts.ResolveResponseHeader(defaultBackendResponseHeader)
+	}
+	return max(connect, 0), max(responseHeader, 0)
+}
+
+// newBackendTransport builds the transport to backend be (nil: a backend
+// without a config entry) of listener l; tlsCfg is its backend_tls config
+// (nil: plaintext). A backend that does not start answering within the
+// response-header timeout fails the attempt with a timeout (answered 504).
+func newBackendTransport(l *ListenerConfig, be *config.Backend, tlsCfg *tls.Config) *http.Transport {
+	connect, responseHeader := backendTimeouts(l, be)
+	dialer := &net.Dialer{Timeout: connect, KeepAlive: 30 * time.Second}
+	return &http.Transport{
+		DialContext:           dialer.DialContext,
+		MaxIdleConns:          1024,
+		MaxIdleConnsPerHost:   256,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		TLSClientConfig:       tlsCfg,
+		ResponseHeaderTimeout: responseHeader,
+		DisableCompression:    true, // we handle compression ourselves
+		ForceAttemptHTTP2:     true,
+	}
+}
 
 // parseByteSize parses human-readable byte sizes ("10MB", "512KB") into bytes.
 // Returns 0 for invalid/empty input and clamps n*multiplier to math.MaxInt64
@@ -464,6 +494,14 @@ func (s *HTTPServer) Close() {
 func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	serverW := w // http.MaxBytesReader needs the server's own writer (it closes the connection after a 413)
+	// The listener's read and write limits: how long the client may stall
+	// sending its body or taking the response (stall.go). Deferred first, so
+	// that finish runs last, after every write of the handler.
+	if lim := newStallLimits(w, r, s.Listener); lim != nil {
+		defer lim.finish()
+		w = lim.writer(w)
+		r.Body = lim.wrapBody(r.Body)
+	}
 	rec := &statusRecorder{ResponseWriter: w}
 	w = rec
 
@@ -753,9 +791,6 @@ dispatch:
 		u.admission = &tunnelAdmission{req: admitted, route: matched, backend: backendName,
 			scheme: s.backendScheme(backendName), rerouted: rerouted}
 		u.clientIP = net.ParseIP(clientIP)
-	}
-	if readTO := s.Listener.Timeouts.ResolveRead(defaultReadTimeout); readTO > 0 {
-		u.readDeadline = start.Add(readTO)
 	}
 	s.proxy(w, r, rec, u, &upstream)
 }

@@ -329,28 +329,81 @@ func TestProxy_ConnectIsRejected(t *testing.T) {
 	}
 }
 
-// TestProxy_ReadTimeoutIs504NotFailure: on HTTP/1 net/http cancels the
-// request context when the listener's read timeout passes; that is neither
-// the client going away nor a backend failure: the client gets a 504 and
-// the backend is not penalized (it used to be a 502 counted as a failure).
-func TestProxy_ReadTimeoutIs504NotFailure(t *testing.T) {
+// TestProxy_SlowBackendOutlivesListenerRead: the listener's read limit is
+// about the client sending its body. A request without a body that waits
+// for a slow backend longer than it is not cut (on HTTP/1 a read deadline
+// left on the connection used to cancel the request: 504).
+func TestProxy_SlowBackendOutlivesListenerRead(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-r.Context().Done():
-		case <-time.After(2 * time.Second):
-		}
+		time.Sleep(time.Second)
+		io.WriteString(w, "late")
 	}))
 	defer backend.Close()
 	ph := newSecPassive()
-	l := &ListenerConfig{Timeouts: config.TimeoutConfig{Read: "300ms"}}
+	l := &ListenerConfig{Timeouts: config.TimeoutConfig{Read: "300ms", Write: "300ms"}}
 	_, addr := secSite(t, l, []string{secHost(backend)}, secOpts{ph: ph})
 
 	resp, _ := secRaw(t, addr, secGet("/slow", ""), 3*time.Second)
-	if !strings.HasPrefix(secStatus(resp), "HTTP/1.1 504") {
-		t.Fatalf("slow backend past the read timeout -> %q, want 504", secStatus(resp))
+	if !strings.HasPrefix(secStatus(resp), "HTTP/1.1 200") || secBody(resp) != "late" {
+		t.Fatalf("backend answering after the listener's read limit -> %q, want 200 \"late\"", resp)
 	}
 	if n := ph.totalFailures(); n != 0 {
-		t.Fatalf("passive health recorded %d failures for the listener's own timeout", n)
+		t.Fatalf("passive health recorded %d failures", n)
+	}
+}
+
+// TestProxy_ResponseHeaderTimeoutIs504: a backend that does not start
+// answering within its timeouts.response_header gets the client a 504 and
+// counts as a failure; the request, which reached it, is not retried.
+func TestProxy_ResponseHeaderTimeoutIs504(t *testing.T) {
+	var hits atomic.Int32
+	slow := func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		select {
+		case <-r.Context().Done():
+		case <-time.After(3 * time.Second):
+		}
+	}
+	b1 := httptest.NewServer(http.HandlerFunc(slow))
+	defer b1.Close()
+	b2 := httptest.NewServer(http.HandlerFunc(slow))
+	defer b2.Close()
+	ph := newSecPassive()
+	be := &config.Backend{
+		Timeouts: config.TimeoutConfig{ResponseHeader: "300ms"},
+		Retry:    config.RetryConfig{Attempts: 2},
+	}
+	_, addr := secSite(t, &ListenerConfig{}, []string{secHost(b1), secHost(b2)}, secOpts{ph: ph, backend: be})
+
+	start := time.Now()
+	resp, _ := secRaw(t, addr, secGet("/slow", ""), 5*time.Second)
+	if !strings.HasPrefix(secStatus(resp), "HTTP/1.1 504") {
+		t.Fatalf("backend silent past response_header -> %q, want 504", secStatus(resp))
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("504 after %v, want about the 300ms response_header", took)
+	}
+	if n := ph.totalFailures(); n != 1 {
+		t.Fatalf("passive health recorded %d failures, want 1", n)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("backend hit %d times, want 1 (no retry once the request was sent)", n)
+	}
+}
+
+// TestProxy_ResponseHeaderZeroWaits: "0" is no limit.
+func TestProxy_ResponseHeaderZeroWaits(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(600 * time.Millisecond)
+		io.WriteString(w, "late")
+	}))
+	defer backend.Close()
+	be := &config.Backend{Timeouts: config.TimeoutConfig{ResponseHeader: "0"}}
+	_, addr := secSite(t, &ListenerConfig{}, []string{secHost(backend)}, secOpts{backend: be})
+
+	resp, _ := secRaw(t, addr, secGet("/slow", ""), 3*time.Second)
+	if !strings.HasPrefix(secStatus(resp), "HTTP/1.1 200") || secBody(resp) != "late" {
+		t.Fatalf("response_header 0 -> %q, want 200 \"late\"", resp)
 	}
 }
 
