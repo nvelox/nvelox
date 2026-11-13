@@ -358,3 +358,23 @@ func TestPrivilegeDropWarning(t *testing.T) {
 		t.Errorf("unknown group: got %q", msg)
 	}
 }
+
+// TestStartupWarnings_MetricsEveryAddress (D3): metrics bound to every address
+// starts, with a warning; loopback, a specific address and the empty default
+// do not warn.
+func TestStartupWarnings_MetricsEveryAddress(t *testing.T) {
+	for bind, want := range map[string]bool{
+		":9090": true, "0.0.0.0:9090": true, "[::]:9090": true,
+		"": false, "127.0.0.1:9090": false, "[::1]:9090": false, "10.20.0.10:9090": false,
+	} {
+		cfg := &Config{Metrics: MetricsConfig{Enabled: true, Bind: bind}}
+		got := strings.Contains(strings.Join(StartupWarnings(cfg), "\n"), "every address")
+		if got != want {
+			t.Errorf("metrics.bind %q: warning=%v, want %v", bind, got, want)
+		}
+	}
+	cfg := &Config{Metrics: MetricsConfig{Enabled: false, Bind: ":9090"}}
+	if w := StartupWarnings(cfg); len(w) != 0 {
+		t.Errorf("metrics disabled: want no warning, got %q", w)
+	}
+}

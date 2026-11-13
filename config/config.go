@@ -973,6 +973,35 @@ func validateACL(rules []ACLRule, l4 bool) error {
 	return nil
 }
 
+// StartupWarnings returns what main prints on stderr at startup, whatever the
+// log level: server.* keys that do nothing, and settings that are accepted but
+// expose something.
+func StartupWarnings(cfg *Config) []string {
+	out := ServerWarnings(cfg.Server)
+	if cfg.Metrics.Enabled && everyAddress(cfg.Metrics.Bind) {
+		out = append(out, fmt.Sprintf("metrics.bind %q listens on every address, and the metrics endpoint has no authentication: bind a specific address or restrict the port with a firewall", cfg.Metrics.Bind))
+	}
+	return out
+}
+
+// everyAddress reports whether bind (host:port) leaves the host empty or names
+// the IPv4 or IPv6 unspecified address. An empty bind is not one of them: it
+// means each server's loopback default.
+func everyAddress(bind string) bool {
+	if bind == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(bind)
+	if err != nil {
+		return false // validation reports a malformed bind
+	}
+	if host == "" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsUnspecified()
+}
+
 // ServerWarnings returns one warning per server.* key that is set but not
 // implemented. user / group are reported only when the process does not
 // already run as them (nvelox never drops privileges itself); pid_file and
