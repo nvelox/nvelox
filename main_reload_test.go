@@ -102,7 +102,7 @@ logging:
 	}
 	_ = reused
 
-	// Rotate like cert-sync: temp file in the same dir + rename, key then cert.
+	// Rotate like a certificate manager: temp file in the same dir + rename, key then cert.
 	installPair(t, dir, certPath, keyPath, v2cert, v2key)
 	reloadCh <- syscall.SIGHUP
 	waitFor(t, "new handshakes get v2", func() bool { got, err := servedCN(addr); return err == nil && got == "v2.rotation.test" })
@@ -213,7 +213,7 @@ func selfSigned(t *testing.T, cn string) (certPEM, keyPEM []byte) {
 		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: kder})
 }
 
-// installPair replaces the files the way cert-sync does: write a temp file in
+// installPair replaces the files the way certificate managers do: write a temp file in
 // the destination directory, then rename over the target (key first).
 func installPair(t *testing.T, dir, certPath, keyPath string, certPEM, keyPEM []byte) {
 	t.Helper()
