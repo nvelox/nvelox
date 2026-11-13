@@ -929,6 +929,11 @@ func validate(cfg *Config) error {
 		return err
 	}
 
+	// One udp listener per port (before the bind-group rules, whose
+	// server_name rules are about HTTP sites).
+	if err := validateUDPPorts(cfg.Listeners); err != nil {
+		return err
+	}
 	// Cross-listener bind-group rules (nginx-style multi-server-per-port).
 	if err := validateBindGroups(cfg.Listeners); err != nil {
 		return err
@@ -1259,43 +1264,75 @@ func validateBindGroups(listeners []Listener) error {
 	return nil
 }
 
+// validateUDPPorts refuses two udp listeners on one port, also on different
+// addresses or through overlapping ranges: a datagram is matched to its udp
+// listener by the port it arrived on, so one listener's settings (backend,
+// IP lists, ACL, PROXY trust) would silently apply to the other's traffic.
+func validateUDPPorts(listeners []Listener) error {
+	owner := make(map[int]string) // port -> udp listener
+	for _, l := range listeners {
+		if l.Protocol != "udp" {
+			continue
+		}
+		first, last, err := bindPortRange(l.Bind)
+		if err != nil {
+			continue // reported by validateBindAddress
+		}
+		for p := first; p <= last; p++ {
+			if other, taken := owner[p]; taken {
+				return fmt.Errorf("listeners %s and %s: two udp listeners cannot share port %d, also not on different addresses",
+					other, l.Name, p)
+			}
+			owner[p] = l.Name
+		}
+	}
+	return nil
+}
+
 func validateBindAddress(addr string) error {
+	_, _, err := bindPortRange(addr)
+	return err
+}
+
+// bindPortRange returns the port of a bind address, or the first and last
+// port of a range ("10.0.0.1:7000", ":17000-17100").
+func bindPortRange(addr string) (first, last int, err error) {
 	lastColon := strings.LastIndex(addr, ":")
 	if lastColon == -1 {
-		return fmt.Errorf("missing port")
+		return 0, 0, fmt.Errorf("missing port")
 	}
 	portStr := addr[lastColon+1:]
 
 	if strings.Contains(portStr, "-") {
 		parts := strings.Split(portStr, "-")
 		if len(parts) != 2 {
-			return fmt.Errorf("invalid port range format")
+			return 0, 0, fmt.Errorf("invalid port range format")
 		}
 		start, err := strconv.Atoi(parts[0])
 		if err != nil {
-			return fmt.Errorf("invalid range start port: %v", err)
+			return 0, 0, fmt.Errorf("invalid range start port: %v", err)
 		}
 		end, err := strconv.Atoi(parts[1])
 		if err != nil {
-			return fmt.Errorf("invalid range end port: %v", err)
+			return 0, 0, fmt.Errorf("invalid range end port: %v", err)
 		}
 		if start < 1 || start > 65535 || end < 1 || end > 65535 {
-			return fmt.Errorf("port out of range (1-65535)")
+			return 0, 0, fmt.Errorf("port out of range (1-65535)")
 		}
 		if start > end {
-			return fmt.Errorf("port range start (%d) is greater than end (%d)", start, end)
+			return 0, 0, fmt.Errorf("port range start (%d) is greater than end (%d)", start, end)
 		}
-		return nil
+		return start, end, nil
 	}
 
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		return fmt.Errorf("invalid port: %v", err)
+		return 0, 0, fmt.Errorf("invalid port: %v", err)
 	}
 	if port < 1 || port > 65535 {
-		return fmt.Errorf("port %d out of range (1-65535)", port)
+		return 0, 0, fmt.Errorf("port %d out of range (1-65535)", port)
 	}
-	return nil
+	return port, port, nil
 }
 
 // resolveIncludeGlob expands an `include:` pattern and enforces that every

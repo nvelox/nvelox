@@ -207,6 +207,38 @@ func TestValidation_UDPWithTLSRejected(t *testing.T) {
 	wantErr(t, validate(baseCfg(l)), "not supported on udp")
 }
 
+// TestValidation_UDPListenersCannotSharePort: a datagram is matched to its
+// udp listener by port, so two udp listeners on one port — also on different
+// addresses or through overlapping ranges — are refused; a tcp listener on
+// the same port and udp listeners on other ports are not.
+func TestValidation_UDPListenersCannotSharePort(t *testing.T) {
+	udp := func(name, bind string) Listener {
+		return Listener{Name: name, Bind: bind, Protocol: "udp", Backend: "be"}
+	}
+	refused := map[string][]Listener{
+		"same address":       {udp("a", ":7000"), udp("b", ":7000")},
+		"different address":  {udp("a", "10.0.0.1:7000"), udp("b", "192.0.2.1:7000")},
+		"range and port":     {udp("a", ":17000-17100"), udp("b", "10.0.0.1:17050")},
+		"overlapping ranges": {udp("a", ":17000-17100"), udp("b", ":17100-17200")},
+	}
+	for name, ls := range refused {
+		t.Run(name, func(t *testing.T) {
+			wantErr(t, validate(baseCfg(ls...)), "two udp listeners cannot share port", "listeners a and b")
+		})
+	}
+	allowed := map[string][]Listener{
+		"other ports":     {udp("a", ":7000"), udp("b", ":7001")},
+		"adjacent ranges": {udp("a", ":17000-17100"), udp("b", ":17101-17200")},
+		"tcp on the same port": {udp("a", ":7000"),
+			{Name: "b", Bind: ":7000", Protocol: "tcp", Backend: "be"}},
+	}
+	for name, ls := range allowed {
+		if err := validate(baseCfg(ls...)); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
 func TestValidation_ClientAuth(t *testing.T) {
 	dir := t.TempDir()
 	cert, key := writePEMPair(t, dir, "srv")
