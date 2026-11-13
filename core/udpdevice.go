@@ -5,6 +5,9 @@ import (
 	"net"
 	"runtime"
 	"strconv"
+	"strings"
+
+	"nvelox/core/logging"
 )
 
 // accept_proxy_interfaces: a UDP listener trusts a peer's PROXY header only
@@ -93,8 +96,36 @@ func (e *Engine) planUDPInterfaces() (*udpInterfacePlan, error) {
 			return nil, fmt.Errorf("listener %s: binds %s, which none of accept_proxy_interfaces carries", l.Name, host)
 		}
 		p.sharedPorts[port] = true
+		if own := trustedOwnAddresses(l.proxyTrust, localAddrs()); len(own) > 0 {
+			logging.Warn("[CONFIG] WARNING: listener %s: accept_proxy_from includes this machine's own address %s; a program on this machine can send from it, and its datagram counts as arriving on the interface that has the address: keep this machine's addresses out of accept_proxy_from, or use accept_proxy_key_file", l.Name, strings.Join(own, ", "))
+		}
 	}
 	return p, nil
+}
+
+// trustedOwnAddresses returns the addresses of this machine (addrs) that
+// trust accepts PROXY headers from. A program on this machine can send from
+// any of them, and Linux files a datagram to a local address under the
+// interface that has the address, so interface trust cannot tell it from a
+// relay's.
+func trustedOwnAddresses(trust *proxyTrust, addrs []net.Addr) []string {
+	var own []string
+	for _, a := range addrs {
+		ipn, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if trust.trusts(&net.UDPAddr{IP: ipn.IP}) {
+			own = append(own, ipn.IP.String())
+		}
+	}
+	return own
+}
+
+// localAddrs lists this machine's interface addresses (none on error).
+func localAddrs() []net.Addr {
+	addrs, _ := net.InterfaceAddrs()
+	return addrs
 }
 
 // listenShared is the ordinary UDP engine's socket factory: a socket on a
