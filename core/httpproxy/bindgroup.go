@@ -30,7 +30,8 @@ type BindGroup struct {
 	protocol    string // "http" or "https"
 	httpServer  *http.Server
 	http3Server *http3.Server
-	primary     *HTTPServer // for shared TLS / HTTP3 config; first site
+	http3Conn   net.PacketConn // the HTTP/3 socket Start bound
+	primary     *HTTPServer    // for shared TLS / HTTP3 config; first site
 
 	// Site dispatch state. Lives behind an atomic.Pointer so ReplaceSites
 	// (called by Engine.Reload on listener config changes) can swap the
@@ -56,10 +57,10 @@ type BindGroup struct {
 // Pre-computed exact / wildcard / default lookup tables so pickSite is one
 // map probe in the common case.
 type siteSet struct {
-	all         []*HTTPServer            // for iteration (cert reload etc.)
-	exact       map[string]*HTTPServer   // lowercased exact server_name → site
-	wildcard    []*HTTPServer            // sites with leftmost-wildcard names
-	defaultSite *HTTPServer              // explicit default_server, else first site
+	all         []*HTTPServer          // for iteration (cert reload etc.)
+	exact       map[string]*HTTPServer // lowercased exact server_name → site
+	wildcard    []*HTTPServer          // sites with leftmost-wildcard names
+	defaultSite *HTTPServer            // explicit default_server, else first site
 }
 
 // tlsState is the immutable snapshot of every site's loaded cert for
@@ -438,33 +439,45 @@ func (g *BindGroup) Start() error {
 				anyH3 = true
 			}
 		}
+		// Bind before returning: a port that cannot be bound fails Start
+		// (it used to fail in a goroutine, logged, while nvelox ran on
+		// without it), and once Start returns every socket is held, so the
+		// process may give up root (server.user).
+		ln, err := tls.Listen("tcp", g.addr, g.httpServer.TLSConfig)
+		if err != nil {
+			return fmt.Errorf("listen %s: %w", g.addr, err)
+		}
 		if anyH3 {
+			pc, err := net.ListenPacket("udp", g.addr)
+			if err != nil {
+				ln.Close()
+				return fmt.Errorf("listen %s/udp (HTTP/3): %w", g.addr, err)
+			}
+			g.http3Conn = pc
 			g.http3Server = &http3.Server{
 				Addr:      g.addr,
 				Handler:   g,
 				TLSConfig: http3.ConfigureTLSConfig(tlsCfg.Clone()),
 			}
 			go func() {
-				if err := g.http3Server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				if err := g.http3Server.Serve(pc); err != nil && err != http.ErrServerClosed {
 					logging.Error("[HTTP3] Server error: %v", err)
 				}
 			}()
 			logging.Info("[HTTP3] QUIC listener started on %s", g.addr)
 		}
-
 		go func() {
-			ln, err := tls.Listen("tcp", g.addr, g.httpServer.TLSConfig)
-			if err != nil {
-				logging.Error("[HTTP] TLS listen failed on %s: %v", g.addr, err)
-				return
-			}
 			if err := g.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 				logging.Error("[HTTP] Server error: %v", err)
 			}
 		}()
 	} else {
+		ln, err := net.Listen("tcp", g.addr)
+		if err != nil {
+			return fmt.Errorf("listen %s: %w", g.addr, err)
+		}
 		go func() {
-			if err := g.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			if err := g.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 				logging.Error("[HTTP] Server error: %v", err)
 			}
 		}()
@@ -753,6 +766,9 @@ func (g *BindGroup) pickSiteCert(sni string) *siteCert {
 func (g *BindGroup) Stop(ctx context.Context) error {
 	if g.http3Server != nil {
 		g.http3Server.Close()
+	}
+	if g.http3Conn != nil {
+		g.http3Conn.Close() // Serve does not close a socket it was handed
 	}
 	var err error
 	if g.httpServer != nil {

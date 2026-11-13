@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -79,9 +78,10 @@ type RequestIDConfig struct {
 }
 
 type ServerConfig struct {
-	// User, Group, PidFile and Workers are accepted for config compatibility
-	// but NOT IMPLEMENTED: nvelox never drops privileges, writes no pid file
-	// and always runs one process. ServerWarnings reports them at startup.
+	// User and Group: started as root, nvelox switches to them once it has
+	// bound its ports (core/privdrop). PidFile and Workers are accepted for
+	// config compatibility but not implemented: nvelox writes no pid file and
+	// always runs one process; ServerWarnings reports them at startup.
 	User    string `yaml:"user"`
 	Group   string `yaml:"group"`
 	PidFile string `yaml:"pid_file"`
@@ -1003,15 +1003,10 @@ func everyAddress(bind string) bool {
 }
 
 // ServerWarnings returns one warning per server.* key that is set but not
-// implemented. user / group are reported only when the process does not
-// already run as them (nvelox never drops privileges itself); pid_file and
-// workers whenever they are set. main prints these at startup. They are
+// implemented: pid_file and workers. main prints these at startup. They are
 // warnings, not errors, because deployed configs carry these keys.
 func ServerWarnings(s ServerConfig) []string {
 	var out []string
-	if msg := privilegeDropWarning(s.User, s.Group, os.Getuid(), os.Getgid()); msg != "" {
-		out = append(out, msg)
-	}
 	if s.PidFile != "" {
 		out = append(out, fmt.Sprintf("server.pid_file (%q) is set but not implemented: nvelox does not write a pid file", s.PidFile))
 	}
@@ -1019,50 +1014,6 @@ func ServerWarnings(s ServerConfig) []string {
 		out = append(out, fmt.Sprintf("server.workers (%d) is set but not implemented: nvelox always runs as one process", s.Workers))
 	}
 	return out
-}
-
-// privilegeDropWarning reports server.user / server.group values the process
-// (uid, gid) is not running as. A name that does not resolve counts as
-// different.
-func privilegeDropWarning(userName, groupName string, uid, gid int) string {
-	var set []string
-	if userName != "" {
-		if id, ok := lookupUID(userName); !ok || id != uid {
-			set = append(set, fmt.Sprintf("server.user=%q", userName))
-		}
-	}
-	if groupName != "" {
-		if id, ok := lookupGID(groupName); !ok || id != gid {
-			set = append(set, fmt.Sprintf("server.group=%q", groupName))
-		}
-	}
-	if len(set) == 0 {
-		return ""
-	}
-	return fmt.Sprintf("%s set but privilege drop is not implemented: nvelox is running as uid %d gid %d. Run nvelox under systemd User=/Group= with CAP_NET_BIND_SERVICE (AmbientCapabilities) instead",
-		strings.Join(set, " and "), uid, gid)
-}
-
-func lookupUID(name string) (int, bool) {
-	u, err := user.Lookup(name)
-	if err != nil {
-		if u, err = user.LookupId(name); err != nil {
-			return 0, false
-		}
-	}
-	id, err := strconv.Atoi(u.Uid)
-	return id, err == nil
-}
-
-func lookupGID(name string) (int, bool) {
-	g, err := user.LookupGroup(name)
-	if err != nil {
-		if g, err = user.LookupGroupId(name); err != nil {
-			return 0, false
-		}
-	}
-	id, err := strconv.Atoi(g.Gid)
-	return id, err == nil
 }
 
 // validateServerName checks a server_names entry. Allows exact hostnames and

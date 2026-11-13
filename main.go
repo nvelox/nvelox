@@ -12,6 +12,7 @@ import (
 	"nvelox/config"
 	"nvelox/core"
 	"nvelox/core/logging"
+	"nvelox/core/privdrop"
 	"nvelox/core/procsignal"
 )
 
@@ -89,6 +90,31 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 		}
 		close(errCh)
 	}()
+
+	// Once every port is bound and the log files are open, switch to
+	// server.user / server.group. A root process that cannot give root up
+	// stops here rather than run with rights it was told to drop.
+	select {
+	case <-engine.Ready():
+		info, warning, err := privdrop.Switch(cfg.Server.User, cfg.Server.Group,
+			[]string{cfg.Logging.AccessLog, cfg.Logging.ErrorLog})
+		if err != nil {
+			return fmt.Errorf("server.user / server.group: %w", err)
+		}
+		if warning != "" {
+			fmt.Fprintf(os.Stderr, "[CONFIG] WARNING: %s\n", warning)
+		}
+		if info != "" {
+			logging.Info("[SERVER] %s", info)
+		}
+	case err, ok := <-errCh:
+		if ok && err != nil && err != context.Canceled {
+			return fmt.Errorf("engine stopped: %v", err)
+		}
+		return nil
+	case <-ctx.Done():
+		return nil
+	}
 
 	// Handle SIGHUP (reopen logs + reload) and SIGUSR1 (reopen logs).
 	if reloadCh != nil {

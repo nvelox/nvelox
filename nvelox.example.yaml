@@ -6,13 +6,16 @@ version: "2"
 # ─── Server Settings ───────────────────────────────────────
 server:
   # gateway_id: "gw-1"  # gw=<id> on HTTP access-log lines (default: hostname)
-  # user / group / pid_file / workers are accepted but NOT implemented:
-  # nvelox never drops privileges, writes no pid file and runs one process.
-  # When set (and the process is not already that user/group) nvelox prints a
-  # WARNING at startup. Run it under systemd User=/Group= with
-  # AmbientCapabilities=CAP_NET_BIND_SERVICE to bind ports below 1024.
+  # user / group: started as root, nvelox binds every port, hands its log
+  # files to this user and then runs as it (like nginx). It exits if it
+  # cannot switch. Not root: a startup WARNING, and it runs as it is. The
+  # config, certificates and log directory must be readable by this user for
+  # reloads and log reopens; a reload cannot add a port below 1024 (restart
+  # for that) and does not change the user.
   # user: "nvelox"
   # group: "nvelox"
+  # pid_file / workers are accepted but not implemented (no pid file, one
+  # process); setting them prints a startup WARNING.
 
 # ─── Logging ───────────────────────────────────────────────
 # Log files are created 0640 in 0750 directories (an existing file is

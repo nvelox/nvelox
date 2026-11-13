@@ -87,7 +87,7 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 - **PROXY Protocol v2** — pass client IP to backends in HAProxy format; accept it from trusted relays (`accept_proxy_from`)
 - **DNS Service Discovery** — periodic hostname resolution with auto-update
 - **Modular Config** — split configs via `include` glob patterns
-- **Config Validation** — comprehensive validation at load time; keys that are parsed but not implemented (`sni_routes`, `throttle`, `tls.ocsp_stapling`, `routes[].scripts`) are rejected with an error naming the key, and `server.user` / `group` / `pid_file` / `workers` print a startup warning (nvelox does not drop privileges: run it under systemd `User=` with `CAP_NET_BIND_SERVICE`)
+- **Config Validation** — comprehensive validation at load time; keys that are parsed but not implemented (`sni_routes`, `throttle`, `tls.ocsp_stapling`, `routes[].scripts`) are rejected with an error naming the key, and `server.pid_file` / `workers` print a startup warning. Started as root with `server.user` / `group`, nvelox binds its ports and then switches to that user
 
 ## Architecture
 

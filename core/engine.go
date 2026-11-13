@@ -59,6 +59,7 @@ type Engine struct {
 	runCtx          context.Context             // Start's ctx: cancels in-flight L4 backend dials on shutdown
 	reloadMu        sync.Mutex                  // serializes concurrent SIGHUPs
 	view            atomic.Pointer[backendView] // what request paths read (backendview.go)
+	ready           chan struct{}               // closed once Start holds every listening socket
 	configPath      string                      // path for reload
 
 	// UDP session limits (see udpsession.go). Set from code constants in
@@ -106,8 +107,14 @@ type ListenerConfig struct {
 	prepared   bool
 }
 
+// Ready is closed once Start has bound every listening socket (HTTP, HTTPS
+// and HTTP/3, TCP, UDP, admin API, metrics). main switches to server.user /
+// server.group only then.
+func (e *Engine) Ready() <-chan struct{} { return e.ready }
+
 func NewEngine(cfg *config.Config) *Engine {
 	e := &Engine{
+		ready:           make(chan struct{}),
 		Listeners:       make([]*ListenerConfig, 0),
 		Config:          cfg,
 		Balancers:       make(map[string]lb.Balancer),
@@ -228,8 +235,13 @@ func (e *Engine) Start(ctx context.Context) error {
 		mux := http.NewServeMux()
 		mux.Handle(metricsPath, e.Metrics.Handler())
 		e.metricsServer = newMetricsServer(e.Config.Metrics.Bind, mux)
+		// Bound here, like every listener, before Start reports ready.
+		mln, err := net.Listen("tcp", e.metricsServer.Addr)
+		if err != nil {
+			return fmt.Errorf("metrics endpoint: %w", err)
+		}
 		go func() {
-			if err := e.metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			if err := e.metricsServer.Serve(mln); err != nil && err != http.ErrServerClosed {
 				logging.Error("[METRICS] Server error: %v", err)
 			}
 		}()
@@ -340,9 +352,11 @@ func (e *Engine) Start(ctx context.Context) error {
 		logging.Info("NBIO UDP Engine Started on %d listeners", len(udpAddrs))
 	}
 
-	// 5. Wait for Context. Reloads may run from here on.
+	// 5. Every socket is bound: report ready, then wait for the context.
+	// Reloads may run from here on.
 	startupLocked = false
 	e.reloadMu.Unlock()
+	close(e.ready)
 	<-ctx.Done()
 
 	logging.Info("Stopping Engines...")

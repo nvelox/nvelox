@@ -9,9 +9,7 @@ import (
 	"encoding/pem"
 	"math/big"
 	"os"
-	"os/user"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -317,45 +315,6 @@ func TestServerWarnings(t *testing.T) {
 	}
 	if !strings.Contains(joined, "not implemented") {
 		t.Errorf("warnings must say the keys are not implemented: %q", w)
-	}
-}
-
-func TestPrivilegeDropWarning(t *testing.T) {
-	me, err := user.Current()
-	if err != nil {
-		t.Skipf("no current user: %v", err)
-	}
-	uid, gid := os.Getuid(), os.Getgid()
-	grp, gerr := user.LookupGroupId(strconv.Itoa(gid))
-
-	// Already running as the configured user / group: nothing to warn about.
-	group := ""
-	if gerr == nil {
-		group = grp.Name
-	}
-	if msg := privilegeDropWarning(me.Username, group, uid, gid); msg != "" {
-		t.Errorf("running as %s/%s: want no warning, got %q", me.Username, group, msg)
-	}
-	// Numeric ids work too.
-	if msg := privilegeDropWarning(strconv.Itoa(uid), strconv.Itoa(gid), uid, gid); msg != "" {
-		t.Errorf("numeric uid/gid of the process: want no warning, got %q", msg)
-	}
-
-	// A user the process is not running as (or that does not exist): warn,
-	// with the operator's way out.
-	for _, name := range []string{"nvelox-no-such-user", "root"} {
-		if name == me.Username {
-			continue
-		}
-		msg := privilegeDropWarning(name, "", uid, gid)
-		for _, part := range []string{"server.user=", "privilege drop is not implemented", "User=", "CAP_NET_BIND_SERVICE"} {
-			if !strings.Contains(msg, part) {
-				t.Errorf("user %q: warning %q lacks %q", name, msg, part)
-			}
-		}
-	}
-	if msg := privilegeDropWarning("", "nvelox-no-such-group", uid, gid); !strings.Contains(msg, "server.group=") {
-		t.Errorf("unknown group: got %q", msg)
 	}
 }
 

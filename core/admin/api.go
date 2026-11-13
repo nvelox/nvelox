@@ -368,8 +368,14 @@ func (s *Server) Start() error {
 	if s.bind.err != nil {
 		return fmt.Errorf("admin API: %w", s.bind.err)
 	}
+	// Bind before returning (a busy port fails startup, and the socket is
+	// held before the process gives up root).
+	ln, err := net.Listen("tcp", s.httpServer.Addr)
+	if err != nil {
+		return fmt.Errorf("admin API: %w", err)
+	}
 	go func() {
-		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 			logging.Error("[ADMIN] Server error: %v", err)
 		}
 	}()
