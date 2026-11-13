@@ -286,3 +286,110 @@ func TestSignedProxy_ReloadChangingTrustKeepsIt(t *testing.T) {
 		t.Fatalf("after the reload an unsigned header was trusted: the backend got %q", d)
 	}
 }
+
+// TestSignedProxy_TransportMustMatch: a signed header names the transport
+// it was made for. A signed stream (TCP) header replayed as a datagram —
+// with an empty payload its signature would otherwise verify — admits no
+// client, and a datagram header at the start of a TCP connection is refused.
+func TestSignedProxy_TransportMustMatch(t *testing.T) {
+	udpBE, _ := stUDPBackend(t, nil)
+	echo, _ := stTCPEchoBackend(t)
+	udpAddr, tcpAddr := stFreeUDPAddr(t), stFreeTCPAddr(t)
+	e := stStart(t, &config.Config{
+		Listeners: []config.Listener{
+			{Name: "relay-udp", Bind: udpAddr, Protocol: "udp", Backend: "udp-be",
+				AcceptProxyFrom: []string{"127.0.0.0/8"}, AcceptProxyKeys: [][]byte{sigKeyA}},
+			{Name: "relay-tcp", Bind: tcpAddr, Protocol: "tcp", Backend: "tcp-be",
+				AcceptProxyFrom: []string{"127.0.0.0/8"}, AcceptProxyKeys: [][]byte{sigKeyA}},
+		},
+		Backends: []config.Backend{{Name: "udp-be", Servers: []string{udpBE}}, {Name: "tcp-be", Servers: []string{echo}}},
+	}, nil)
+
+	// A stream header, signed, sent as a whole datagram.
+	stream := proxyproto.HeaderProxyFromAddrs(2,
+		&net.TCPAddr{IP: net.ParseIP("198.51.100.92"), Port: 4000}, &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9})
+	if err := proxy.SignHeader(stream, sigKeyA, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := stream.Format()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stUDPExchange("127.0.0.1", udpAddr, raw, 300*time.Millisecond)
+	admitted := false
+	stHandler(e).sessions.Range(func(_, v any) bool {
+		ctx := v.(*ConnContext)
+		ctx.Mu.Lock()
+		if ctx.ClientResolved && ctx.RealClientIP == "198.51.100.92" {
+			admitted = true
+		}
+		ctx.Mu.Unlock()
+		return true
+	})
+	if admitted {
+		t.Fatal("a signed stream header replayed as a datagram admitted its client")
+	}
+
+	// A datagram header, signed, at the start of a TCP connection.
+	dgram, err := proxy.SignedHeaderBytes(stUDPDatagramWithProxy(t, "198.51.100.93:4000", tcpAddr, nil), sigKeyA, nil, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := net.Dial("tcp", tcpAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write(dgram)
+	stRefused(t, c, "hello")
+}
+
+// TestSignedProxy_UDPSenderUsesTheCurrentKey: a reload that rotates a
+// backend's send_proxy_key_file applies to the datagrams of UDP sessions
+// already running, so the old key can be retired on the receivers.
+func TestSignedProxy_UDPSenderUsesTheCurrentKey(t *testing.T) {
+	be, got := stUDPBackend(t, nil)
+	addr := stFreeUDPAddr(t)
+	mk := func(key []byte) *config.Config {
+		return &config.Config{Version: "2",
+			Listeners: []config.Listener{{Name: "udp-in", Bind: addr, Protocol: "udp", Backend: "udp-be"}},
+			Backends:  []config.Backend{{Name: "udp-be", Servers: []string{be}, SendProxyV2: true, SendProxyKey: key}},
+		}
+	}
+	e := stStart(t, mk(sigKeyA), nil)
+	raddr, _ := net.ResolveUDPAddr("udp", addr)
+	c, err := net.DialUDP("udp", nil, raddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	signedWith := func(payload string) [][]byte {
+		c.Write([]byte(payload))
+		d, ok := stWaitGot(got, 2*time.Second)
+		if !ok {
+			t.Fatalf("backend got nothing for %q", payload)
+		}
+		r := bufio.NewReader(bytes.NewReader(d))
+		h, err := proxyproto.Read(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(r)
+		var keys [][]byte
+		for _, k := range [][]byte{sigKeyA, sigKeyB} {
+			if proxy.Verify(h, [][]byte{k}, body, time.Now()) == nil {
+				keys = append(keys, k)
+			}
+		}
+		return keys
+	}
+	if k := signedWith("before"); len(k) != 1 || !bytes.Equal(k[0], sigKeyA) {
+		t.Fatalf("before the reload: signed with %q", k)
+	}
+	if err := e.Reload(mk(sigKeyB)); err != nil {
+		t.Fatal(err)
+	}
+	if k := signedWith("after"); len(k) != 1 || !bytes.Equal(k[0], sigKeyB) {
+		t.Fatalf("same session after the reload: signed with %q, want key B", k)
+	}
+}

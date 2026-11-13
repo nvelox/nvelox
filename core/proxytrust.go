@@ -3,6 +3,7 @@ package core
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"net"
 	"sync/atomic"
 	"time"
@@ -50,16 +51,21 @@ func (p *proxyTrust) setKeys(keys [][]byte) {
 	p.keys.Store(&keys)
 }
 
-// verify checks a trusted peer's header h: with keys configured it must
-// carry a valid signature over payload (the datagram after the header; nil
-// for a stream). Without keys every header passes, as before.
-func (p *proxyTrust) verify(h *proxyproto.Header, payload []byte) error {
+// verify checks a trusted peer's header h, which arrived in a datagram or
+// on a stream: with keys configured it must name that transport (a signed
+// stream header replayed as a datagram is refused) and carry a valid
+// signature over payload (the datagram after the header; nil for a stream).
+// Without keys every header passes, as before.
+func (p *proxyTrust) verify(h *proxyproto.Header, payload []byte, datagram bool) error {
 	if p == nil {
 		return nil
 	}
 	keys := p.keys.Load()
 	if keys == nil {
 		return nil
+	}
+	if datagram && !h.TransportProtocol.IsDatagram() || !datagram && !h.TransportProtocol.IsStream() {
+		return fmt.Errorf("%w: its transport protocol is not the connection's", proxy.ErrSignatureMalformed)
 	}
 	return proxy.Verify(h, *keys, payload, time.Now())
 }

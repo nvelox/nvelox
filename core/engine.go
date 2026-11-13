@@ -1172,7 +1172,7 @@ func (e *Engine) startTLSListener(l *ListenerConfig, handler *ProxyEventHandler)
 			ReadHeaderTimeout: tlsProxyHeaderTimeout,
 			// With accept_proxy_key_file a trusted peer's header must be
 			// signed; the library drops the connection otherwise.
-			ValidateHeader: func(h *proxyproto.Header) error { return l.proxyTrust.verify(h, nil) },
+			ValidateHeader: func(h *proxyproto.Header) error { return l.proxyTrust.verify(h, nil, false) },
 		}
 		logging.Info("TLS listener %s accepts inbound PROXY-v2 from %v", l.Name, l.AcceptProxyFrom)
 	}

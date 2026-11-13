@@ -181,7 +181,7 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 		// With accept_proxy_key_file a header that names a client must be
 		// signed; the connection is refused otherwise.
 		if hdr != nil {
-			if err := l.proxyTrust.verify(hdr, nil); err != nil {
+			if err := l.proxyTrust.verify(hdr, nil, false); err != nil {
 				logging.Warn("[PROXY] listener %s: refusing %s: %v", l.Name, clientConn.RemoteAddr(), err)
 				sessErr = err
 				return
