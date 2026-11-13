@@ -1,6 +1,7 @@
 // Package denylist provides a process-wide, TTL-aware dynamic IP/CIDR
-// denylist that is mutated at runtime (via the admin API) and consulted by
-// the L7 request path on every request.
+// denylist that is mutated at runtime (via the admin API) and consulted when
+// a request, an L4 connection or a UDP session starts; OnAdd lets the proxy
+// also close what a newly blocked client already has open.
 //
 // It is deliberately separate from the static per-listener ip_denylist
 // (config-driven, compiled at boot). This one is for DYNAMIC, EXPIRING blocks
@@ -69,6 +70,10 @@ type Dynamic struct {
 	mu     sync.RWMutex
 	exact  map[string]entry // key: net.IP.String() for single-host blocks
 	ranges map[string]entry // key: canonical CIDR (net.IPNet.String()) for multi-host blocks
+
+	subMu   sync.Mutex
+	subs    map[int]func() // OnAdd callbacks
+	nextSub int
 }
 
 // Entry is the public view of a denylist row (List / admin API).
@@ -104,8 +109,17 @@ func expPtr(t time.Time) *time.Time {
 // into the denylist with an optional TTL (ttl<=0 means never expire). Adding
 // an existing key replaces it (refreshes the TTL). Returns the normalized
 // entry, or an error if the input is not a valid IP/CIDR or is a range wider
-// than MinPrefixV4 / MinPrefixV6.
+// than MinPrefixV4 / MinPrefixV6. The OnAdd callbacks run after the entry is
+// in place.
 func (d *Dynamic) Add(ipOrCIDR string, ttl time.Duration) (Entry, error) {
+	ent, err := d.add(ipOrCIDR, ttl)
+	if err == nil {
+		d.notifyAdd()
+	}
+	return ent, err
+}
+
+func (d *Dynamic) add(ipOrCIDR string, ttl time.Duration) (Entry, error) {
 	ipOrCIDR = strings.TrimSpace(ipOrCIDR)
 	if ipOrCIDR == "" {
 		return Entry{}, fmt.Errorf("empty ip/cidr")
@@ -138,6 +152,39 @@ func (d *Dynamic) Add(ipOrCIDR string, ttl time.Duration) (Entry, error) {
 	}
 
 	return Entry{}, fmt.Errorf("invalid ip/cidr: %q", ipOrCIDR)
+}
+
+// OnAdd registers fn to run after every successful Add, on the caller's
+// goroutine, once Blocked already reports the new entry: a proxy uses it to
+// close the open connections of a client that has just been blocked (the
+// list is otherwise consulted only when a request or connection starts).
+// fn must not block. The returned function unregisters fn.
+func (d *Dynamic) OnAdd(fn func()) (remove func()) {
+	d.subMu.Lock()
+	defer d.subMu.Unlock()
+	if d.subs == nil {
+		d.subs = make(map[int]func())
+	}
+	id := d.nextSub
+	d.nextSub++
+	d.subs[id] = fn
+	return func() {
+		d.subMu.Lock()
+		delete(d.subs, id)
+		d.subMu.Unlock()
+	}
+}
+
+func (d *Dynamic) notifyAdd() {
+	d.subMu.Lock()
+	fns := make([]func(), 0, len(d.subs))
+	for _, fn := range d.subs {
+		fns = append(fns, fn)
+	}
+	d.subMu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
 }
 
 // Blocked reports whether ip is currently denied (present and not expired).

@@ -153,3 +153,8 @@ func (l *ListenerConfig) prepare() error {
 func (h *ProxyEventHandler) l4Admit(l *ListenerConfig, ip net.IP) (bool, string) {
 	return l.access.check(ip, denylist.Default)
 }
+
+// denylisted reports whether the dynamic denylist blocks ip now.
+func (h *ProxyEventHandler) denylisted(ip net.IP) bool {
+	return ip != nil && denylist.Default.Blocked(ip)
+}

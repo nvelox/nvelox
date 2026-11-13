@@ -251,6 +251,15 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 		limiter:      limiter,
 	}
 	h.setCtx(c, clientCtx)
+	// A block added after the access check above, before the session was
+	// visible to the denylist's close pass (closeSessionsOf), is caught here.
+	if h.denylisted(ip) {
+		clientCtx.Mu.Lock()
+		clientCtx.refused = l4StatusDenylisted
+		clientCtx.Mu.Unlock()
+		closeOnOpen(c)
+		return
+	}
 
 	h.connectBackend(c, l)
 }

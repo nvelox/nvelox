@@ -48,8 +48,9 @@ type BindGroup struct {
 	tlsBase *tls.Config
 
 	// tunnels holds the open WebSocket tunnels of every site of the group,
-	// replaced site instances included (a reload leaves their tunnels
-	// running). Stop closes them.
+	// replaced site instances included. ReplaceSites re-checks them against
+	// the new sites, CloseTunnelsOf closes those of blocked clients and Stop
+	// closes them all.
 	tunnels tunnelSet
 }
 
@@ -79,10 +80,12 @@ func (g *BindGroup) Addr() string { return g.addr }
 // NewBindGroup creates a group bound to addr. Use AddSite to attach one or
 // more *HTTPServer instances before calling Start.
 func NewBindGroup(addr, protocol string) *BindGroup {
-	return &BindGroup{
+	g := &BindGroup{
 		addr:     addr,
 		protocol: protocol,
 	}
+	g.tunnels.recheck = g.recheckTunnel
+	return g
 }
 
 // AddSite attaches a Site to this group. Idempotent during initial
@@ -93,7 +96,10 @@ func (g *BindGroup) AddSite(s *HTTPServer) {
 	if g.primary == nil {
 		g.primary = s
 	}
-	s.setTunnelSet(&g.tunnels)
+	g.tunnels.mu.Lock()
+	gen := g.tunnels.gen
+	g.tunnels.mu.Unlock()
+	s.setTunnelSet(&g.tunnels, gen)
 	current := g.sites.Load()
 	var all []*HTTPServer
 	if current != nil {
@@ -165,16 +171,21 @@ func (g *BindGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	if len(ss.all) == 1 {
-		if !g.clientAuthOK(ss, ss.all[0], r) {
-			ss.all[0].serveError(w, http.StatusMisdirectedRequest)
-			return
-		}
-		applySiteDeadlines(w, ss.all[0])
-		ss.all[0].ServeHTTP(w, r)
+	site := g.siteFor(ss, r)
+	if !g.clientAuthOK(ss, site, r) {
+		site.serveError(w, http.StatusMisdirectedRequest)
 		return
 	}
+	applySiteDeadlines(w, site)
+	site.ServeHTTP(w, r)
+}
 
+// siteFor is the site of ss (not empty) that serves r: the only one, else
+// the one r.Host names (pickSite).
+func (g *BindGroup) siteFor(ss *siteSet, r *http.Request) *HTTPServer {
+	if len(ss.all) == 1 {
+		return ss.all[0]
+	}
 	host := r.Host
 	// Strip port if present. IPv6 literals are bracketed; SplitHostPort
 	// handles both.
@@ -185,14 +196,7 @@ func (g *BindGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			host = host[:i]
 		}
 	}
-
-	site := g.pickSite(ss, host)
-	if !g.clientAuthOK(ss, site, r) {
-		site.serveError(w, http.StatusMisdirectedRequest)
-		return
-	}
-	applySiteDeadlines(w, site)
-	site.ServeHTTP(w, r)
+	return g.pickSite(ss, host)
 }
 
 // clientAuthOK enforces a site's client_auth on the request, not only on the
@@ -204,13 +208,10 @@ func (g *BindGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // Request, which tells a browser to retry on a new connection). For
 // "require" the connection must also carry a verified client certificate.
 func (g *BindGroup) clientAuthOK(ss *siteSet, site *HTTPServer, r *http.Request) bool {
-	ca := site.Listener.ClientAuth
-	if ca == nil && site.Listener.TLS != nil && clientAuthConfigured(site.Listener.TLS.ClientAuth) {
-		// A site not built by the engine: its policy lives in the TLS
-		// snapshot. Configured but not found there = refuse (fail closed).
-		if ca = g.siteClientAuth(site); ca == nil {
-			return r.TLS == nil
-		}
+	ca, configured := g.clientAuthOf(site)
+	if configured && ca == nil {
+		// Configured but not found in the TLS snapshot: refuse (fail closed).
+		return r.TLS == nil
 	}
 	if ca == nil || r.TLS == nil {
 		return true
@@ -222,6 +223,41 @@ func (g *BindGroup) clientAuthOK(ss *siteSet, site *HTTPServer, r *http.Request)
 		return false
 	}
 	return true
+}
+
+// clientAuthOf is site's client-certificate policy: its parsed
+// Listener.ClientAuth, else for a site not built by the engine the one in the
+// TLS snapshot. configured: client_auth is on, so a nil policy means it was
+// not found (callers refuse).
+func (g *BindGroup) clientAuthOf(site *HTTPServer) (ca *tlsutil.ClientAuth, configured bool) {
+	if site.Listener.ClientAuth != nil {
+		return site.Listener.ClientAuth, true
+	}
+	if site.Listener.TLS != nil && clientAuthConfigured(site.Listener.TLS.ClientAuth) {
+		return g.siteClientAuth(site), true
+	}
+	return nil, false
+}
+
+// clientCertCurrent reports whether a connection's client certificate still
+// verifies against the policy's CA pool, now: a reload may have replaced the
+// pool, and the certificate may have expired since the handshake. True when
+// the policy verifies no certificate or the connection presented none
+// (clientAuthOK decides whether one is required).
+func clientCertCurrent(ca *tlsutil.ClientAuth, cs *tls.ConnectionState) bool {
+	if ca == nil || ca.CAs == nil || cs == nil || len(cs.PeerCertificates) == 0 {
+		return true
+	}
+	if ca.Mode != tls.VerifyClientCertIfGiven && ca.Mode != tls.RequireAndVerifyClientCert {
+		return true
+	}
+	intermediates := x509.NewCertPool()
+	for _, c := range cs.PeerCertificates[1:] {
+		intermediates.AddCert(c)
+	}
+	_, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{Roots: ca.CAs, Intermediates: intermediates,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}})
+	return err == nil
 }
 
 // clientAuthConfigured reports whether a tls.client_auth value turns client
@@ -342,12 +378,16 @@ func (g *BindGroup) pickSite(ss *siteSet, host string) *HTTPServer {
 // Every old site instance that is not in the new list — a dropped site,
 // and the old instance of a site that is rebuilt under the same name — has
 // Close() called on it: that stops its cleanup goroutines (ResponseCache,
-// IPRateLimiter). Its upgraded (WebSocket) connections keep running until
-// they end or go idle; they stay in the group's tunnel set, so Stop closes
-// them. Note: Close is called immediately — a plain request currently inside an
-// old site still holds references to those collaborators, but neither
-// cache eviction nor IP-rate-limit pruning is critical for an in-flight
-// request to finish, so stopping their tickers is safe.
+// IPRateLimiter). Note: Close is called immediately — a plain request
+// currently inside an old site still holds references to those
+// collaborators, but neither cache eviction nor IP-rate-limit pruning is
+// critical for an in-flight request to finish, so stopping their tickers is
+// safe.
+//
+// Upgraded (WebSocket) connections are re-checked against the new sites
+// (recheckTunnel): one the new configuration would still admit keeps
+// running, the others are closed. An upgrade still in flight on an old
+// instance is re-checked when its tunnel starts.
 //
 // ReplaceSites also rebuilds the TLS cert snapshot, in case site
 // server_names or cert paths changed. Failures during cert load follow
@@ -361,8 +401,9 @@ func (g *BindGroup) ReplaceSites(newSites []*HTTPServer) error {
 	// Publish the new site set BEFORE closing dropped sites — in-flight
 	// requests should see the new set, and dropped sites' Close stops
 	// background tickers but doesn't interrupt running handlers.
+	gen := g.tunnels.nextGen()
 	for _, s := range newSites {
-		s.setTunnelSet(&g.tunnels)
+		s.setTunnelSet(&g.tunnels, gen)
 	}
 	g.sites.Store(buildSiteSet(newSites))
 
@@ -375,6 +416,12 @@ func (g *BindGroup) ReplaceSites(newSites []*HTTPServer) error {
 		if _, err := g.ReloadCerts(); err != nil {
 			logging.Warn("[RELOAD] bind group %s: cert refresh after ReplaceSites: %v", g.addr, err)
 		}
+	}
+
+	// Keep only the tunnels the new sites admit (after the cert refresh:
+	// a site's client-certificate policy lives in the TLS state).
+	for _, t := range g.tunnels.startGen(gen) {
+		g.recheckTunnel(t)
 	}
 
 	// Close every old instance that is not part of the new list.
@@ -390,6 +437,66 @@ func (g *BindGroup) ReplaceSites(newSites []*HTTPServer) error {
 		}
 	}
 	return nil
+}
+
+// recheckTunnel closes tunnel t unless the group's current sites would admit
+// its upgrade request again (tunnelRefusal); a tunnel that stays takes its
+// site's current idle timeout. Closing runs in the background: a TLS close
+// can wait for a stalled client.
+func (g *BindGroup) recheckTunnel(t *tunnelConn) {
+	site, client, why := g.tunnelSite(g.sites.Load(), t)
+	if site == nil {
+		logging.Info("[WS] closing tunnel %s after a reload: %s", t.Conn.RemoteAddr(), why)
+		go t.Close()
+		return
+	}
+	if client != nil {
+		t.client.Store(&client)
+	}
+	t.setIdle(site.tunnelIdleTimeout())
+}
+
+// tunnelSite returns the site of ss that admits tunnel t's upgrade request
+// and the client it resolves, or nil and why none does: the site the request
+// reaches must accept the connection's client certificate (clientAuthOK,
+// and the certificate must verify against the site's current CAs) and pass
+// the request (tunnelRefusal).
+func (g *BindGroup) tunnelSite(ss *siteSet, t *tunnelConn) (*HTTPServer, net.IP, string) {
+	a := t.adm
+	switch {
+	case a == nil:
+		return nil, nil, "nothing to check it against"
+	case a.rerouted:
+		return nil, nil, "try_files moved its request"
+	case ss == nil || len(ss.all) == 0:
+		return nil, nil, "no site"
+	}
+	site := g.siteFor(ss, a.req)
+	if !g.clientAuthOK(ss, site, a.req) {
+		return nil, nil, "its site's client-certificate policy refuses it"
+	}
+	if ca, _ := g.clientAuthOf(site); !clientCertCurrent(ca, a.req.TLS) {
+		return nil, nil, "its client certificate does not verify against the site's current client CAs"
+	}
+	why, client := site.tunnelRefusal(a)
+	if why != "" {
+		return nil, nil, why
+	}
+	return site, client, ""
+}
+
+// CloseTunnelsOf closes the group's tunnels whose client blocked reports (a
+// client the dynamic denylist has just blocked) and returns how many. The
+// closes run in the background.
+func (g *BindGroup) CloseTunnelsOf(blocked func(net.IP) bool) int {
+	n := 0
+	for _, t := range g.tunnels.open() {
+		if ip := t.client.Load(); ip != nil && blocked(*ip) {
+			go t.Close()
+			n++
+		}
+	}
+	return n
 }
 
 // Start opens the listening socket and builds a TLS config that supports

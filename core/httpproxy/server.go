@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -107,9 +109,11 @@ type HTTPServer struct {
 	closeOnce         sync.Once // guards Close() against double-invocation
 
 	// Upgraded (WebSocket) connections relayed through this site, in the
-	// bind group's shared set (see tunnel.go).
+	// bind group's shared set, and the group's reload generation this site
+	// instance belongs to (see tunnel.go).
 	tunnelsMu sync.Mutex
 	tunnels   *tunnelSet
+	tunnelGen uint64
 }
 
 // ListenerConfig mirrors core.ListenerConfig to avoid circular imports.
@@ -519,26 +523,9 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fetchSite, fetchDest, r.TLS != nil, reqID, s.Listener.Name)
 	}()
 
-	// IP denylist check (static, per-listener config)
-	if len(s.IPDenylist) > 0 && acl.CheckIPList(clientIP, s.IPDenylist) {
-		s.serveError(w, http.StatusForbidden)
-		return
-	}
-
-	// Dynamic (runtime) denylist — TTL-bearing blocks pushed via the admin
-	// API (e.g. by an abuse detector). Consulted on every request
-	// using the same trusted-proxy-resolved client IP; process-global so it
-	// survives SIGHUP config reloads.
-	if s.DynDenylist != nil {
-		if ip := net.ParseIP(clientIP); ip != nil && s.DynDenylist.Blocked(ip) {
-			s.serveError(w, http.StatusForbidden)
-			return
-		}
-	}
-
-	// IP allowlist check (if set, only listed IPs are allowed)
-	if len(s.IPAllowlist) > 0 && !acl.CheckIPList(clientIP, s.IPAllowlist) {
-		s.serveError(w, http.StatusForbidden)
+	// ip_denylist, the dynamic denylist, ip_allowlist.
+	if status := s.clientStatus(clientIP); status != 0 {
+		s.serveError(w, status)
 		return
 	}
 
@@ -558,17 +545,9 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// ACL check. A deny may carry a custom status (e.g. 404 to hide an admin
-	// surface from unauthorized clients); default to 403 when unset.
-	if s.ACLEngine != nil {
-		action, status := s.ACLEngine.DecideClientIP(r, net.ParseIP(clientIP))
-		if action == "deny" {
-			if status == 0 {
-				status = http.StatusForbidden
-			}
-			s.serveError(w, status)
-			return
-		}
+	if status := s.aclStatus(r, clientIP); status != 0 {
+		s.serveError(w, status)
+		return
 	}
 
 	// CONNECT asks for a tunnel to an arbitrary host: this is a reverse
@@ -589,6 +568,12 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// path's response under another path. WebSocket upgrades bypass the
 	// cache (and compression).
 	upgrade := isWebSocketUpgrade(r)
+	var admitted *http.Request
+	if upgrade {
+		// The upgrade request as the access rules above saw it: while the
+		// tunnel lasts, a reload runs the rules again on it.
+		admitted = r.Clone(context.Background())
+	}
 	cacheKey := ""
 	if !upgrade && s.ResponseCache != nil && s.ResponseCache.ShouldCache(r.Method) && !ShouldSkipCache(r) {
 		if k := CacheKey(r); len(k) <= maxCacheKeyLen {
@@ -602,6 +587,7 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Route matching
 	routeResult := s.router.MatchFull(r.Host, r.URL.Path)
+	matched := routeResult // what a reload compares a tunnel's route with
 	var backendName string
 	var routeHeaders *config.HeadersConfig
 	// A try_files fallback the route cannot serve itself is an internal
@@ -609,6 +595,7 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// new path and dispatch restarts here, once — the route it lands on
 	// serves the target without try_files.
 	tryFilesRedirected := false
+	rerouted := false // try_files moved the request (see tunnelAdmission)
 dispatch:
 	if routeResult != nil {
 		backendName = routeResult.Backend
@@ -650,6 +637,7 @@ dispatch:
 					if !s.tryFilesFallback(w, r, target, clientIP) {
 						return
 					}
+					rerouted = true
 					if _, ok := NewStaticHandler(routeResult.Static).Resolve(r.URL.Path, routeResult.FastCGI.Pass != ""); !ok {
 						routeResult = s.router.MatchFull(r.Host, r.URL.Path)
 						tryFilesRedirected = true
@@ -659,6 +647,7 @@ dispatch:
 					if !s.rewriteRequestPath(w, r, target, clientIP) {
 						return
 					}
+					rerouted = true
 				}
 			}
 
@@ -760,10 +749,97 @@ dispatch:
 		cacheKey:     cacheKey,
 		upgrade:      upgrade,
 	}
+	if upgrade {
+		u.admission = &tunnelAdmission{req: admitted, route: matched, backend: backendName,
+			scheme: s.backendScheme(backendName), rerouted: rerouted}
+		u.clientIP = net.ParseIP(clientIP)
+	}
 	if readTO := s.Listener.Timeouts.ResolveRead(defaultReadTimeout); readTO > 0 {
 		u.readDeadline = start.Add(readTO)
 	}
 	s.proxy(w, r, rec, u, &upstream)
+}
+
+// clientStatus applies the client checks, in order: ip_denylist, the dynamic
+// denylist (TTL-bearing blocks pushed via the admin API, e.g. by an abuse
+// detector; process-global, so it survives SIGHUP config reloads) and
+// ip_allowlist (if set, only listed clients). It returns the refusal status,
+// or 0 when clientIP may pass. ServeHTTP runs it on every request, a reload
+// on every open tunnel.
+func (s *HTTPServer) clientStatus(clientIP string) int {
+	if len(s.IPDenylist) > 0 && acl.CheckIPList(clientIP, s.IPDenylist) {
+		return http.StatusForbidden
+	}
+	if s.DynDenylist != nil {
+		if ip := net.ParseIP(clientIP); ip != nil && s.DynDenylist.Blocked(ip) {
+			return http.StatusForbidden
+		}
+	}
+	if len(s.IPAllowlist) > 0 && !acl.CheckIPList(clientIP, s.IPAllowlist) {
+		return http.StatusForbidden
+	}
+	return 0
+}
+
+// aclStatus is the ACL's refusal status for r from clientIP, 0 when the ACL
+// lets it through. A deny may carry a custom status (e.g. 404 to hide an
+// admin surface from unauthorized clients); default to 403 when unset.
+func (s *HTTPServer) aclStatus(r *http.Request, clientIP string) int {
+	if s.ACLEngine == nil {
+		return 0
+	}
+	action, status := s.ACLEngine.DecideClientIP(r, net.ParseIP(clientIP))
+	if action != "deny" {
+		return 0
+	}
+	if status == 0 {
+		status = http.StatusForbidden
+	}
+	return status
+}
+
+// tunnelRefusal says why s would not admit the upgrade request of a tunnel
+// admitted with a ("" = it would), and returns the client s resolves for it.
+// It applies what a new request meets — the client checks and the ACL, not
+// the rate limits, which meter new requests — and requires the same route
+// to the same backend, which still lists the tunnel's server and reaches it
+// over the same transport.
+func (s *HTTPServer) tunnelRefusal(a *tunnelAdmission) (string, net.IP) {
+	clientIP := s.realClientIP(a.req)
+	if s.clientStatus(clientIP) != 0 {
+		return "its client is refused (ip_denylist, denylist or ip_allowlist)", nil
+	}
+	if s.aclStatus(a.req, clientIP) != 0 {
+		return "the ACL refuses its request", nil
+	}
+	route := s.router.MatchFull(a.req.Host, a.req.URL.Path)
+	if !reflect.DeepEqual(route, a.route) {
+		return "its route changed", nil
+	}
+	backendName := s.router.defaultBackend
+	if route != nil {
+		backendName = route.Backend
+	}
+	if backendName != a.backend {
+		return "its backend changed", nil
+	}
+	balancer, ok := s.Balancers[backendName]
+	if !ok || !slices.Contains(balancer.Servers(), a.target) {
+		return "its server left the backend", nil
+	}
+	if !s.backendTLSReady(backendName, s.Backends[backendName]) || s.backendScheme(backendName) != a.scheme {
+		return "its backend's transport changed", nil
+	}
+	return "", net.ParseIP(clientIP)
+}
+
+// backendScheme is the scheme of requests to backendName: its backend_tls
+// transport's ("https"), else "http".
+func (s *HTTPServer) backendScheme(backendName string) string {
+	if _, ok := s.backendTransports[backendName]; ok {
+		return s.backendSchemes[backendName]
+	}
+	return "http"
 }
 
 // backendTLSReady reports whether a request may be proxied to backendName:

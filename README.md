@@ -82,7 +82,7 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 - **Per-Request Access Logging** — method, path, status, bytes, latency, backend in CLF format
 - **Prometheus Metrics** — `/metrics` endpoint with counters, gauges, histograms
 - **Admin REST API** — runtime stats, drain/enable/disable servers
-- **Hot Reload** — SIGHUP reloads the whole config without dropping in-flight connections: backends (with sticky / CB / LeastConn state preserved on rename), per-listener routes / ACL / headers / error pages, TLS certs (Let's Encrypt rotation), and bind addresses (added or removed with 10s graceful drain). Pre-flight port-availability check ensures all-or-nothing apply.
+- **Hot Reload** — SIGHUP reloads the whole config without dropping in-flight connections: backends (with sticky / CB / LeastConn state preserved on rename), per-listener routes / ACL / headers / error pages, TLS certs (Let's Encrypt rotation), and bind addresses (added or removed with 10s graceful drain). Pre-flight port-availability check ensures all-or-nothing apply. Open WebSocket tunnels are checked against the new rules: a tunnel the new config would refuse (IP lists, ACL, route, backend server) is closed, the others keep running.
 
 ### Extensibility
 - **PROXY Protocol v2** — pass client IP to backends in HAProxy format; accept it from trusted relays (`accept_proxy_from`)
@@ -294,6 +294,7 @@ backends:
 - `POST` requests need `Content-Type: application/json` (the body-less backend actions too), and browser cross-site requests (`Sec-Fetch-Site` / `Origin`) are refused with 403.
 - A valid key is always served. After 10 failed attempts from one IP within 10 minutes, that IP's further *failures* get `429` (with `Retry-After`) for 15 minutes.
 - The denylist refuses ranges wider than an IPv4 `/8` or an IPv6 `/16` (`0.0.0.0/0`, `::/0`, `::ffff:0:0/96`, …). `ttl_seconds` ≤ 0 keeps an entry until restart.
+- Adding an entry also closes what that client has open: WebSocket tunnels, L4 TCP and TLS connections and UDP sessions.
 
 ```bash
 KEY=...   # admin.api_key

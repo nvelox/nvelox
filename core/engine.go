@@ -56,7 +56,7 @@ type Engine struct {
 	tlsListeners    []net.Listener              // TLS listeners to close on shutdown
 	tcpListeners    []tcpListener               // plain L4 TCP listeners (std accept loop + relayL4)
 	acceptWG        sync.WaitGroup              // L4 TCP/TLS accept loops; waited on before closing live conns
-	l4Conns         sync.Map                    // live L4 TCP/TLS client conns (net.Conn -> struct{}), closed on shutdown
+	l4Conns         sync.Map                    // live L4 TCP/TLS client conns (net.Conn -> *l4Client), closed on shutdown
 	runCtx          context.Context             // Start's ctx: cancels in-flight L4 backend dials on shutdown
 	reloadMu        sync.Mutex                  // serializes concurrent SIGHUPs
 	view            atomic.Pointer[backendView] // what request paths read (backendview.go)
@@ -367,9 +367,12 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 
 	// 5. Every socket is bound: report ready, then wait for the context.
-	// Reloads may run from here on.
+	// Reloads may run from here on. A dynamic denylist add also ends what
+	// the blocked client has open (denyclose.go).
 	startupLocked = false
 	e.reloadMu.Unlock()
+	stopDenyClose := denylist.Default.OnAdd(e.closeDenylisted)
+	defer stopDenyClose()
 	close(e.ready)
 	<-ctx.Done()
 
@@ -1156,7 +1159,10 @@ func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *
 	}()
 
 	// Access policy (static lists, ACL, dynamic denylist) on the resolved
-	// client, before the handshake: a refused client costs no crypto.
+	// client, before the handshake: a refused client costs no crypto. The
+	// client is recorded first, so a block added after the check still finds
+	// the connection (closeDenylisted).
+	e.setL4Client(clientConn, ipOf(client))
 	if ok, st := handler.l4Admit(l, ipOf(client)); !ok {
 		status = st
 		return

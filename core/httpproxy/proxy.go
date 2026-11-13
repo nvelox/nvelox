@@ -32,6 +32,11 @@ type upstreamRequest struct {
 	// request (zero: none). On HTTP/1 net/http cancels the request context
 	// when it passes, which is not the client going away.
 	readDeadline time.Time
+	// admission (upgrades) is what the tunnel is admitted with, completed
+	// with its server when the backend switches; clientIP is the client
+	// the access rules checked.
+	admission *tunnelAdmission
+	clientIP  net.IP
 }
 
 // deadlineSlack absorbs the gap between the read deadline BindGroup set and
@@ -87,7 +92,15 @@ func (s *HTTPServer) proxy(w http.ResponseWriter, r *http.Request, rec *statusRe
 		defer cancel()
 		r = r.WithContext(ctx)
 		rec.closeUnlessSwitching = true
-		rec.onHijack = func(c net.Conn) *tunnelConn { return s.trackTunnel(c, cancel) }
+		rec.onHijack = func(c net.Conn) *tunnelConn {
+			var adm *tunnelAdmission
+			if u.admission != nil {
+				a := *u.admission
+				a.target = *upstream // the server of the attempt that switched
+				adm = &a
+			}
+			return s.trackTunnel(c, cancel, adm, u.clientIP)
+		}
 	} else {
 		// Writer chain: proxy -> cache -> compression -> recorder. The cache
 		// stores the backend's own bytes and headers; compression applies to

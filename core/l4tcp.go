@@ -61,7 +61,7 @@ func (e *Engine) startAcceptLoop(ln net.Listener, name string, serve func(net.Co
 			}
 			backoff = 0
 			e.ActiveConns.Add(1)
-			e.l4Conns.Store(c, struct{}{})
+			e.l4Conns.Store(c, &l4Client{})
 			go func() {
 				defer e.ActiveConns.Done()
 				defer e.l4Conns.Delete(c)
@@ -122,7 +122,10 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 	// Access policy (ip_denylist, dynamic denylist, ip_allowlist, acl) on the
 	// immediate peer when it IS the client. A trusted relay's real client is
 	// checked below, once its header is read.
+	// The client is recorded before the check, so a block added after the
+	// check still finds the connection (closeDenylisted).
 	if !peerTrusted {
+		e.setL4Client(clientConn, ipOf(clientConn.RemoteAddr()))
 		if ok, status := h.l4Admit(l, ipOf(clientConn.RemoteAddr())); !ok {
 			logging.AccessL4(ipStrOf(clientConn.RemoteAddr()), l.Protocol, dstPort, status, 0, 0, 0)
 			clientConn.Close()
@@ -183,6 +186,7 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 		}
 		realClientIP = ipStrOf(src)
 		clientResolved = true
+		e.setL4Client(clientConn, ipOf(src))
 		if ok, status := h.l4Admit(l, ipOf(src)); !ok {
 			refused = status
 			return

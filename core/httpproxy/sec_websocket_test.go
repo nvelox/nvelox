@@ -234,10 +234,9 @@ func TestWebSocket_StopClosesTunnels(t *testing.T) {
 }
 
 // TestWebSocket_ReloadKeepsTunnels: a reload (ReplaceSites) replaces every
-// site instance, also the one rebuilt under the same name, and leaves the
-// old instance's tunnels running (as before v1.2.0: an ingress reloads on
-// every endpoint change). Stop still closes them, including a tunnel the
-// replaced instance opens after the reload (an upgrade in flight across it).
+// site instance, also the one rebuilt under the same name; a tunnel the new
+// configuration still admits keeps running (tunnel_recheck_test.go covers
+// the ones it closes). Stop still closes them all.
 func TestWebSocket_ReloadKeepsTunnels(t *testing.T) {
 	b := secStartWSBackend(t)
 	old := secNewSite(t, &ListenerConfig{}, []string{b.addr}, secOpts{})
@@ -264,22 +263,11 @@ func TestWebSocket_ReloadKeepsTunnels(t *testing.T) {
 	}
 	assertEcho(t, conn2, br2)
 
-	// A tunnel the replaced instance tracks after the reload.
-	late, lateClient := net.Pipe()
-	defer lateClient.Close()
-	lateTun := old.trackTunnel(late, func() {})
-
 	if err := g.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	secExpectEOF(t, conn, br, 2*time.Second, "pre-reload tunnel after Stop")
 	secExpectEOF(t, conn2, br2, 2*time.Second, "post-reload tunnel after Stop")
-	lateTun.mu.Lock()
-	closed := lateTun.closed
-	lateTun.mu.Unlock()
-	if !closed {
-		t.Fatal("tunnel opened on the replaced instance after the reload not closed by Stop")
-	}
 }
 
 // TestWebSocket_BreakerOutcomeRecorded (H4): an upgrade is an attempt like

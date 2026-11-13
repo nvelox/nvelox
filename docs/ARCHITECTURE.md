@@ -234,6 +234,7 @@ sequenceDiagram
   S->>A: POST /api/v1/denylist ip and ttl_seconds
   A->>A: API key check and lockout
   A->>A: denylist Add with expiry
+  A->>N: close the client's open tunnels, connections and sessions
   A-->>S: 200 blocked
   N->>N: HTTP and L4 paths call Blocked
   S->>A: re-push active blocks after a restart
@@ -242,7 +243,8 @@ sequenceDiagram
 - The admin API requires `api_key` (load error without it, `config/controlplane.go`). Every request passes, in order: loopback-only peers when bound to loopback, a `Host` header naming the bind address (DNS rebinding), Go's cross-origin protection (`Sec-Fetch-Site` / `Origin`), a constant-time `X-API-Key` comparison, then `Content-Type: application/json` on state-changing requests. A valid key is always served; 10 failures from one IP in 10 min make that IP's further failures return 429 for 15 min, and the failure table is capped at 4096 IPs and pruned (`core/admin/api.go:30-48`, `core/admin/api.go:162-357`).
 - `POST` takes `{ip, ttl_seconds}` (TTL 0 or less never expires; ranges wider than an IPv4 /8 or IPv6 /16, including `::ffff:0:0/96`, are refused), `DELETE` takes `?cidr=` or `{ip}`, and `GET` lists live entries (`core/admin/api.go:446-507`, `core/denylist/denylist.go:30-58`).
 - Single hosts are stored in a map, ranges in a scanned list. Expired entries stop matching at once, and a sweeper removes them every minute (`core/denylist/denylist.go:76-131`, `core/engine.go:142-148`).
-- The HTTP path checks every request against the resolved client IP (`core/httpproxy/server.go:424-429`). L4 checks every TCP / TLS connection and UDP session on the resolved client: at accept time for a direct client, once its PROXY v2 header is parsed for a client behind a trusted relay (`core/l4tcp.go`, `core/engine.go`, `core/handler.go`).
+- The HTTP path checks every request against the resolved client IP (`HTTPServer.clientStatus` in `core/httpproxy/server.go`). L4 checks every TCP / TLS connection and UDP session on the resolved client: at accept time for a direct client, once its PROXY v2 header is parsed for a client behind a trusted relay (`core/l4tcp.go`, `core/engine.go`, `core/handler.go`).
+- An add also closes what the blocked client has open: its WebSocket tunnels (the client the access rules checked), its L4 TCP and TLS connections and its UDP sessions. Behind a trusted relay that is the client the relay's PROXY header named; a TCP relay that sent no header is itself the client, as in the access check (`core/denyclose.go`).
 - Entries live only in memory, so a controller should re-push its active blocks when nvelox restarts (for example on a timer). Each nvelox instance has its own denylist; a controller blocking an IP everywhere calls every instance.
 
 ## Data and state
@@ -305,7 +307,8 @@ Every HTTP response gets exactly one line, written when the request ends (for a 
 **Behaviour to know about**
 - L7 backend dials time out after a fixed 10 s; backend `timeouts.connect` is used only by L4 dials (`core/httpproxy/server.go`, `core/l4tcp.go:160-165`).
 - The TLS-terminating L4 path's PROXY v2 destination is nvelox's own source address, not the dialed port (`core/engine.go`).
-- A WebSocket tunnel is closed after the site's `timeouts.idle` (120 s when unset) without a byte either way, and when its listener stops. A SIGHUP reload leaves open tunnels running, with the config they were opened under, until they end or go idle: an ingress controller reloads on every endpoint change (`core/httpproxy/tunnel.go`).
+- A WebSocket tunnel is closed after the site's `timeouts.idle` (120 s when unset) without a byte either way, and when its listener stops (`core/httpproxy/tunnel.go`).
+- A SIGHUP reload checks every open tunnel against the new configuration the way its upgrade request would be checked. The site its `Host` reaches must accept the connection's client certificate, which must still verify against the site's current client CAs (a reload may replace them, and the certificate may have expired). The client checks (`ip_denylist`, the dynamic denylist, `ip_allowlist`) and the ACL must pass. The request must match the same route to the same backend, which must still list the tunnel's server, with the same `backend_tls` setting. A tunnel that passes keeps running with the site's current idle timeout; the others are closed, and so is a tunnel whose request `try_files` moved. An upgrade still in flight during the reload is checked when its tunnel starts. Rate limits are not applied again: they meter new requests (`BindGroup.recheckTunnel` in `core/httpproxy/bindgroup.go`, `HTTPServer.tunnelRefusal` in `core/httpproxy/server.go`).
 - Active health checks probe the server list the backend had when it was created. Reload does not update the checker, and a server-list change marks every server healthy again (`lb/lb.go:118-128`, `core/health/checker.go:70-80`, `core/engine.go:765-774`).
 
 **Timeouts and limits**

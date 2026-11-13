@@ -60,7 +60,8 @@ admin:
   #   GET    /api/v1/denylist
   #   POST   /api/v1/denylist {"ip": "<ip or cidr>", "ttl_seconds": N}
   #          (ttl <= 0 = until restart; ranges wider than /8 IPv4 or
-  #          /16 IPv6 are refused)
+  #          /16 IPv6 are refused). Also closes the client's open
+  #          WebSocket tunnels, TCP/TLS connections and UDP sessions.
   #   DELETE /api/v1/denylist?cidr=<ip or cidr>
 
 # Hot reload: `kill -HUP $(pidof nvelox)` (or `systemctl reload nvelox`)
@@ -69,7 +70,9 @@ admin:
 # listener routes/ACL/headers, TLS certs (Let's Encrypt rotation), and
 # bind addresses (added or removed with 10s graceful drain). All-or-
 # nothing: pre-flight aborts the apply if any new bind addr is unbindable
-# or the new config is invalid. See examples/32-hot-reload.yaml.
+# or the new config is invalid. Open WebSocket tunnels are checked against
+# the new rules; one they would refuse is closed. See
+# examples/32-hot-reload.yaml.
 
 # ─── OpenTelemetry Tracing ─────────────────────────────────
 # tracing:
