@@ -19,12 +19,14 @@ type target struct {
 }
 
 // Switch changes the process to userName and groupName (either may be
-// empty) after handing files to them. It reports what it did in info, or in
-// warning why it did nothing: a process that is not root cannot switch and
-// keeps running as it is, as nginx does. err is set when the process is root
-// and was asked to give root up but could not: nvelox must not keep running
-// with root rights it was told to drop.
-func Switch(userName, groupName string, files []string) (info, warning string, err error) {
+// empty). handOver, when set, runs first, still as root, to give files to
+// the new uid and gid (-1 = unchanged); it must work on open descriptors
+// (fchown), never on paths the new user could redirect. Switch reports what
+// it did in info, or in warning why it did nothing: a process that is not
+// root cannot switch and keeps running as it is, as nginx does. err is set
+// when the process is root and was asked to give root up but could not:
+// nvelox must not keep running with root rights it was told to drop.
+func Switch(userName, groupName string, handOver func(uid, gid int) error) (info, warning string, err error) {
 	if userName == "" && groupName == "" {
 		return "", "", nil
 	}
@@ -41,8 +43,8 @@ func Switch(userName, groupName string, files []string) (info, warning string, e
 	if t.uid == 0 && (t.gid < 0 || t.gid == 0) {
 		return "", "", nil // root to root
 	}
-	for _, f := range files {
-		if err := handOver(f, t); err != nil {
+	if handOver != nil {
+		if err := handOver(t.uid, t.gid); err != nil {
 			return "", "", err
 		}
 	}
@@ -80,22 +82,6 @@ func (t target) verify() error {
 	}
 	if t.uid > 0 && syscall.Setuid(0) == nil {
 		return errors.New("after the switch the process could become root again")
-	}
-	return nil
-}
-
-// handOver gives a log file to the new user so a reopen (SIGUSR1, SIGHUP)
-// still works. Only regular files: not a terminal, a pipe or /dev/stdout.
-func handOver(path string, t target) error {
-	if path == "" {
-		return nil
-	}
-	fi, err := os.Lstat(path)
-	if err != nil || !fi.Mode().IsRegular() {
-		return nil
-	}
-	if err := os.Chown(path, t.uid, t.gid); err != nil {
-		return fmt.Errorf("handing %s to the new user: %w", path, err)
 	}
 	return nil
 }

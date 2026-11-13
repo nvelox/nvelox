@@ -11,7 +11,11 @@ server:
   # cannot switch. Not root: a startup WARNING, and it runs as it is. The
   # config, certificates and log directory must be readable by this user for
   # reloads and log reopens; a reload cannot add a port below 1024 (restart
-  # for that) and does not change the user.
+  # for that) and does not change the user. Keep the config and every file
+  # it names (certificates, keys, CA files, PROXY key files, error pages)
+  # NOT writable by this user: nvelox reads them as root at start. The log
+  # directory may be; as root, nvelox does not follow a symbolic link at a
+  # log path.
   # user: "nvelox"
   # group: "nvelox"
   # pid_file / workers are accepted but not implemented (no pid file, one

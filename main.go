@@ -96,8 +96,7 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 	// stops here rather than run with rights it was told to drop.
 	select {
 	case <-engine.Ready():
-		info, warning, err := privdrop.Switch(cfg.Server.User, cfg.Server.Group,
-			[]string{cfg.Logging.AccessLog, cfg.Logging.ErrorLog})
+		info, warning, err := privdrop.Switch(cfg.Server.User, cfg.Server.Group, logging.HandOver)
 		if err != nil {
 			return fmt.Errorf("server.user / server.group: %w", err)
 		}
