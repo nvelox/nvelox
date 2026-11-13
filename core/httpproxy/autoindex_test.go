@@ -48,7 +48,7 @@ func autoindexSite(t *testing.T, autoindex bool) (string, *HTTPServer) {
 	return root, NewHTTPServer(l, nil, map[string]*config.Backend{}, nil, nil, nil, nil, nil)
 }
 
-// TestAutoindex_ListsWhatTheRouteServes (D4): a directory without an index
+// TestAutoindex_ListsWhatTheRouteServes: a directory without an index
 // file is listed when the route sets autoindex, with only what the route would
 // serve: no dotfiles, no scripts, no symlink out of the root. Names are
 // HTML-escaped, links URL-escaped, directories first, and the page runs no

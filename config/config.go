@@ -201,10 +201,13 @@ type Listener struct {
 	AcceptProxyKeyFile string `yaml:"accept_proxy_key_file,omitempty"`
 	// AcceptProxyKeys is loaded from AcceptProxyKeyFile by Load.
 	AcceptProxyKeys [][]byte `yaml:"-"`
-	// AcceptProxyInterfaces (udp listeners): a PROXY header is trusted only on
-	// datagrams that arrived on one of these network interfaces — a VPN or a
-	// private network the public side cannot inject packets into. The
-	// listener gets one extra socket per address of each interface.
+	// AcceptProxyInterfaces (udp listeners, Linux): a PROXY header is trusted
+	// only on datagrams that arrived on one of these network interfaces (a
+	// second network card, a VLAN or a tunnel that only the relays reach),
+	// addressed to one of the interface's addresses. The listener gets one
+	// socket per address of each interface (a listener bound to one address:
+	// its own socket, on the interface that has the address), sharing its
+	// port. Interfaces and addresses are read at start (core/udpdevice.go).
 	AcceptProxyInterfaces []string `yaml:"accept_proxy_interfaces,omitempty"`
 
 	// L7 fields

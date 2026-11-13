@@ -318,7 +318,7 @@ func TestServerWarnings(t *testing.T) {
 	}
 }
 
-// TestStartupWarnings_MetricsEveryAddress (D3): metrics bound to every address
+// TestStartupWarnings_MetricsEveryAddress: metrics bound to every address
 // starts, with a warning; loopback, a specific address and the empty default
 // do not warn.
 func TestStartupWarnings_MetricsEveryAddress(t *testing.T) {
@@ -338,7 +338,7 @@ func TestStartupWarnings_MetricsEveryAddress(t *testing.T) {
 	}
 }
 
-// TestProxyKeysAndInterfaces (D1): key files load (several keys, comments),
+// TestProxyKeysAndInterfaces: key files load (several keys, comments),
 // short, empty or missing files fail the load, and the settings need their
 // counterparts: a key needs accept_proxy_from, a send key needs
 // send_proxy_v2, interfaces need a udp listener and accept_proxy_from.
@@ -383,9 +383,9 @@ func TestProxyKeysAndInterfaces(t *testing.T) {
 		"no key":            {udp("    accept_proxy_from: [\"10.0.0.0/8\"]\n    accept_proxy_key_file: \"" + empty + "\"\n"), "no key"},
 		"missing file":      {udp("    accept_proxy_from: [\"10.0.0.0/8\"]\n    accept_proxy_key_file: \"" + dir + "/nope\"\n"), "no such file"},
 		"key without trust": {udp("    accept_proxy_key_file: \"" + good + "\"\n"), "needs accept_proxy_from"},
-		"interfaces on tcp": {"listeners:\n  - name: l\n    bind: \":7002\"\n    protocol: tcp\n    backend: b\n    accept_proxy_from: [\"10.0.0.0/8\"]\n    accept_proxy_interfaces: [\"wg0\"]\n" +
+		"interfaces on tcp": {"listeners:\n  - name: l\n    bind: \":7002\"\n    protocol: tcp\n    backend: b\n    accept_proxy_from: [\"10.0.0.0/8\"]\n    accept_proxy_interfaces: [\"eth1\"]\n" +
 			"backends:\n  - name: b\n    servers: [\"127.0.0.1:1\"]\n", "applies to udp listeners"},
-		"interfaces without trust": {udp("    accept_proxy_interfaces: [\"wg0\"]\n"), "needs accept_proxy_from"},
+		"interfaces without trust": {udp("    accept_proxy_interfaces: [\"eth1\"]\n"), "needs accept_proxy_from"},
 		"send key without send_proxy_v2": {"listeners:\n  - name: l\n    bind: \":7003\"\n    protocol: tcp\n    backend: b\n" +
 			"backends:\n  - name: b\n    servers: [\"127.0.0.1:1\"]\n    send_proxy_key_file: \"" + good + "\"\n", "needs send_proxy_v2"},
 	} {
@@ -395,7 +395,7 @@ func TestProxyKeysAndInterfaces(t *testing.T) {
 	}
 }
 
-// TestStartupWarnings_UDPAddressOnlyTrust (D1): a udp listener that trusts
+// TestStartupWarnings_UDPAddressOnlyTrust: a udp listener that trusts
 // PROXY headers by source address alone warns; a key or interfaces, or a tcp
 // listener, do not.
 func TestStartupWarnings_UDPAddressOnlyTrust(t *testing.T) {
@@ -408,7 +408,7 @@ func TestStartupWarnings_UDPAddressOnlyTrust(t *testing.T) {
 	}
 	for name, l := range map[string]Listener{
 		"udp with key":        {Name: "u", Protocol: "udp", AcceptProxyFrom: trust, AcceptProxyKeyFile: "/k"},
-		"udp with interfaces": {Name: "u", Protocol: "udp", AcceptProxyFrom: trust, AcceptProxyInterfaces: []string{"wg0"}},
+		"udp with interfaces": {Name: "u", Protocol: "udp", AcceptProxyFrom: trust, AcceptProxyInterfaces: []string{"eth1"}},
 		"tcp":                 {Name: "t", Protocol: "tcp", AcceptProxyFrom: trust},
 		"udp without trust":   {Name: "u", Protocol: "udp"},
 	} {

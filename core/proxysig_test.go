@@ -1,6 +1,6 @@
 package core
 
-// D1-A: signed PROXY v2 headers (accept_proxy_key_file / send_proxy_key_file)
+// Signed PROXY v2 headers (accept_proxy_key_file / send_proxy_key_file)
 // through a running engine: a receiver with keys takes only headers signed
 // with one of them; a sender with a key signs every header it writes.
 

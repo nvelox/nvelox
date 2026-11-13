@@ -33,7 +33,10 @@ import (
 )
 
 type Engine struct {
-	UDPEngine       *nbio.Engine
+	UDPEngine *nbio.Engine
+	// UDPIfaceEngine serves the interface-bound sockets of udp listeners with
+	// accept_proxy_interfaces (udpdevice.go).
+	UDPIfaceEngine  *nbio.Engine
 	Listeners       []*ListenerConfig
 	Config          *config.Config
 	Balancers       map[string]lb.Balancer
@@ -97,6 +100,7 @@ type ListenerConfig struct {
 	TrustedProxies  []string
 	AcceptProxyFrom []string
 	proxyTrust      *proxyTrust // parsed once from AcceptProxyFrom (inbound PROXY-v2 trust)
+	proxyInterfaces []string    // accept_proxy_interfaces (udp): trust only datagrams that arrived on them
 	ServerNames     []string
 	DefaultServer   bool
 	Compression     config.CompressionConfig
@@ -348,15 +352,25 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 
 	// 4. Setup UDP Engine
-	udpAddrs := e.getAddrs("udp")
+	plan, err := e.planUDPInterfaces()
+	if err != nil {
+		return err
+	}
+	var udpAddrs []string
+	for _, a := range e.getAddrs("udp") {
+		if !plan.onDevice[a] {
+			udpAddrs = append(udpAddrs, a)
+		}
+	}
 	if len(udpAddrs) > 0 {
 		conf := nbio.Config{
 			Network:        "udp",
 			Addrs:          udpAddrs,
 			UDPReadTimeout: 60 * time.Second,
+			ListenUDP:      plan.listenShared,
 		}
 		e.UDPEngine = nbio.NewEngine(conf)
-		e.UDPEngine.OnOpen(handler.OnOpen)
+		e.UDPEngine.OnOpen(func(c *nbio.Conn) { handler.onOpen(c, false) })
 		e.UDPEngine.OnData(handler.OnData)
 		e.UDPEngine.OnClose(handler.OnClose)
 
@@ -364,6 +378,23 @@ func (e *Engine) Start(ctx context.Context) error {
 			return fmt.Errorf("UDP Engine start failed: %v", err)
 		}
 		logging.Info("NBIO UDP Engine Started on %d listeners", len(udpAddrs))
+	}
+	if len(plan.deviceAddrs) > 0 {
+		conf := nbio.Config{
+			Network:        "udp",
+			Addrs:          plan.deviceAddrs,
+			UDPReadTimeout: 60 * time.Second,
+			ListenUDP:      plan.listenDevice,
+		}
+		e.UDPIfaceEngine = nbio.NewEngine(conf)
+		// Every session of this engine arrived on a listed interface.
+		e.UDPIfaceEngine.OnOpen(func(c *nbio.Conn) { handler.onOpen(c, true) })
+		e.UDPIfaceEngine.OnData(handler.OnData)
+		e.UDPIfaceEngine.OnClose(handler.OnClose)
+		if err := e.UDPIfaceEngine.Start(); err != nil {
+			return fmt.Errorf("UDP interface engine start failed: %v", err)
+		}
+		logging.Info("UDP accept_proxy_interfaces sockets started on %v", plan.deviceAddrs)
 	}
 
 	// 5. Every socket is bound: report ready, then wait for the context.
@@ -413,6 +444,9 @@ func (e *Engine) Start(ctx context.Context) error {
 	// Stop the nbio UDP engine
 	if e.UDPEngine != nil {
 		e.UDPEngine.Stop()
+	}
+	if e.UDPIfaceEngine != nil {
+		e.UDPIfaceEngine.Stop()
 	}
 
 	// Drain active L4 connections
@@ -734,6 +768,7 @@ func ExpandListeners(listeners []config.Listener) ([]*ListenerConfig, error) {
 			TrustedProxies:  l.TrustedProxies,
 			AcceptProxyFrom: l.AcceptProxyFrom,
 			proxyTrust:      newProxyTrust(l.AcceptProxyFrom, l.AcceptProxyKeys),
+			proxyInterfaces: l.AcceptProxyInterfaces,
 			ServerNames:     l.ServerNames,
 			DefaultServer:   l.DefaultServer,
 			Compression:     l.Compression,

@@ -129,7 +129,11 @@ func (h *ProxyEventHandler) deleteCtx(c *nbio.Conn) {
 // a trusted relay's client is admitted in OnData once its PROXY header names
 // it) -> session limits -> backend max_connections -> backend socket.
 // Every refusal closes through closeOnOpen, never synchronously.
-func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
+func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) { h.onOpen(c, false) }
+
+// onOpen is OnOpen for a session that arrived on a socket bound to one of the
+// listener's accept_proxy_interfaces (viaListedInterface) or not.
+func (h *ProxyEventHandler) onOpen(c *nbio.Conn, viaListedInterface bool) {
 	// Backend connections from DialAsync already have session set in callback
 	if h.getCtx(c) != nil {
 		return
@@ -154,7 +158,12 @@ func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) {
 	// header names the REAL client — but that isn't parsed until after the backend
 	// dial, so until then an L4 record can only carry the relay IP. Track it so the
 	// emit paths can suppress a record that would blame the relay for its clients.
-	peerTrusted := l.proxyTrust != nil && l.proxyTrust.trusts(c.RemoteAddr())
+	// With accept_proxy_interfaces the datagram must also have arrived on one
+	// of them, that is on a socket bound to one (the interface engine,
+	// udpdevice.go): a forged relay source arriving anywhere else is an
+	// ordinary client.
+	peerTrusted := l.proxyTrust.trusts(c.RemoteAddr()) &&
+		(len(l.proxyInterfaces) == 0 || viaListedInterface)
 
 	// Check rate limit
 	if rl, ok := h.engine.RateLimiters[l.Name]; ok {
@@ -568,7 +577,11 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 	// NOT build the outbound header here — OnData strips the inbound header and
 	// builds the outbound one from the parsed real client. Untrusted peers skip
 	// this entirely: their headers are never parsed.
-	acceptInbound := l.proxyTrust.trusts(clientConn.RemoteAddr())
+	// Decided once, in OnOpen (address and, with accept_proxy_interfaces,
+	// arrival interface): a session OnOpen did not trust never strips a header.
+	clientCtx.Mu.Lock()
+	acceptInbound := clientCtx.PeerTrusted
+	clientCtx.Mu.Unlock()
 
 	// Snapshot what OnData needs to do the strip + outbound-header build. Set
 	// before any datagram of this session is forwarded (this runs inside

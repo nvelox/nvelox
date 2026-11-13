@@ -57,6 +57,7 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 - **ACLs** — match by source IP/CIDR, HTTP method, path, headers; allow/deny actions (TCP/UDP listeners: source IP only)
 - **IP Allowlist/Denylist** — CIDR-based per-listener filtering on HTTP, TCP and UDP listeners (behind a trusted PROXY v2 relay, on the client it names)
 - **Signed PROXY v2 headers** — relays and receivers share a key so a forged header (a spoofed UDP source) cannot name a client; keys rotate on reload
+- **Interface-bound relay trust** — for UDP relays that cannot sign: trust their PROXY headers only on datagrams that arrived on chosen network interfaces (`accept_proxy_interfaces`, Linux)
 - **Per-IP Rate Limiting** — token bucket per client IP with LRU cleanup
 - **Per-Listener Rate Limiting** — global connection rate limit
 - **Request Body Size Limit** — reject oversized request bodies

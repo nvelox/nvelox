@@ -162,6 +162,20 @@ listeners:
     #   sending nvelox signs with send_proxy_key_file. Rotation without a
     #   restart: add the new key on the receivers (SIGHUP), put it first on
     #   the senders (SIGHUP), then remove the old key from the receivers.
+    # accept_proxy_interfaces: ["eth1"]
+    #   (udp listeners, Linux) A trusted peer's PROXY header counts only on
+    #   datagrams that arrived on one of these network interfaces — e.g. a
+    #   second network card, a VLAN or a tunnel that only the relays reach —
+    #   addressed to one of its addresses. A datagram claiming a listed
+    #   address that arrives on another interface is an ordinary client
+    #   datagram. For relays that cannot sign their headers.
+    #   The listener shares its port with sockets bound to these interfaces,
+    #   and any program on the machine can bind a UDP port shared that way:
+    #   where other users or services run on the machine, use a port below
+    #   1024 (only privileged programs bind those) or run nvelox alone in its
+    #   own container or VM. The interfaces and their addresses are read at
+    #   start: restart nvelox after they change (a reload does not re-read
+    #   them).
 
     # Timeouts (HTTP/HTTPS listeners). All values accept Go duration
     # strings ("30s", "5m", "1h"). An explicit "0" means unlimited.
