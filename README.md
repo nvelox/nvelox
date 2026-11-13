@@ -46,7 +46,7 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 - **Redirect Rules** — 301/302 with variable substitution (`${host}`, `${path}`, `${uri}`, `${scheme}`, `${query}`, `${port}`)
 
 ### Static Files & PHP
-- **Static File Serving** — serve from document root with directory index support
+- **Static File Serving** — serve from document root with directory index support and optional directory listings (`autoindex`)
 - **try_files** — nginx-style `$uri`, `$uri/`, `/fallback$is_args$args`
 - **expires** — `1y`, `30d`, `1h`, `-1` (no-cache), sets Cache-Control/Expires headers
 - **FastCGI (PHP-FPM)** — forward to PHP-FPM via TCP or Unix socket with `split_path_info`, custom params

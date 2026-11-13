@@ -276,6 +276,10 @@ listeners:
         static:
           root: "/var/www/html"
           index: ["index.html"]
+          # autoindex: true   # list a directory that has no index file (like
+          #                   # nginx autoindex): names, sizes and dates, no
+          #                   # dotfiles, no scripts, no symlinks out of the
+          #                   # root, at most 10,000 entries, GET/HEAD only
         try_files:
           files: ["$uri", "$uri/"]
           fallback: "/index.php$is_args$args"

@@ -325,7 +325,7 @@ type FastCGIConfig struct {
 type StaticConfig struct {
 	Root      string   `yaml:"root"`                // Document root directory
 	Index     []string `yaml:"index,omitempty"`     // Index files (default: ["index.html"])
-	Autoindex bool     `yaml:"autoindex,omitempty"` // Directory listing
+	Autoindex bool     `yaml:"autoindex,omitempty"` // List a directory without an index file (core/httpproxy/autoindex.go)
 }
 
 // TryFilesConfig defines try_files behavior.
