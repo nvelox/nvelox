@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"nvelox/core/logging"
+	"nvelox/proxy"
 
 	"github.com/pires/go-proxyproto"
 )
@@ -165,10 +166,20 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 	var pending []byte
 	if peerTrusted {
 		var err error
-		src, pending, err = readInboundProxyV2(clientConn, src, inboundProxyHeaderWait)
+		var hdr *proxyproto.Header
+		hdr, src, pending, err = readInboundProxyV2Header(clientConn, src, inboundProxyHeaderWait)
 		if err != nil {
 			sessErr = err
 			return
+		}
+		// With accept_proxy_key_file a header that names a client must be
+		// signed; the connection is refused otherwise.
+		if hdr != nil {
+			if err := l.proxyTrust.verify(hdr, nil); err != nil {
+				logging.Warn("[PROXY] listener %s: refusing %s: %v", l.Name, clientConn.RemoteAddr(), err)
+				sessErr = err
+				return
+			}
 		}
 		realClientIP = ipStrOf(src)
 		clientResolved = true
@@ -230,6 +241,13 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 	// what lets one backend socket MUX a whole port range.
 	if backend != nil && backend.SendProxyV2 {
 		header := proxyproto.HeaderProxyFromAddrs(2, src, clientConn.LocalAddr())
+		if len(backend.SendProxyKey) > 0 {
+			if err := proxy.SignHeader(header, backend.SendProxyKey, time.Now()); err != nil {
+				logging.Error("Failed to sign PROXY v2 header: %v", err)
+				sessErr = err
+				return
+			}
+		}
 		if _, err := header.WriteTo(backendConn); err != nil {
 			logging.Error("Failed to write PROXY v2 header: %v", err)
 			sessErr = err
@@ -260,6 +278,13 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 // never completes) plus any bytes read past the header, which the caller must
 // forward to the backend before relaying.
 func readInboundProxyV2(c net.Conn, fallback net.Addr, wait time.Duration) (net.Addr, []byte, error) {
+	_, src, rest, err := readInboundProxyV2Header(c, fallback, wait)
+	return src, rest, err
+}
+
+// readInboundProxyV2Header is readInboundProxyV2 also returning the parsed
+// header (nil when the client is the fallback) for a signature check.
+func readInboundProxyV2Header(c net.Conn, fallback net.Addr, wait time.Duration) (*proxyproto.Header, net.Addr, []byte, error) {
 	c.SetReadDeadline(time.Now().Add(wait))
 	defer c.SetReadDeadline(time.Time{})
 	var buf []byte
@@ -267,22 +292,22 @@ func readInboundProxyV2(c net.Conn, fallback net.Addr, wait time.Duration) (net.
 	for {
 		n, err := c.Read(tmp)
 		buf = append(buf, tmp[:n]...)
-		if done, src, consumed := tryParseInboundProxyV2(buf); done {
-			if src == nil {
-				src = fallback
+		if done, hdr, consumed := tryParseInboundProxyV2Header(buf); done {
+			if hdr == nil {
+				return nil, fallback, buf[consumed:], nil
 			}
-			return src, buf[consumed:], nil
+			return hdr, hdr.SourceAddr, buf[consumed:], nil
 		}
 		if err != nil {
 			if isTimeout(err) || errors.Is(err, io.EOF) {
 				// Header never completed (or the peer half-closed first): fall
 				// back to the peer address and forward the bytes intact.
-				return fallback, buf, nil
+				return nil, fallback, buf, nil
 			}
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if len(buf) >= maxInboundProxyHeaderBuf {
-			return fallback, buf, nil
+			return nil, fallback, buf, nil
 		}
 	}
 }

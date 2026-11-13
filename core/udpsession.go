@@ -50,6 +50,7 @@ const (
 	udpDropSourceLimit   = "source_limit"    // maxUDPSessionsPerIP reached: new session refused
 	udpDropNoProxyHeader = "no_proxy_header" // trusted relay datagram without a valid PROXY v2 header
 	udpDropClientChanged = "client_changed"  // trusted relay datagram naming another client than the session's
+	udpDropBadSignature  = "bad_signature"   // trusted relay datagram whose header signature is missing or wrong (accept_proxy_key_file)
 )
 
 // udpSessionLimiter counts live UDP sessions, globally and per client IP.
@@ -169,4 +170,5 @@ var udpDropText = map[string]string{
 	udpDropSourceLimit:   fmt.Sprintf("UDP per-client session limit (%d) reached, new sessions refused", maxUDPSessionsPerIP),
 	udpDropNoProxyHeader: "datagrams from a trusted relay without a valid PROXY v2 header",
 	udpDropClientChanged: "datagrams from a trusted relay naming another client than the session's",
+	udpDropBadSignature:  "datagrams from a trusted relay without a valid header signature",
 }

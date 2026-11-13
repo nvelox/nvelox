@@ -147,10 +147,18 @@ listeners:
     #   TCP: the handshake proves the peer's address, so only a listed peer
     #   can supply a header. UDP: a datagram's source address can be forged,
     #   so anyone who can send packets claiming a listed address can name any
-    #   client. List a UDP relay only where the network drops such packets
-    #   before they reach this host: the relay reaches it over a private
-    #   network or WireGuard, and the public side drops those source
-    #   addresses (provider/firewall anti-spoofing, strict rp_filter).
+    #   client. Protect a UDP relay with accept_proxy_key_file or
+    #   accept_proxy_interfaces, or list it only where the network drops
+    #   such packets before they reach this host (startup WARNING otherwise).
+    # accept_proxy_key_file: "/etc/nvelox/proxy.keys"
+    #   A trusted peer's PROXY header must carry a valid signature made with
+    #   one of these keys (one per line, at least 32 characters, e.g.
+    #   `openssl rand -hex 32`; "#" comments; chmod 600). An unsigned or
+    #   wrongly signed header refuses the TCP connection / drops the UDP
+    #   datagram; a peer that sends no header is itself the client. The
+    #   sending nvelox signs with send_proxy_key_file. Rotation without a
+    #   restart: add the new key on the receivers (SIGHUP), put it first on
+    #   the senders (SIGHUP), then remove the old key from the receivers.
 
     # Timeouts (HTTP/HTTPS listeners). All values accept Go duration
     # strings ("30s", "5m", "1h"). An explicit "0" means unlimited.
@@ -397,6 +405,9 @@ backends:
     #   - UDP backends: header prepended to each datagram (DGRAM variant)
     #     so QUIC/HTTP3 backends can recover the client IP per packet.
     send_proxy_v2: false
+    # send_proxy_key_file: "/etc/nvelox/proxy.keys"  # sign the header (with
+    #   the first key) for a receiver that sets accept_proxy_key_file; for
+    #   UDP every datagram's header is signed over that datagram
 
     # Timeouts (override listener defaults)
     timeouts:

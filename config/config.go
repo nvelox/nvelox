@@ -183,15 +183,29 @@ type Listener struct {
 	TrustedProxies []string `yaml:"trusted_proxies,omitempty"`
 
 	// AcceptProxyFrom: CIDRs whose INBOUND PROXY-protocol-v2 header is trusted
-	// and used as the real client address at L4 (tcp / https-passthrough
-	// listeners). Connections from peers OUTSIDE this list have any inbound
-	// PROXY header IGNORED — the real TCP/UDP peer is used — so a direct client
-	// can never spoof its source. Empty (default) = trust nobody = inbound PROXY
-	// headers are never honored (behaviour unchanged). Distinct from
-	// trusted_proxies (L7 XFF/X-Real-IP trust). Used behind a relay (another
-	// nvelox, HAProxy, ...) that prepends a PROXY-v2 header with the real
-	// client: this list lets nvelox accept it and forward it to the backend.
+	// and used as the real client address at L4 (tcp, https-passthrough and
+	// udp listeners). Peers OUTSIDE this list have any inbound PROXY header
+	// IGNORED and are the client themselves. Empty (default) = trust nobody.
+	// Distinct from trusted_proxies (L7 XFF/X-Real-IP trust). Used behind a
+	// relay (another nvelox, HAProxy, ...) that prepends a PROXY-v2 header
+	// with the real client. A TCP handshake proves the peer address; a UDP
+	// datagram's source can be forged, so a udp listener should also set
+	// AcceptProxyKeyFile or AcceptProxyInterfaces (startup warning otherwise).
 	AcceptProxyFrom []string `yaml:"accept_proxy_from,omitempty"`
+	// AcceptProxyKeyFile: shared keys, one per line (at least 32 characters,
+	// "#" starts a comment), that a trusted peer's PROXY header must be signed
+	// with (proxy/signature.go; nvelox signs with send_proxy_key_file). A
+	// header without a valid signature is refused (TCP) or dropped (UDP).
+	// Every key in the file is accepted, so keys can be rotated: add the new
+	// key here, then sign with it, then remove the old one.
+	AcceptProxyKeyFile string `yaml:"accept_proxy_key_file,omitempty"`
+	// AcceptProxyKeys is loaded from AcceptProxyKeyFile by Load.
+	AcceptProxyKeys [][]byte `yaml:"-"`
+	// AcceptProxyInterfaces (udp listeners): a PROXY header is trusted only on
+	// datagrams that arrived on one of these network interfaces — a VPN or a
+	// private network the public side cannot inject packets into. The
+	// listener gets one extra socket per address of each interface.
+	AcceptProxyInterfaces []string `yaml:"accept_proxy_interfaces,omitempty"`
 
 	// L7 fields
 	HTTP3       bool              `yaml:"http3,omitempty"`
@@ -470,9 +484,14 @@ type HeadersConfig struct {
 
 // Backend defines a server pool.
 type Backend struct {
-	Name           string   `yaml:"name"`
-	Balance        string   `yaml:"balance"`         // "roundrobin", "leastconn", "random"
-	SendProxyV2    bool     `yaml:"send_proxy_v2"`   // Send PROXY Protocol v2 header to backend
+	Name        string `yaml:"name"`
+	Balance     string `yaml:"balance"`       // "roundrobin", "leastconn", "random"
+	SendProxyV2 bool   `yaml:"send_proxy_v2"` // Send PROXY Protocol v2 header to backend
+	// SendProxyKeyFile: sign the PROXY v2 header with the first key of this
+	// file (same format as a listener's accept_proxy_key_file).
+	SendProxyKeyFile string `yaml:"send_proxy_key_file,omitempty"`
+	// SendProxyKey is loaded from SendProxyKeyFile by Load.
+	SendProxyKey   []byte   `yaml:"-"`
 	Servers        []string `yaml:"servers"`         // List of server addresses
 	MaxConnections int      `yaml:"max_connections"` // Max concurrent HTTP requests / TCP connections / UDP sessions (0 = unlimited)
 
@@ -609,8 +628,73 @@ func Load(path string) (*Config, error) {
 	if err := validate(&cfg); err != nil {
 		return nil, fmt.Errorf("config validation failed: %w", err)
 	}
+	if err := loadProxyKeys(&cfg); err != nil {
+		return nil, fmt.Errorf("config validation failed: %w", err)
+	}
 
 	return &cfg, nil
+}
+
+// minProxyKeyLen is the shortest PROXY signing key accepted (characters).
+const minProxyKeyLen = 32
+
+// loadProxyKeys reads the accept_proxy_key_file and send_proxy_key_file of
+// every listener and backend.
+func loadProxyKeys(cfg *Config) error {
+	for i := range cfg.Listeners {
+		l := &cfg.Listeners[i]
+		if l.AcceptProxyKeyFile == "" {
+			continue
+		}
+		keys, err := readProxyKeyFile(l.AcceptProxyKeyFile)
+		if err != nil {
+			return fmt.Errorf("listener %s: accept_proxy_key_file: %v", l.Name, err)
+		}
+		l.AcceptProxyKeys = keys
+	}
+	for i := range cfg.Backends {
+		b := &cfg.Backends[i]
+		if b.SendProxyKeyFile == "" {
+			continue
+		}
+		if !b.SendProxyV2 {
+			return fmt.Errorf("backend %s: send_proxy_key_file needs send_proxy_v2: true", b.Name)
+		}
+		keys, err := readProxyKeyFile(b.SendProxyKeyFile)
+		if err != nil {
+			return fmt.Errorf("backend %s: send_proxy_key_file: %v", b.Name, err)
+		}
+		b.SendProxyKey = keys[0]
+	}
+	return nil
+}
+
+// readProxyKeyFile returns the keys of a key file: one per line, surrounding
+// spaces trimmed, blank lines and "#" comments skipped, each at least
+// minProxyKeyLen characters. A file other users can read is reported.
+func readProxyKeyFile(path string) ([][]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if fi, err := os.Stat(path); err == nil && fi.Mode().Perm()&0o077 != 0 {
+		fmt.Fprintf(os.Stderr, "[CONFIG] WARNING: key file %s has mode %#o; other users should not read it (chmod 600)\n", path, fi.Mode().Perm())
+	}
+	var keys [][]byte
+	for n, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if len(line) < minProxyKeyLen {
+			return nil, fmt.Errorf("%s line %d: key shorter than %d characters", path, n+1, minProxyKeyLen)
+		}
+		keys = append(keys, []byte(line))
+	}
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("%s: no key", path)
+	}
+	return keys, nil
 }
 
 func validate(cfg *Config) error {
@@ -708,6 +792,22 @@ func validate(cfg *Config) error {
 		for _, c := range l.AcceptProxyFrom {
 			if _, _, err := net.ParseCIDR(strings.TrimSpace(c)); err != nil {
 				return fmt.Errorf("listener %s: invalid accept_proxy_from CIDR %q: %v", l.Name, c, err)
+			}
+		}
+		if l.AcceptProxyKeyFile != "" && len(l.AcceptProxyFrom) == 0 {
+			return fmt.Errorf("listener %s: accept_proxy_key_file needs accept_proxy_from (the peers whose signed headers are trusted)", l.Name)
+		}
+		if len(l.AcceptProxyInterfaces) > 0 {
+			if l.Protocol != "udp" {
+				return fmt.Errorf("listener %s: accept_proxy_interfaces applies to udp listeners (a TCP handshake already proves the peer address)", l.Name)
+			}
+			if len(l.AcceptProxyFrom) == 0 {
+				return fmt.Errorf("listener %s: accept_proxy_interfaces needs accept_proxy_from", l.Name)
+			}
+			for _, name := range l.AcceptProxyInterfaces {
+				if strings.TrimSpace(name) == "" {
+					return fmt.Errorf("listener %s: accept_proxy_interfaces has an empty name", l.Name)
+				}
 			}
 		}
 
@@ -978,6 +1078,11 @@ func validateACL(rules []ACLRule, l4 bool) error {
 // expose something.
 func StartupWarnings(cfg *Config) []string {
 	out := ServerWarnings(cfg.Server)
+	for _, l := range cfg.Listeners {
+		if l.Protocol == "udp" && len(l.AcceptProxyFrom) > 0 && l.AcceptProxyKeyFile == "" && len(l.AcceptProxyInterfaces) == 0 {
+			out = append(out, fmt.Sprintf("listener %s: accept_proxy_from on a udp listener trusts the source address alone, which a datagram can forge: set accept_proxy_key_file or accept_proxy_interfaces, or make sure the network drops packets that claim those addresses", l.Name))
+		}
+	}
 	if cfg.Metrics.Enabled && everyAddress(cfg.Metrics.Bind) {
 		out = append(out, fmt.Sprintf("metrics.bind %q listens on every address, and the metrics endpoint has no authentication: bind a specific address or restrict the port with a firewall", cfg.Metrics.Bind))
 	}

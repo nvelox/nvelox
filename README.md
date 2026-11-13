@@ -56,6 +56,7 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 - **Client Certificate Auth (mTLS)** — `client_auth: require` / `request` with `client_ca` verification on TLS-terminating TCP, HTTPS and HTTP/3 listeners; per site (by SNI) when sites share a port
 - **ACLs** — match by source IP/CIDR, HTTP method, path, headers; allow/deny actions (TCP/UDP listeners: source IP only)
 - **IP Allowlist/Denylist** — CIDR-based per-listener filtering on HTTP, TCP and UDP listeners (behind a trusted PROXY v2 relay, on the client it names)
+- **Signed PROXY v2 headers** — relays and receivers share a key so a forged header (a spoofed UDP source) cannot name a client; keys rotate on reload
 - **Per-IP Rate Limiting** — token bucket per client IP with LRU cleanup
 - **Per-Listener Rate Limiting** — global connection rate limit
 - **Request Body Size Limit** — reject oversized request bodies

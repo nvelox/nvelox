@@ -73,6 +73,9 @@ type ConnContext struct {
 	// backend has send_proxy_v2: true (or, for StripInbound conns, in OnData
 	// once the real client is recovered from the inbound header).
 	ProxyHeader []byte
+	// SendProxyKey (send_proxy_key_file): sign ProxyHeader over each
+	// datagram it is sent with.
+	SendProxyKey []byte
 	// StripInbound (UDP): this listener trusts an inbound PROXY-v2 header from
 	// the immediate peer (a relay). OnData then
 	// strips a per-datagram DGRAM header and builds the OUTBOUND header from the
@@ -351,7 +354,23 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 	l := ctx.listener
 	ctx.Mu.Unlock()
 	if stripInbound {
-		src, consumed, isProxy := parseInboundProxyV2Datagram(data)
+		hdr, consumed, isProxy := parseInboundProxyV2DatagramHeader(data)
+		var src net.Addr
+		if hdr != nil {
+			src = hdr.SourceAddr
+			// With accept_proxy_key_file the header must be signed over this
+			// datagram: a forged relay datagram cannot name a client.
+			if err := l.proxyTrust.verify(hdr, data[consumed:]); err != nil {
+				h.udpDrops.note(udpDropBadSignature, listenerName(l), c.RemoteAddr())
+				ctx.Mu.Lock()
+				pending := ctx.relayPending
+				ctx.Mu.Unlock()
+				if pending {
+					c.Close()
+				}
+				return
+			}
+		}
 		if !isProxy || src == nil {
 			// A trusted relay must name the client in EVERY datagram. One
 			// without a (valid, non-LOCAL) header would be forwarded with no
@@ -443,9 +462,9 @@ func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
 	ctx.Mu.Lock()
 	if ctx.PeerConn != nil {
 		peer := ctx.PeerConn
-		hdr := ctx.ProxyHeader
+		hdr, key := ctx.ProxyHeader, ctx.SendProxyKey
 		ctx.Mu.Unlock()
-		_, err := writeWithProxy(peer, hdr, data)
+		_, err := writeWithProxy(peer, hdr, key, data)
 		if err != nil {
 			logging.Error("[DATA] Write failed: %v", err)
 		}
@@ -548,6 +567,10 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 	clientCtx.Mu.Lock()
 	clientCtx.StripInbound = acceptInbound
 	clientCtx.SendProxyV2 = sendProxyV2
+	clientCtx.SendProxyKey = nil
+	if backend != nil {
+		clientCtx.SendProxyKey = backend.SendProxyKey
+	}
 	clientCtx.LocalAddr = clientConn.LocalAddr()
 	clientCtx.Mu.Unlock()
 
@@ -586,7 +609,7 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 			clientCtx.BalancerRef.OnConnect(clientCtx.BackendServer)
 		}
 		if len(clientCtx.Buffer) > 0 {
-			writeWithProxy(session.BackendConn, clientCtx.ProxyHeader, clientCtx.Buffer)
+			writeWithProxy(session.BackendConn, clientCtx.ProxyHeader, clientCtx.SendProxyKey, clientCtx.Buffer)
 			clientCtx.Buffer = nil
 		}
 		clientCtx.Mu.Unlock()
@@ -650,7 +673,7 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 
 		// Flush any buffered data
 		if len(clientCtx.Buffer) > 0 {
-			_, writeErr := writeWithProxy(backendConn, clientCtx.ProxyHeader, clientCtx.Buffer)
+			_, writeErr := writeWithProxy(backendConn, clientCtx.ProxyHeader, clientCtx.SendProxyKey, clientCtx.Buffer)
 			if writeErr != nil {
 				logging.Error("Failed to flush UDP buffer: %v", writeErr)
 				clientCtx.Mu.Unlock()
@@ -750,11 +773,19 @@ func ipStrOf(addr net.Addr) string {
 }
 
 // writeWithProxy writes data to peer, optionally prepending a PROXY v2
-// header. When hdr is empty this is a plain peer.Write(data) — the hot
-// path for backends without send_proxy_v2.
-func writeWithProxy(peer net.Conn, hdr, data []byte) (int, error) {
+// header, signed over data when key is set (send_proxy_key_file). When hdr
+// is empty this is a plain peer.Write(data) — the hot path for backends
+// without send_proxy_v2.
+func writeWithProxy(peer net.Conn, hdr, key, data []byte) (int, error) {
 	if len(hdr) == 0 {
 		return peer.Write(data)
+	}
+	if len(key) > 0 {
+		signed, err := proxy.SignedHeaderBytes(hdr, key, data, time.Now())
+		if err != nil {
+			return 0, err
+		}
+		hdr = signed
 	}
 	out := make([]byte, len(hdr)+len(data))
 	copy(out, hdr)

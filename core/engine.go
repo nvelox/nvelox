@@ -26,6 +26,7 @@ import (
 	"nvelox/core/sticky"
 	"nvelox/core/tlsutil"
 	"nvelox/lb"
+	"nvelox/proxy"
 
 	"github.com/lesismal/nbio"
 	"github.com/pires/go-proxyproto"
@@ -60,7 +61,11 @@ type Engine struct {
 	reloadMu        sync.Mutex                  // serializes concurrent SIGHUPs
 	view            atomic.Pointer[backendView] // what request paths read (backendview.go)
 	ready           chan struct{}               // closed once Start holds every listening socket
-	configPath      string                      // path for reload
+	// l4Running: the L4 (tcp, udp) listener configs Start began serving,
+	// keyed by protocol, name and address. A reload does not rebuild them;
+	// it only swaps their PROXY signing keys (rotation).
+	l4Running  map[string]*ListenerConfig
+	configPath string // path for reload
 
 	// UDP session limits (see udpsession.go). Set from code constants in
 	// NewEngine — deliberately not configurable; tests lower them.
@@ -106,6 +111,9 @@ type ListenerConfig struct {
 	clientAuth *tlsutil.ClientAuth
 	prepared   bool
 }
+
+// l4Key identifies an L4 listener across a reload.
+func l4Key(l *ListenerConfig) string { return l.Protocol + "|" + l.Name + "|" + l.Addr }
 
 // Ready is closed once Start has bound every listening socket (HTTP, HTTPS
 // and HTTP/3, TCP, UDP, admin API, metrics). main switches to server.user /
@@ -198,6 +206,12 @@ func (e *Engine) Start(ctx context.Context) error {
 		return err
 	}
 	warnInsecureBackendTLS(e.Config.Backends)
+	e.l4Running = make(map[string]*ListenerConfig)
+	for _, l := range e.Listeners {
+		if l.Protocol == "tcp" || l.Protocol == "udp" {
+			e.l4Running[l4Key(l)] = l
+		}
+	}
 
 	// 1. Initialize Backends & Health Checkers
 	e.initBackends()
@@ -490,6 +504,17 @@ func (e *Engine) Reload(cfg *config.Config) error {
 	}
 
 	// Pre-flight passed — apply mutations.
+	// L4 listeners keep running as configured at start, except for their
+	// PROXY signing keys, which take the re-read key files (rotation).
+	for _, l := range expanded {
+		if running := e.l4Running[l4Key(l)]; running != nil && running.proxyTrust != nil && l.proxyTrust != nil {
+			var keys [][]byte
+			if k := l.proxyTrust.keys.Load(); k != nil {
+				keys = *k
+			}
+			running.proxyTrust.setKeys(keys)
+		}
+	}
 	warnInsecureBackendTLS(cfg.Backends)
 	e.Config = cfg
 	beAdded, beRemoved, beUpdated := e.reconcileBackends(cfg)
@@ -705,7 +730,7 @@ func ExpandListeners(listeners []config.Listener) ([]*ListenerConfig, error) {
 			ACL:             l.ACL,
 			TrustedProxies:  l.TrustedProxies,
 			AcceptProxyFrom: l.AcceptProxyFrom,
-			proxyTrust:      newProxyTrust(l.AcceptProxyFrom),
+			proxyTrust:      newProxyTrust(l.AcceptProxyFrom, l.AcceptProxyKeys),
 			ServerNames:     l.ServerNames,
 			DefaultServer:   l.DefaultServer,
 			Compression:     l.Compression,
@@ -1067,6 +1092,9 @@ func (e *Engine) startTLSListener(l *ListenerConfig, handler *ProxyEventHandler)
 			Listener:          raw,
 			Policy:            pol,
 			ReadHeaderTimeout: tlsProxyHeaderTimeout,
+			// With accept_proxy_key_file a trusted peer's header must be
+			// signed; the library drops the connection otherwise.
+			ValidateHeader: func(h *proxyproto.Header) error { return l.proxyTrust.verify(h, nil) },
 		}
 		logging.Info("TLS listener %s accepts inbound PROXY-v2 from %v", l.Name, l.AcceptProxyFrom)
 	}
@@ -1212,6 +1240,12 @@ func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *
 	// Send PROXY v2 if configured
 	if backend != nil && backend.SendProxyV2 {
 		header := proxyproto.HeaderProxyFromAddrs(2, client, backendConn.LocalAddr())
+		if len(backend.SendProxyKey) > 0 {
+			if err := proxy.SignHeader(header, backend.SendProxyKey, time.Now()); err != nil {
+				logging.Error("Failed to sign PROXY v2 header on TLS conn: %v", err)
+				return
+			}
+		}
 		if _, err := header.WriteTo(backendConn); err != nil {
 			logging.Error("Failed to write PROXY v2 header on TLS conn: %v", err)
 			return
