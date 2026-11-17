@@ -95,10 +95,6 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 		return fmt.Errorf("listener expansion: %w", err)
 	}
 
-	// Slots for the scheduler beside the event loops' own, before anything
-	// is served.
-	core.SpareSchedulerSlots()
-
 	engine := core.NewEngine(cfg)
 	engine.Listeners = expandedListeners
 	// Bind as root, serve only as server.user: nothing is answered before

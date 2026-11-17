@@ -6,7 +6,7 @@ toolchain go1.27.4
 
 require (
 	github.com/lesismal/nbio v1.6.8
-	github.com/nvelox/ngx v0.0.0-20261117102205-a4ab1057096e
+	github.com/nvelox/ngx v0.2.0
 	github.com/pires/go-proxyproto v0.8.1
 	github.com/quic-go/qpack v0.6.0
 	github.com/quic-go/quic-go v0.59.1

@@ -104,7 +104,7 @@ The HTTP/1.1, HTTPS and TCP scenarios on a 6 vCPU VM (KVM, Intel Broadwell, Linu
 
 ## Tuning
 
-- **Cores.** nvelox starts one event loop per `GOMAXPROCS`. Go sets it from the CPUs the process may run on (its affinity mask and, since Go 1.25, a cgroup CPU limit). Set `GOMAXPROCS` only to use fewer cores than that.
+- **Cores.** nvelox starts one event loop per `GOMAXPROCS` as it finds it at start. Go sets it from the CPUs the process may run on (its affinity mask and, since Go 1.25, a cgroup CPU limit). Set `GOMAXPROCS` only to use fewer cores than that. Each loop runs on its own OS thread, and nvelox then raises `GOMAXPROCS` by the number of loops for the goroutines beside them, so a running nvelox reports twice the value it started with.
 - **Open files.** Every client connection and every backend connection is a file descriptor; raise `ulimit -n` (for example to 65535 or more) for many concurrent connections. When the limit is reached, nvelox pauses accepting and retries, and connections that are already open keep working.
 - **Features and speed.** A site with a response cache, compression or client certificates, and a route that serves static files, FastCGI, redirects, `try_files` or `expires`, run on `net/http`, as do backends with sticky sessions and gRPC requests to `backend_tls` backends. They behave the same; they are served at `net/http` speed.
 - **Access log.** The access log is formatted without allocating and written once per loop iteration, so it costs little; the numbers above include it for nvelox in every HTTP scenario.
