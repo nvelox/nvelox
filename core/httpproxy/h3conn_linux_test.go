@@ -864,12 +864,26 @@ func h3Held(g *BindGroup) uint64 {
 	return total.Load()
 }
 
+// h3FirstWindowsOnly keeps a connection's receive windows at their first
+// size for the test: the configuration's smallest limits, which are that
+// size. A window otherwise grows while a backend takes a body as fast as
+// it arrives, and how far it got before the backend stopped reading
+// depends on the machine; with these limits "the window" is one number.
+func h3FirstWindowsOnly(t *testing.T) {
+	t.Helper()
+	useHTTP3Limits(t, config.HTTP3Config{MaxStreamReceiveWindow: "1MB", MaxConnectionReceiveWindow: "1MB"})
+	if l := http3Limits(); l.MaxStreamReceiveWindow != h3StreamWindow || l.MaxConnectionReceiveWindow != h3ConnWindow {
+		t.Fatalf("the limits are %d and %d, want the first windows %d and %d", l.MaxStreamReceiveWindow, l.MaxConnectionReceiveWindow, h3StreamWindow, h3ConnWindow)
+	}
+}
+
 // A request body its backend does not take backs up in nvelox, as far as
 // the client's windows allow and no further; when the backend takes it,
 // the client gets the room back, all of it: the body arrives whole, and
 // nothing is left counted against the connection.
 func TestH3Loops_BodyRoomGivenBack(t *testing.T) {
 	h3ServedBy(t, true)
+	h3FirstWindowsOnly(t)
 	upSendBuffer = 64 << 10 // nvelox's socket to the backend takes little too
 	t.Cleanup(func() { upSendBuffer = 0 })
 	pki := newCAPKI(t, "h3-loops-ca")
@@ -954,6 +968,7 @@ func TestH3Loops_BodyRoomGivenBack(t *testing.T) {
 // unread.
 func TestH3Loops_HandlersBodyRoomGivenBack(t *testing.T) {
 	h3ServedBy(t, true)
+	h3FirstWindowsOnly(t)
 	pki := newCAPKI(t, "h3-loops-ca")
 	release := make(chan struct{})
 	var letGo sync.Once
