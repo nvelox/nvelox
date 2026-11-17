@@ -26,8 +26,8 @@ import (
 )
 
 // UDP listeners on the event loops (the ngx module): the sessions, limits,
-// relay rules and access records of handler.go without the nbio poller, the
-// goroutine per session and the locks per datagram.
+// relay rules and access records of handler.go without the reading
+// goroutine per socket, the goroutine per session and the locks per datagram.
 //
 // Sockets. A single port (and a port range with fewer ports than loops) has
 // one socket per loop, all bound to the port with SO_REUSEPORT: the kernel
@@ -198,7 +198,7 @@ type udpSess struct {
 	start, lastPeer, opened, lastReply int64
 	replied                            bool
 
-	// Admission, as ConnContext keeps it for the nbio engine.
+	// Admission, as ConnContext keeps it for the sessions of udpsock.go.
 	realClientIP   string
 	peerTrusted    bool // the peer is a trusted relay
 	clientResolved bool // a header of the relay named the client
@@ -555,7 +555,7 @@ func (s *udpSock) datagram(from netip.AddrPort, name *unix.RawSockaddrInet6, nam
 	sess.forward(data)
 }
 
-// open admits a new session for peer, in the order of the nbio engine's
+// open admits a new session for peer, in the order of the handler's
 // OnOpen: listener rate limit, access policy on the client (a relay's
 // client is admitted when its header names it), session limits, the
 // backend's max_connections, the backend socket. It returns nil when the
@@ -1059,7 +1059,7 @@ func (sess *udpSess) OnTimer() {
 }
 
 // close ends the session: its backend socket, its slots and its access
-// record, as the nbio engine's OnClose.
+// record, as the handler's OnClose.
 func (sess *udpSess) close(err error) {
 	if sess.closed {
 		return

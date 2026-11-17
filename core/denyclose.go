@@ -8,8 +8,6 @@ import (
 	"nvelox/core/denylist"
 	"nvelox/core/httpproxy"
 	"nvelox/core/logging"
-
-	"github.com/lesismal/nbio"
 )
 
 // The dynamic denylist is consulted when a request, a connection or a UDP
@@ -74,7 +72,7 @@ func (h *ProxyEventHandler) closeSessionsOf(blocked func(net.IP) bool) int {
 		ip := net.ParseIP(ctx.RealClientIP)
 		ctx.Mu.Unlock()
 		if !skip && ip != nil && blocked(ip) {
-			go k.(*nbio.Conn).Close()
+			go k.(*udpConn).Close()
 			n++
 		}
 		return true

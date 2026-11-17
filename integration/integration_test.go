@@ -176,7 +176,6 @@ func getFreeUDPPort(t *testing.T) int {
 }
 
 func TestEndToEndUDP(t *testing.T) {
-	// t.Skip("UDP not yet supported in NBIO engine")
 	backendAddr := startUDPEchoServer(t)
 	proxyPort := getFreeUDPPort(t)
 

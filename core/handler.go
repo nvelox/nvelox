@@ -12,17 +12,15 @@ import (
 	"nvelox/core/logging"
 	"nvelox/lb"
 	"nvelox/proxy"
-
-	"github.com/lesismal/nbio"
 )
 
 // ProxyEventHandler holds the L4 accept-time gating shared by every L4 path
-// and is the nbio event handler for UDP. Plain TCP connections are served by
-// serveTCP (l4tcp.go) on their own goroutines, not through nbio.
+// and handles the UDP sessions of the listener sockets (udpsock.go). Plain
+// TCP connections are served by serveTCP (l4tcp.go) on their own goroutines.
 type ProxyEventHandler struct {
 	engine      *Engine
 	listenerMap map[string]*ListenerConfig
-	sessions    sync.Map // *nbio.Conn -> *ConnContext (thread-safe session storage)
+	sessions    sync.Map // *udpConn -> *ConnContext (thread-safe session storage)
 	udpSessions *udpSessionLimiter
 	udpDrops    *udpDrops
 }
@@ -112,12 +110,11 @@ type ConnContext struct {
 	viaInterface bool
 }
 
-func (h *ProxyEventHandler) setCtx(c *nbio.Conn, ctx *ConnContext) {
+func (h *ProxyEventHandler) setCtx(c *udpConn, ctx *ConnContext) {
 	h.sessions.Store(c, ctx)
-	c.SetSession(ctx) // also set on nbio for the session != nil guard in OnOpen
 }
 
-func (h *ProxyEventHandler) getCtx(c *nbio.Conn) *ConnContext {
+func (h *ProxyEventHandler) getCtx(c *udpConn) *ConnContext {
 	v, ok := h.sessions.Load(c)
 	if !ok {
 		return nil
@@ -125,8 +122,14 @@ func (h *ProxyEventHandler) getCtx(c *nbio.Conn) *ConnContext {
 	return v.(*ConnContext)
 }
 
-func (h *ProxyEventHandler) deleteCtx(c *nbio.Conn) {
-	h.sessions.Delete(c)
+// takeCtx removes and returns the session of c: of several callers, one gets
+// it, so a session is closed once however many close it at the same time.
+func (h *ProxyEventHandler) takeCtx(c *udpConn) *ConnContext {
+	v, ok := h.sessions.LoadAndDelete(c)
+	if !ok {
+		return nil
+	}
+	return v.(*ConnContext)
 }
 
 // OnOpen admits a new UDP session (one client source ip:port on a listener).
@@ -134,15 +137,11 @@ func (h *ProxyEventHandler) deleteCtx(c *nbio.Conn) {
 // a trusted relay's client is admitted in OnData once its PROXY header names
 // it) -> session limits -> backend max_connections -> backend socket.
 // Every refusal closes through closeOnOpen, never synchronously.
-func (h *ProxyEventHandler) OnOpen(c *nbio.Conn) { h.onOpen(c, false) }
+func (h *ProxyEventHandler) OnOpen(c *udpConn) { h.onOpen(c, false) }
 
 // onOpen is OnOpen for a session that arrived on a socket bound to one of the
 // listener's accept_proxy_interfaces (viaListedInterface) or not.
-func (h *ProxyEventHandler) onOpen(c *nbio.Conn, viaListedInterface bool) {
-	// Backend connections from DialAsync already have session set in callback
-	if h.getCtx(c) != nil {
-		return
-	}
+func (h *ProxyEventHandler) onOpen(c *udpConn, viaListedInterface bool) {
 	// Nothing is served before the process gave up root (Engine.HoldServing).
 	if h.engine != nil && !h.engine.serveGate.Wait(h.engine.runDone()) {
 		closeOnOpen(c)
@@ -154,10 +153,6 @@ func (h *ProxyEventHandler) onOpen(c *nbio.Conn, viaListedInterface bool) {
 		return
 	}
 
-	// Avoid calling net.UDPAddr.String() (or .IP's appendTo) here — nbio
-	// v1.6.8 can concurrently dupStdConn the same IP slice backing the
-	// address, tripping the race detector. Reading Port (an int field) on
-	// the concrete type sidesteps that slice walk entirely.
 	l := h.findListenerForAddr(localAddr)
 	if l == nil {
 		return
@@ -169,8 +164,8 @@ func (h *ProxyEventHandler) onOpen(c *nbio.Conn, viaListedInterface bool) {
 	// dial, so until then an L4 record can only carry the relay IP. Track it so the
 	// emit paths can suppress a record that would blame the relay for its clients.
 	// With accept_proxy_interfaces the datagram must also have arrived on one
-	// of them, that is on a socket bound to one (the interface engine,
-	// udpdevice.go): a forged relay source arriving anywhere else is an
+	// of them, that is on a socket bound to one (udpdevice.go): a forged
+	// relay source arriving anywhere else is an
 	// ordinary client.
 	peerTrusted := l.proxyTrust.trusts(c.RemoteAddr()) &&
 		(len(l.proxyInterfaces) == 0 || viaListedInterface)
@@ -297,27 +292,18 @@ func (h *ProxyEventHandler) onOpen(c *nbio.Conn, viaListedInterface bool) {
 }
 
 // closeOnOpen closes a UDP session being REJECTED from OnOpen (or failing
-// inside it). It must NOT close synchronously: nbio calls OnOpen from the
-// poller while it holds the UDP listener's (parent) conn mutex
-// (ReadAndGetConn -> readUDP -> getConn -> onOpen), and closing a child conn
-// takes that same mutex to remove itself from the parent's table
-// (udpConn.Close). A synchronous Close therefore deadlocks the poller
-// goroutine, and every UDP listener on that poller stops until a restart.
-// Conn.Execute is NOT a fix here: nvelox runs nbio with the default (inline)
-// Engine.Execute, which runs the job synchronously in place. A real goroutine
-// blocks on the mutex until OnOpen returns and the poller releases it, then
-// closes through nbio's normal path (OnClose included). (OnData runs after
-// the poller released the mutex, so closing there is synchronous-safe.)
-func closeOnOpen(c *nbio.Conn) {
+// inside it). The close runs on a goroutine of its own, never on the one
+// that reads the listener socket: OnClose logs and releases what the session
+// holds, and the socket's other clients must not wait for that.
+func closeOnOpen(c *udpConn) {
 	go func() { _ = c.Close() }()
 }
 
-func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
-	ctx := h.getCtx(c)
+func (h *ProxyEventHandler) OnClose(c *udpConn, err error) {
+	ctx := h.takeCtx(c)
 	if ctx == nil {
 		return
 	}
-	h.deleteCtx(c)
 
 	ctx.Mu.Lock()
 	peer := ctx.PeerConn
@@ -385,7 +371,7 @@ func (h *ProxyEventHandler) OnClose(c *nbio.Conn, err error) {
 	}
 }
 
-func (h *ProxyEventHandler) OnData(c *nbio.Conn, data []byte) {
+func (h *ProxyEventHandler) OnData(c *udpConn, data []byte) {
 	ctx := h.getCtx(c)
 	if ctx == nil {
 		return
@@ -556,10 +542,9 @@ func listenerName(l *ListenerConfig) string {
 	return l.Name
 }
 
-func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerConfig) {
+func (h *ProxyEventHandler) connectBackend(clientConn *udpConn, l *ListenerConfig) {
 	// Runs inside OnOpen (a direct client) or inside a relayed session's
-	// first OnData: every failure closes through closeOnOpen (a synchronous
-	// Close inside OnOpen deadlocks the nbio poller — see closeOnOpen).
+	// first OnData: every failure closes through closeOnOpen.
 	bv := h.engine.backends() // one consistent view for this session (H6)
 	balancer, ok := bv.Balancers[l.Backend]
 	if !ok {
@@ -601,11 +586,11 @@ func (h *ProxyEventHandler) connectBackend(clientConn *nbio.Conn, l *ListenerCon
 		dialTarget = fmt.Sprintf("%s:%d", dialTarget, l.Port)
 	}
 
-	// nbio serves UDP only; plain TCP runs serveTCP (l4tcp.go).
+	// These sessions are UDP only; plain TCP runs serveTCP (l4tcp.go).
 	h.connectBackendUDP(clientConn, dialTarget, backend, l)
 }
 
-func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target string, backend *config.Backend, l *ListenerConfig) {
+func (h *ProxyEventHandler) connectBackendUDP(clientConn *udpConn, target string, backend *config.Backend, l *ListenerConfig) {
 	clientCtx := h.getCtx(clientConn)
 
 	sendProxyV2 := backend != nil && backend.SendProxyV2
@@ -647,9 +632,8 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *nbio.Conn, target stri
 	}
 
 	// Check UDP pool for existing session (session affinity).
-	// The key includes the LOCAL (dedicated) port the client hit — portOf() reads
-	// the int Port field race-safely (vs .String() which walks the IP slice that
-	// nbio races on). Under a range-funnel ALL dedicated ports share one backend
+	// The key includes the LOCAL (dedicated) port the client hit. Under a
+	// range-funnel ALL dedicated ports share one backend
 	// name, so without the local port two clients with the same source IP:port
 	// (CGNAT) hitting DIFFERENT dedicated ports would collide on one backend conn
 	// and their replies would cross.
@@ -784,10 +768,9 @@ func (h *ProxyEventHandler) findListener(network, localAddr string) *ListenerCon
 	return nil
 }
 
-// findListenerForAddr is the race-safe variant of findListener: it reads the
-// port directly from the concrete *net.UDPAddr / *net.TCPAddr Port field
-// (an int, a scalar word) instead of calling .String() which walks the IP
-// byte slice that nbio@v1.6.8 races on during UDP conn setup.
+// findListenerForAddr is findListener for a net.Addr: it reads the port
+// from the concrete *net.UDPAddr / *net.TCPAddr, without formatting the
+// address.
 func (h *ProxyEventHandler) findListenerForAddr(addr net.Addr) *ListenerConfig {
 	var network string
 	var port int
@@ -810,8 +793,7 @@ func (h *ProxyEventHandler) findListenerForAddr(addr net.Addr) *ListenerConfig {
 }
 
 // portOf returns the Port field of a *net.UDPAddr / *net.TCPAddr, or 0 if
-// the address is of an unknown type. Used for logging so we don't call
-// Addr.String() (which walks the IP slice and races with nbio's conn setup).
+// the address is of an unknown type.
 func portOf(addr net.Addr) int {
 	switch a := addr.(type) {
 	case *net.UDPAddr:

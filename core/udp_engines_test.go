@@ -7,19 +7,20 @@ import (
 )
 
 // The UDP listeners are served by the event loops where they are supported
-// and by nbio elsewhere. The tests of UDP behaviour run on both, and look at
-// live sessions through stUDPSessions, whatever engine holds them.
+// and by a reading goroutine per socket elsewhere (udpsock.go). The tests of
+// UDP behaviour run on both, and look at live sessions through
+// stUDPSessions, whatever path holds them.
 
 // stUDPEngines runs body once per UDP engine this platform has.
 func stUDPEngines(t *testing.T, body func(t *testing.T)) {
 	t.Helper()
-	engines := []string{"nbio"}
+	engines := []string{"sockets"}
 	if udpFastEnabled() {
-		engines = []string{"loops", "nbio"}
+		engines = []string{"loops", "sockets"}
 	}
 	for _, eng := range engines {
 		t.Run(eng, func(t *testing.T) {
-			udpFastOff.Store(eng == "nbio")
+			udpFastOff.Store(eng == "sockets")
 			defer udpFastOff.Store(false)
 			body(t)
 		})

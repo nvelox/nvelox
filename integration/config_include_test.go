@@ -101,12 +101,12 @@ backends:
 	ctx, cancel := context.WithCancel(context.Background())
 	// Cancel immediately? No, Start needs to run initBackends.
 	// initBackends is first.
-	// But Start will start NBIO listeners.
+	// But Start will start the UDP listeners.
 	// We handle that by letting it fail on bind or just run briefly.
 
 	errCh := make(chan error)
 	go func() {
-		// Mock getAddrs to return empty so NBIO doesn't start actual sockets?
+		// Mock getAddrs to return empty so that no actual sockets start?
 		// No, getAddrs uses e.Listeners.
 		// We set engine.Listeners.
 		// We can set Address to random high port.

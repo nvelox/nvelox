@@ -13,7 +13,7 @@ import (
 )
 
 // UDP session limits. A UDP session is one client source ip:port on one
-// listener: an nbio conn, a connected backend socket (one fd and one
+// listener: its entry in the listener socket's table, a connected backend socket (one fd and one
 // ephemeral port) and the goroutine relaying the backend's replies. Without a
 // bound every datagram from a new source — trivially spoofed — created one
 // that lived 60 s (2000 sources: +1928 goroutines, +125 MiB).
@@ -43,7 +43,7 @@ const (
 	// that opened the session.
 	udpRelayPendingTimeout = 2 * time.Second
 	// udpIdleTimeout ends a session after this long without a backend reply
-	// (the nbio client-side read timeout is the same).
+	// (udpClientReadTimeout, for a silent client, is the same).
 	udpIdleTimeout = 60 * time.Second
 	// udpMaxDatagram is the reply buffer size (largest UDP payload).
 	udpMaxDatagram = 65535

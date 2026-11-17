@@ -16,13 +16,13 @@ import (
 
 // L4 TCP relay with standard proxy half-close semantics.
 //
-// The previous L4 TCP data path ran the client side on nbio and, as soon as
-// EITHER side ended, closed BOTH connections. nbio's Conn.Close discards its
-// pending write queue, so when a backend wrote a response and closed first,
+// The previous L4 TCP data path closed BOTH connections as soon as EITHER
+// side ended, and its close discarded the pending write queue, so when a
+// backend wrote a response and closed first,
 // every byte nvelox had already read from the backend but not yet flushed to
 // a slower client was silently dropped (production: a 90,104-byte HTTP/1.1
 // "Connection: close" response reached clients as 41-52 KB, cut mid TLS
-// record). nbio also treats a peer's half-close (EPOLLRDHUP) as a full close,
+// record). It also treated a peer's half-close (EPOLLRDHUP) as a full close,
 // so a client that half-closed after sending its request never got an answer.
 //
 // relayL4 instead does what an L4 proxy must:

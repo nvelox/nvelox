@@ -8,7 +8,7 @@ import (
 )
 
 // udpFast is the event-loop UDP engine, which runs on Linux only
-// (udpfast_linux.go); elsewhere the nbio engine serves UDP.
+// (udpfast_linux.go); elsewhere udpsock.go serves UDP.
 type udpFast struct{}
 
 func (e *Engine) startUDPFast(*udpInterfacePlan, *ProxyEventHandler) error {

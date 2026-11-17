@@ -22,13 +22,13 @@ import (
 //
 // The interface-bound sockets and the listener's own socket share the port.
 // On the event loops (udpfast_linux.go) with SO_REUSEPORT, which only a
-// socket of the same user can join. With nbio (listenShared, listenDevice;
-// tests only on Linux, where the interfaces are supported) with
-// SO_REUSEADDR, which lets any program on the machine bind the port.
+// socket of the same user can join. Without them (udpsock.go: listenShared,
+// listenDevice; tests only on Linux, where the interfaces are supported)
+// with SO_REUSEADDR, which lets any program on the machine bind the port.
 
 // udpInterfacePlan is what planUDPInterfaces decides at startup.
 type udpInterfacePlan struct {
-	deviceAddrs []string          // interface-bound sockets (the interface engine)
+	deviceAddrs []string          // interface-bound sockets
 	deviceOf    map[string]string // their local address -> interface name
 	sharedPorts map[int]bool      // ports whose sockets share the port
 	onDevice    map[string]bool   // listener addresses whose own socket is interface-bound
@@ -129,8 +129,8 @@ func localAddrs() []net.Addr {
 	return addrs
 }
 
-// listenShared is the ordinary UDP engine's socket factory: a socket on a
-// port that interface-bound sockets also use shares it (SO_REUSEADDR).
+// listenShared opens a listener's own socket (udpsock.go): on a port that
+// interface-bound sockets also use it shares the port (SO_REUSEADDR).
 func (p *udpInterfacePlan) listenShared(network string, laddr *net.UDPAddr) (*net.UDPConn, error) {
 	if !p.sharedPorts[laddr.Port] {
 		return net.ListenUDP(network, laddr)
@@ -138,7 +138,7 @@ func (p *udpInterfacePlan) listenShared(network string, laddr *net.UDPAddr) (*ne
 	return listenUDPSocket(network, laddr, "")
 }
 
-// listenDevice is the interface engine's socket factory.
+// listenDevice opens an interface-bound socket (udpsock.go).
 func (p *udpInterfacePlan) listenDevice(network string, laddr *net.UDPAddr) (*net.UDPConn, error) {
 	dev := p.deviceOf[laddr.String()]
 	if dev == "" {

@@ -5,7 +5,6 @@ its own license, reproduced here from the version that is compiled in.
 
 | Software | Version | License |
 |---|---|---|
-| github.com/lesismal/nbio | v1.6.8 | MIT |
 | github.com/pires/go-proxyproto | v0.8.1 | Apache-2.0 |
 | github.com/quic-go/qpack | v0.6.0 | MIT |
 | github.com/quic-go/quic-go | v0.59.1 | MIT |
@@ -17,34 +16,6 @@ its own license, reproduced here from the version that is compiled in.
 | golang.org/x/tools/godoc | v0.1.0-deprecated | BSD-3-Clause |
 | gopkg.in/yaml.v3 | v3.0.1 | MIT and Apache-2.0 |
 | The Go programming language (runtime and standard library) | go1.27.4 | BSD-3-Clause |
-
-## github.com/lesismal/nbio v1.6.8
-
-`LICENSE`:
-
-```
-MIT License
-
-Copyright (c) 2020 lesismal
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
 
 ## github.com/pires/go-proxyproto v0.8.1
 
