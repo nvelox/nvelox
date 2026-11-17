@@ -15,10 +15,8 @@ import (
 )
 
 // Plain (non-TLS-terminating) L4 TCP listeners: one accept loop per listener
-// and one goroutine pair per connection (relayL4). TCP used to run on the
-// nbio event loop, but nbio cannot express half-close: it full-closes a conn
-// on the peer's FIN (EPOLLRDHUP) and its Close discards the unflushed write
-// queue — see relay.go. UDP stays on nbio (no half-close there).
+// and one goroutine pair per connection (relayL4), which half-closes and
+// flushes before it closes — see relay.go.
 
 // inboundProxyHeaderWait bounds how long a TRUSTED peer (accept_proxy_from)
 // gets to deliver its inbound PROXY-v2 header; its connection is closed
@@ -83,8 +81,8 @@ func (e *Engine) dialL4Backend(target string, timeout time.Duration) (net.Conn, 
 
 // closeL4Conns closes every live L4 TCP client connection (plain and TLS).
 // Used at shutdown after the accept loops have exited; each session unwinds
-// through its relay's error path. This keeps the old restart behaviour (the
-// nbio TCP engine's Stop closed every TCP conn) and the drain fast.
+// through its relay's error path. A restart closes every TCP connection,
+// and the drain stays fast.
 func (e *Engine) closeL4Conns() {
 	e.l4Conns.Range(func(k, _ any) bool {
 		k.(io.Closer).Close()
@@ -92,10 +90,9 @@ func (e *Engine) closeL4Conns() {
 	})
 }
 
-// serveTCP proxies one accepted plain L4 TCP connection end to end. It is the
-// goroutine-per-connection replacement of the nbio OnOpen -> connectBackend ->
-// OnData/OnClose chain for TCP, with identical accept-time gating, PROXY-v2
-// handling and L4 access record.
+// serveTCP proxies one accepted plain L4 TCP connection end to end, on its
+// own goroutine, with the accept-time gating, PROXY-v2 handling and L4
+// access record that the UDP sessions have (handler.go).
 //
 // Order: listener rate limit -> access policy on the RESOLVED client (the peer
 // for a direct client; for a trusted accept_proxy_from relay, the client its

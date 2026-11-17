@@ -30,15 +30,14 @@ import (
 	"nvelox/lb"
 	"nvelox/proxy"
 
-	"github.com/lesismal/nbio"
 	"github.com/pires/go-proxyproto"
 )
 
 type Engine struct {
-	UDPEngine *nbio.Engine
-	// UDPIfaceEngine serves the interface-bound sockets of udp listeners with
-	// accept_proxy_interfaces (udpdevice.go).
-	UDPIfaceEngine  *nbio.Engine
+	// udpSocks are the udp listener sockets where the event loops do not
+	// serve them (udpsock.go): the listeners' own sockets and the
+	// interface-bound ones of accept_proxy_interfaces (udpdevice.go).
+	udpSocks        []*udpListenSock
 	Listeners       []*ListenerConfig
 	Config          *config.Config
 	Balancers       map[string]lb.Balancer
@@ -63,7 +62,7 @@ type Engine struct {
 	proxyRefusals   proxyRefusals               // refused relay connections (proxytrust.go)
 	tcpListeners    []tcpListener               // plain L4 TCP listeners (std accept loop + relayL4)
 	l4Fast          []*l4FastServer             // plain L4 TCP listeners served by the event loops (l4fast_linux.go)
-	udpFast         *udpFast                    // the udp listeners on the event loops (udpfast_linux.go); nil with nbio
+	udpFast         *udpFast                    // the udp listeners on the event loops (udpfast_linux.go); nil where udpSocks serve them
 	acceptWG        sync.WaitGroup              // L4 TCP/TLS accept loops; waited on before closing live conns
 	l4Conns         sync.Map                    // live L4 TCP/TLS client conns (net.Conn or loop session -> *l4Client), closed on shutdown
 	runCtx          context.Context             // Start's ctx: cancels in-flight L4 backend dials on shutdown
@@ -85,7 +84,10 @@ type Engine struct {
 	// udpRelayPendingTimeout ends a trusted relay's session no header has
 	// reached (udpsession.go).
 	udpRelayPendingTimeout time.Duration
-	l4Handler              *ProxyEventHandler // set by Start (under reloadMu)
+	// udpClientReadTimeout ends a session of a listener socket whose client
+	// has sent nothing for this long (udpsock.go).
+	udpClientReadTimeout time.Duration
+	l4Handler            *ProxyEventHandler // set by Start (under reloadMu)
 }
 
 type ListenerConfig struct {
@@ -176,6 +178,7 @@ func NewEngine(cfg *config.Config) *Engine {
 		udpMaxSessionsPerIP:    maxUDPSessionsPerIP,
 		udpNoReplyTimeout:      udpNoReplyTimeout,
 		udpRelayPendingTimeout: udpRelayPendingTimeout,
+		udpClientReadTimeout:   udpClientReadTimeout,
 	}
 	if cfg != nil {
 		e.shutdownTimeout.Store(int64(cfg.Server.ResolveShutdownTimeout()))
@@ -376,10 +379,9 @@ func (e *Engine) Start(ctx context.Context) error {
 
 	// 3. L4 TCP listeners. Plain (non-TLS) listeners run a std accept loop
 	// with one relayL4 goroutine pair per connection; TLS-terminating
-	// listeners use their own accept loop and the same relay. (TCP no longer
-	// runs on nbio: nbio cannot half-close and drops unflushed bytes on close
-	// — see relay.go.) Bind everything first so a bind failure leaves no
-	// accept loop running.
+	// listeners use their own accept loop and the same relay (relay.go: an
+	// L4 relay has to half-close and to flush before it closes). Bind
+	// everything first so a bind failure leaves no accept loop running.
 	for _, l := range e.Listeners {
 		if l.Protocol != "tcp" || l.TLS != nil {
 			continue
@@ -423,7 +425,7 @@ func (e *Engine) Start(ctx context.Context) error {
 		if err := e.startUDPFast(plan, handler); err != nil {
 			return fmt.Errorf("UDP Engine start failed: %v", err)
 		}
-	} else if err := e.startUDPNbio(plan, handler); err != nil {
+	} else if err := e.startUDPSockets(plan, handler); err != nil {
 		return err
 	}
 
@@ -472,18 +474,14 @@ func (e *Engine) Start(ctx context.Context) error {
 	cancel()
 
 	// Stop accepting new L4 TCP/TLS connections, wait for the accept loops to
-	// exit (no further ActiveConns.Add), then close the live L4 TCP sessions —
-	// the restart behaviour the nbio TCP engine's Stop() had.
+	// exit (no further ActiveConns.Add), then close the live L4 TCP sessions.
 	e.closeTCPListeners()
 	e.acceptWG.Wait()
 	e.closeL4Conns()
 
-	// Stop the nbio UDP engine
-	if e.UDPEngine != nil {
-		e.UDPEngine.Stop()
-	}
-	if e.UDPIfaceEngine != nil {
-		e.UDPIfaceEngine.Stop()
+	// Stop the UDP listeners: their sockets close and their sessions end.
+	for _, s := range e.udpSocks {
+		s.stop()
 	}
 	if e.udpFast != nil {
 		e.udpFast.stop()
@@ -516,47 +514,55 @@ func (e *Engine) Start(ctx context.Context) error {
 	return nil
 }
 
-// startUDPNbio serves the udp listeners with nbio: where event loops are not
-// supported, and in tests that compare the two engines.
-func (e *Engine) startUDPNbio(plan *udpInterfacePlan, handler *ProxyEventHandler) error {
-	var udpAddrs []string
-	for _, a := range e.getAddrs("udp") {
-		if !plan.onDevice[a] {
-			udpAddrs = append(udpAddrs, a)
+// startUDPSockets serves the udp listeners with one reading goroutine per
+// socket (udpsock.go): where event loops are not supported, and in tests
+// that compare the two paths. Every socket is bound before any is read, so
+// a bind failure leaves nothing running.
+func (e *Engine) startUDPSockets(plan *udpInterfacePlan, handler *ProxyEventHandler) error {
+	var socks []*udpListenSock
+	bind := func(addr string, listen func(string, *net.UDPAddr) (*net.UDPConn, error), viaInterface bool) error {
+		ua, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			return err
+		}
+		pc, err := listen("udp", ua)
+		if err != nil {
+			return err
+		}
+		socks = append(socks, newUDPListenSock(pc, handler, viaInterface))
+		return nil
+	}
+	closeAll := func() {
+		for _, s := range socks {
+			_ = s.pc.Close()
 		}
 	}
-	if len(udpAddrs) > 0 {
-		conf := nbio.Config{
-			Network:        "udp",
-			Addrs:          udpAddrs,
-			UDPReadTimeout: 60 * time.Second,
-			ListenUDP:      plan.listenShared,
+	own := 0
+	for _, a := range e.getAddrs("udp") {
+		if plan.onDevice[a] {
+			continue
 		}
-		e.UDPEngine = nbio.NewEngine(conf)
-		e.UDPEngine.OnOpen(func(c *nbio.Conn) { handler.onOpen(c, false) })
-		e.UDPEngine.OnData(handler.OnData)
-		e.UDPEngine.OnClose(handler.OnClose)
-
-		if err := e.UDPEngine.Start(); err != nil {
+		if err := bind(a, plan.listenShared, false); err != nil {
+			closeAll()
 			return fmt.Errorf("UDP Engine start failed: %v", err)
 		}
-		logging.Info("NBIO UDP Engine Started on %d listeners", len(udpAddrs))
+		own++
 	}
-	if len(plan.deviceAddrs) > 0 {
-		conf := nbio.Config{
-			Network:        "udp",
-			Addrs:          plan.deviceAddrs,
-			UDPReadTimeout: 60 * time.Second,
-			ListenUDP:      plan.listenDevice,
-		}
-		e.UDPIfaceEngine = nbio.NewEngine(conf)
-		// Every session of this engine arrived on a listed interface.
-		e.UDPIfaceEngine.OnOpen(func(c *nbio.Conn) { handler.onOpen(c, true) })
-		e.UDPIfaceEngine.OnData(handler.OnData)
-		e.UDPIfaceEngine.OnClose(handler.OnClose)
-		if err := e.UDPIfaceEngine.Start(); err != nil {
+	// Every session of these sockets arrived on a listed interface.
+	for _, a := range plan.deviceAddrs {
+		if err := bind(a, plan.listenDevice, true); err != nil {
+			closeAll()
 			return fmt.Errorf("UDP interface engine start failed: %v", err)
 		}
+	}
+	e.udpSocks = socks
+	for _, s := range socks {
+		s.start()
+	}
+	if own > 0 {
+		logging.Info("UDP Engine Started on %d listeners", own)
+	}
+	if len(plan.deviceAddrs) > 0 {
 		logging.Info("UDP accept_proxy_interfaces sockets started on %v", plan.deviceAddrs)
 	}
 	return nil
@@ -1130,8 +1136,8 @@ func sliceEqual(a, b []string) bool {
 	return true
 }
 
-// getAddrs returns the bind addresses of the nbio-served listeners of proto
-// (UDP; plain TCP now runs its own accept loops — see l4tcp.go).
+// getAddrs returns the bind addresses of the listeners of proto without
+// TLS (UDP; plain TCP runs its own accept loops — see l4tcp.go).
 func (e *Engine) getAddrs(proto string) []string {
 	addrs := make([]string, 0)
 	for _, l := range e.Listeners {

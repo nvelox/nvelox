@@ -100,7 +100,7 @@ graph TD
     subgraph Nvelox
         Listeners -->|IP Filter| ACL{ACL + Rate Limit}
         ACL -->|L4 TCP| L4Relay[TCP relay on the event loops, half-close]
-        ACL -->|L4 UDP| NBIOEngine[UDP sessions on the event loops]
+        ACL -->|L4 UDP| UDPSessions[UDP sessions on the event loops]
         ACL -->|HTTP/1.1, HTTP/2| FastPath[HTTP/1.1 and HTTP/2 on the event loops]
         ACL -->|L7| HTTPServer[net/http Server]
         FastPath -->|hand-over: upgrades, static, cache...| HTTPServer
@@ -111,7 +111,7 @@ graph TD
         Router -->|Proxy| ReverseProxy[httputil.ReverseProxy]
         Router -->|Redirect| RedirectHandler
         L4Relay -->|Dial| BackendPool
-        NBIOEngine -->|DialAsync| BackendPool
+        UDPSessions -->|Dial| BackendPool
         ReverseProxy -->|Shared Transport| BackendPool[Backend Pool]
         FCGIClient --> PHPFPM[PHP-FPM]
     end
@@ -419,7 +419,8 @@ See [`examples/README.md`](examples/README.md) for manual real-world testing wit
 ```
 core/
   engine.go          — Engine orchestration, lifecycle
-  handler.go         — L4 accept gating + UDP proxy (nbio)
+  handler.go         — L4 accept gating + UDP sessions
+  udpsock.go         — UDP listener sockets where event loops are not supported
   l4tcp.go           — L4 TCP accept loop + per-connection proxying
   l4fast_linux.go    — L4 TCP relay on the event loops (Linux)
   relay.go           — L4 TCP relay (half-close semantics, idle timeout)

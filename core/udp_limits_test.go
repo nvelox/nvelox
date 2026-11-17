@@ -2,8 +2,8 @@ package core
 
 // H9 / M1: UDP sessions are bounded (global and per-client caps, a short TTL
 // for sessions the backend never answered), a failure inside OnOpen never
-// closes synchronously (that deadlocked the nbio poller), and a trusted
-// relay's datagram without a PROXY v2 header is dropped.
+// stops the socket's reader, and a trusted relay's datagram without a PROXY
+// v2 header is dropped.
 
 import (
 	"bytes"
@@ -16,10 +16,9 @@ import (
 )
 
 // H9b regression: with no healthy backend server, OnOpen used to close the new
-// client conn synchronously while nbio held the UDP listener's mutex — the
-// poller deadlocked on the first such datagram and every UDP listener on it
-// stayed dead until a restart. Now: refuse that client, and serve the next
-// one once a server is back.
+// client conn in a way that stopped the listener's reader at the first such
+// datagram, and every UDP listener on it stayed dead until a restart. Now:
+// refuse that client, and serve the next one once a server is back.
 func TestUDP_NoHealthyServerDoesNotWedgePoller(t *testing.T) {
 	stUDPEngines(t, udpTestUDP_NoHealthyServerDoesNotWedgePoller)
 }
