@@ -420,6 +420,11 @@ func TestProxyKeysAndInterfaces(t *testing.T) {
 		"interfaces without trust": {udp("    accept_proxy_interfaces: [\"eth1\"]\n"), "needs accept_proxy_from"},
 		"send key without send_proxy_v2": {"listeners:\n  - name: l\n    bind: \":7003\"\n    protocol: tcp\n    backend: b\n" +
 			"backends:\n  - name: b\n    servers: [\"127.0.0.1:1\"]\n    send_proxy_key_file: \"" + good + "\"\n", "needs send_proxy_v2"},
+		// HTTP/3 through relays: a UDP source address proves nothing, so the
+		// relays' headers must be signed.
+		"http3 relays without a key file": {"listeners:\n  - name: l\n    bind: \":7004\"\n    protocol: https\n    http3: true\n    backend: b\n" +
+			"    tls:\n      cert: \"" + good + "\"\n      key: \"" + good + "\"\n    accept_proxy_from: [\"10.0.0.0/8\"]\n" +
+			"backends:\n  - name: b\n    servers: [\"127.0.0.1:1\"]\n", "http3 with accept_proxy_from needs accept_proxy_key_file"},
 	} {
 		if _, err := load(c.extra); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: err %v, want %q", name, err, c.want)
@@ -443,6 +448,36 @@ func TestStartupWarnings_UDPAddressOnlyTrust(t *testing.T) {
 		"udp with interfaces": {Name: "u", Protocol: "udp", AcceptProxyFrom: trust, AcceptProxyInterfaces: []string{"eth1"}},
 		"tcp":                 {Name: "t", Protocol: "tcp", AcceptProxyFrom: trust},
 		"udp without trust":   {Name: "u", Protocol: "udp"},
+	} {
+		if warn(l) {
+			t.Errorf("%s: unexpected warning", name)
+		}
+	}
+}
+
+// TestStartupWarnings_RelayInTrustedProxies: on an http or https listener
+// trusted_proxies is matched against the client a relay names, so a relay
+// listed there too is reported.
+func TestStartupWarnings_RelayInTrustedProxies(t *testing.T) {
+	warn := func(l Listener) bool {
+		return strings.Contains(strings.Join(StartupWarnings(&Config{Listeners: []Listener{l}}), "\n"), "overlaps accept_proxy_from")
+	}
+	for name, l := range map[string]Listener{
+		"same range":              {Name: "h", Protocol: "http", AcceptProxyFrom: []string{"10.0.0.0/24"}, TrustedProxies: []string{"10.0.0.0/24"}},
+		"relay inside the list":   {Name: "h", Protocol: "https", AcceptProxyFrom: []string{"10.0.0.0/24"}, TrustedProxies: []string{"192.0.2.1", " 10.0.0.0/8 "}},
+		"proxy inside the relays": {Name: "h", Protocol: "http", AcceptProxyFrom: []string{"10.0.0.0/8"}, TrustedProxies: []string{"10.1.2.3"}},
+		"ipv6":                    {Name: "h", Protocol: "http", AcceptProxyFrom: []string{"2001:db8::/32"}, TrustedProxies: []string{"2001:db8:1::1"}},
+	} {
+		if !warn(l) {
+			t.Errorf("%s: no warning", name)
+		}
+	}
+	for name, l := range map[string]Listener{
+		"apart":          {Name: "h", Protocol: "http", AcceptProxyFrom: []string{"10.0.0.0/24"}, TrustedProxies: []string{"10.0.1.0/24", "192.0.2.0/24"}},
+		"no relays":      {Name: "h", Protocol: "http", TrustedProxies: []string{"10.0.0.0/8"}},
+		"no proxies":     {Name: "h", Protocol: "https", AcceptProxyFrom: []string{"10.0.0.0/8"}},
+		"tcp listener":   {Name: "t", Protocol: "tcp", AcceptProxyFrom: []string{"10.0.0.0/8"}, TrustedProxies: []string{"10.0.0.0/8"}},
+		"other families": {Name: "h", Protocol: "http", AcceptProxyFrom: []string{"10.0.0.0/8"}, TrustedProxies: []string{"2001:db8::/32"}},
 	} {
 		if warn(l) {
 			t.Errorf("%s: unexpected warning", name)

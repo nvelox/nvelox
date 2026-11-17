@@ -58,10 +58,14 @@ type Engine struct {
 	BindGroups      []*httpproxy.BindGroup      // socket-owning groups (one per bind addr)
 	ActiveConns     sync.WaitGroup              // tracks in-flight connections for graceful drain
 	DrainTimeout    time.Duration               // max wait on shutdown (default 30s)
+	shutdownTimeout atomic.Int64                // server.shutdown_timeout of the config in use (ShutdownTimeout)
 	tlsListeners    []net.Listener              // TLS listeners to close on shutdown
+	proxyRefusals   proxyRefusals               // refused relay connections (proxytrust.go)
 	tcpListeners    []tcpListener               // plain L4 TCP listeners (std accept loop + relayL4)
+	l4Fast          []*l4FastServer             // plain L4 TCP listeners served by the event loops (l4fast_linux.go)
+	udpFast         *udpFast                    // the udp listeners on the event loops (udpfast_linux.go); nil with nbio
 	acceptWG        sync.WaitGroup              // L4 TCP/TLS accept loops; waited on before closing live conns
-	l4Conns         sync.Map                    // live L4 TCP/TLS client conns (net.Conn -> *l4Client), closed on shutdown
+	l4Conns         sync.Map                    // live L4 TCP/TLS client conns (net.Conn or loop session -> *l4Client), closed on shutdown
 	runCtx          context.Context             // Start's ctx: cancels in-flight L4 backend dials on shutdown
 	reloadMu        sync.Mutex                  // serializes concurrent SIGHUPs
 	view            atomic.Pointer[backendView] // what request paths read (backendview.go)
@@ -117,6 +121,11 @@ type ListenerConfig struct {
 
 	// Derived by prepare(): the parsed L4 access policy (tcp/udp) and the
 	// client-certificate policy (tls). prepared marks them built.
+	// rangeSize is how many ports the listener's bind covers (1 for a single
+	// port) and rangeIndex this listener's place among them: a udp range
+	// with at least as many ports as event loops gets one socket per port.
+	rangeSize, rangeIndex int
+
 	access     *l4Access
 	clientAuth *tlsutil.ClientAuth
 	prepared   bool
@@ -168,6 +177,9 @@ func NewEngine(cfg *config.Config) *Engine {
 		udpNoReplyTimeout:      udpNoReplyTimeout,
 		udpRelayPendingTimeout: udpRelayPendingTimeout,
 	}
+	if cfg != nil {
+		e.shutdownTimeout.Store(int64(cfg.Server.ResolveShutdownTimeout()))
+	}
 	return e
 }
 
@@ -210,6 +222,16 @@ func warnInsecureBackendTLS(backends []config.Backend) {
 			logging.Warn("[HTTP] backend %s: backend_tls.insecure=true — certificate verification DISABLED", be.Name)
 		}
 	}
+}
+
+// ShutdownTimeout returns how long a stop lets the HTTP requests in flight
+// finish before it closes what is left: server.shutdown_timeout of the
+// config in use (a reload's included).
+func (e *Engine) ShutdownTimeout() time.Duration {
+	if d := time.Duration(e.shutdownTimeout.Load()); d > 0 {
+		return d
+	}
+	return config.DefaultShutdownTimeout
 }
 
 func (e *Engine) Start(ctx context.Context) error {
@@ -296,6 +318,10 @@ func (e *Engine) Start(ctx context.Context) error {
 		logging.Info("Metrics endpoint started on %s%s", e.metricsServer.Addr, metricsPath)
 	}
 
+	// server.http3: the limits of the HTTP/3 connections, before the first
+	// of them can open. A reload gives them again (Reload).
+	httpproxy.SetHTTP3Limits(e.Config.Server.HTTP3.Resolve())
+
 	// 1d. Start HTTP/HTTPS listeners (L7), grouped by bind address.
 	//
 	// Multiple listeners may share a bind: address (nginx-style multi-server-
@@ -368,6 +394,13 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 	for _, tl := range e.tcpListeners {
 		l := tl.l
+		if l4FastEnabled() {
+			if err := e.startL4Fast(tl.ln, l, handler); err != nil {
+				e.closeTCPListeners()
+				return err
+			}
+			continue
+		}
 		e.startAcceptLoop(tl.ln, l.Name, func(c net.Conn) { handler.serveTCP(c, l) })
 	}
 	if len(e.tcpListeners) > 0 {
@@ -385,6 +418,107 @@ func (e *Engine) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if udpFastEnabled() {
+		// On the event loops (udpfast_linux.go).
+		if err := e.startUDPFast(plan, handler); err != nil {
+			return fmt.Errorf("UDP Engine start failed: %v", err)
+		}
+	} else if err := e.startUDPNbio(plan, handler); err != nil {
+		return err
+	}
+
+	// 5. Every socket is bound: report ready, then wait for the context.
+	// Reloads may run from here on. A dynamic denylist add also ends what
+	// the blocked client has open (denyclose.go).
+	startupLocked = false
+	e.reloadMu.Unlock()
+	stopDenyClose := denylist.Default.OnAdd(e.closeDenylisted)
+	defer stopDenyClose()
+	close(e.ready)
+	<-ctx.Done()
+
+	logging.Info("Stopping Engines...")
+
+	// Snapshot the bind groups under reloadMu: a reload in flight may still be
+	// adding or removing one.
+	e.reloadMu.Lock()
+	stopGroups := append([]*httpproxy.BindGroup(nil), e.BindGroups...)
+	e.reloadMu.Unlock()
+
+	// Stop admin API
+	if e.AdminServer != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		e.AdminServer.Stop(shutdownCtx)
+		cancel()
+	}
+	// Stop metrics server
+	if e.metricsServer != nil {
+		e.metricsServer.Close()
+	}
+
+	// Stop HTTP bind groups (each owns the socket; HTTPServers are sites
+	// within them and have nothing to shut down on their own). A group
+	// stops accepting, lets its requests in flight finish and closes what
+	// is left when the limit (server.shutdown_timeout) is reached. All of
+	// them at the same time, under that one limit: one after the other, a
+	// group would go on accepting while the one before it waits for its
+	// requests, and the limits would add up.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), e.ShutdownTimeout())
+	var stopping sync.WaitGroup
+	for _, bg := range stopGroups {
+		stopping.Go(func() { bg.Stop(shutdownCtx) })
+	}
+	stopping.Wait()
+	cancel()
+
+	// Stop accepting new L4 TCP/TLS connections, wait for the accept loops to
+	// exit (no further ActiveConns.Add), then close the live L4 TCP sessions —
+	// the restart behaviour the nbio TCP engine's Stop() had.
+	e.closeTCPListeners()
+	e.acceptWG.Wait()
+	e.closeL4Conns()
+
+	// Stop the nbio UDP engine
+	if e.UDPEngine != nil {
+		e.UDPEngine.Stop()
+	}
+	if e.UDPIfaceEngine != nil {
+		e.UDPIfaceEngine.Stop()
+	}
+	if e.udpFast != nil {
+		e.udpFast.stop()
+	}
+
+	// Drain active L4 connections
+	drainTimeout := e.DrainTimeout
+	if drainTimeout == 0 {
+		drainTimeout = 30 * time.Second
+	}
+	drainDone := make(chan struct{})
+	go func() {
+		e.ActiveConns.Wait()
+		close(drainDone)
+	}()
+	select {
+	case <-drainDone:
+		logging.Info("All connections drained")
+	case <-time.After(drainTimeout):
+		logging.Warn("Drain timeout reached (%v), forcing shutdown", drainTimeout)
+	}
+
+	if e.UDPPool != nil {
+		e.UDPPool.Stop()
+	}
+	for _, r := range e.DNSResolvers {
+		r.Stop()
+	}
+
+	return nil
+}
+
+// startUDPNbio serves the udp listeners with nbio: where event loops are not
+// supported, and in tests that compare the two engines.
+func (e *Engine) startUDPNbio(plan *udpInterfacePlan, handler *ProxyEventHandler) error {
 	var udpAddrs []string
 	for _, a := range e.getAddrs("udp") {
 		if !plan.onDevice[a] {
@@ -425,83 +559,6 @@ func (e *Engine) Start(ctx context.Context) error {
 		}
 		logging.Info("UDP accept_proxy_interfaces sockets started on %v", plan.deviceAddrs)
 	}
-
-	// 5. Every socket is bound: report ready, then wait for the context.
-	// Reloads may run from here on. A dynamic denylist add also ends what
-	// the blocked client has open (denyclose.go).
-	startupLocked = false
-	e.reloadMu.Unlock()
-	stopDenyClose := denylist.Default.OnAdd(e.closeDenylisted)
-	defer stopDenyClose()
-	close(e.ready)
-	<-ctx.Done()
-
-	logging.Info("Stopping Engines...")
-
-	// Snapshot the bind groups under reloadMu: a reload in flight may still be
-	// adding or removing one.
-	e.reloadMu.Lock()
-	stopGroups := append([]*httpproxy.BindGroup(nil), e.BindGroups...)
-	e.reloadMu.Unlock()
-
-	// Stop admin API
-	if e.AdminServer != nil {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		e.AdminServer.Stop(shutdownCtx)
-		cancel()
-	}
-	// Stop metrics server
-	if e.metricsServer != nil {
-		e.metricsServer.Close()
-	}
-
-	// Stop HTTP bind groups (each owns the socket; HTTPServers are sites
-	// within them and have nothing to shut down on their own).
-	for _, bg := range stopGroups {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		bg.Stop(shutdownCtx)
-		cancel()
-	}
-
-	// Stop accepting new L4 TCP/TLS connections, wait for the accept loops to
-	// exit (no further ActiveConns.Add), then close the live L4 TCP sessions —
-	// the restart behaviour the nbio TCP engine's Stop() had.
-	e.closeTCPListeners()
-	e.acceptWG.Wait()
-	e.closeL4Conns()
-
-	// Stop the nbio UDP engine
-	if e.UDPEngine != nil {
-		e.UDPEngine.Stop()
-	}
-	if e.UDPIfaceEngine != nil {
-		e.UDPIfaceEngine.Stop()
-	}
-
-	// Drain active L4 connections
-	drainTimeout := e.DrainTimeout
-	if drainTimeout == 0 {
-		drainTimeout = 30 * time.Second
-	}
-	drainDone := make(chan struct{})
-	go func() {
-		e.ActiveConns.Wait()
-		close(drainDone)
-	}()
-	select {
-	case <-drainDone:
-		logging.Info("All connections drained")
-	case <-time.After(drainTimeout):
-		logging.Warn("Drain timeout reached (%v), forcing shutdown", drainTimeout)
-	}
-
-	if e.UDPPool != nil {
-		e.UDPPool.Stop()
-	}
-	for _, r := range e.DNSResolvers {
-		r.Stop()
-	}
-
 	return nil
 }
 
@@ -585,14 +642,14 @@ func (e *Engine) Reload(cfg *config.Config) error {
 			logging.Warn("[RELOAD] listener %s: accept_proxy_from or accept_proxy_interfaces changed; restart nvelox to apply that (until then it keeps its current PROXY trust and keys)", l.Name)
 			continue
 		}
-		var keys [][]byte
-		if k := l.proxyTrust.keys.Load(); k != nil {
-			keys = *k
-		}
-		running.proxyTrust.setKeys(keys)
+		running.proxyTrust.setKeys(l.proxyTrust.shared().Keys())
 	}
 	warnInsecureBackendTLS(cfg.Backends)
 	e.Config = cfg
+	e.shutdownTimeout.Store(int64(cfg.Server.ResolveShutdownTimeout()))
+	// server.http3: the totals from now on, the rest for the HTTP/3
+	// connections opened from now on.
+	httpproxy.SetHTTP3Limits(cfg.Server.HTTP3.Resolve())
 	beAdded, beRemoved, beUpdated := e.reconcileBackends(cfg)
 	e.publishBackends()
 	sitesSwapped, bgAdded, bgRemoved := e.reloadL7Sites(expanded)
@@ -835,16 +892,18 @@ func ExpandListeners(listeners []config.Listener) ([]*ListenerConfig, error) {
 				return nil, fmt.Errorf("listener %s: invalid port range %q", l.Name, portStr)
 			}
 			for p := start; p <= end; p++ {
-				expanded = append(expanded,
-					mk(fmt.Sprintf("%s-%d", l.Name, p),
-						fmt.Sprintf("%s:%d", host, p), p))
+				lc := mk(fmt.Sprintf("%s-%d", l.Name, p), fmt.Sprintf("%s:%d", host, p), p)
+				lc.rangeSize, lc.rangeIndex = end-start+1, p-start
+				expanded = append(expanded, lc)
 			}
 		} else {
 			p, err := strconv.Atoi(portStr)
 			if err != nil {
 				return nil, fmt.Errorf("listener %s: invalid port %q: %v", l.Name, portStr, err)
 			}
-			expanded = append(expanded, mk(l.Name, l.Bind, p))
+			lc := mk(l.Name, l.Bind, p)
+			lc.rangeSize = 1
+			expanded = append(expanded, lc)
 		}
 	}
 	return expanded, nil
@@ -863,6 +922,7 @@ func (e *Engine) buildL7Site(l *ListenerConfig) *httpproxy.HTTPServer {
 		rl = limiter
 	}
 	httpL := &httpproxy.ListenerConfig{
+		ProxyTrust:     l.proxyTrust.shared(),
 		Name:           l.Name,
 		Addr:           l.Addr,
 		Protocol:       l.Protocol,
@@ -1090,6 +1150,9 @@ func (e *Engine) getAddrs(proto string) []string {
 // closeTCPListeners closes the plain L4 TCP and TLS listeners (idempotent:
 // a second Close just returns an error) so their accept loops exit.
 func (e *Engine) closeTCPListeners() {
+	for _, f := range e.l4Fast {
+		f.stop()
+	}
 	for _, tl := range e.tcpListeners {
 		tl.ln.Close()
 	}
@@ -1153,41 +1216,25 @@ func (e *Engine) startTLSListener(l *ListenerConfig, handler *ProxyEventHandler)
 		return fmt.Errorf("failed to listen on %s: %v", l.Addr, err)
 	}
 
-	// Trusted inbound PROXY-v2 acceptance: when accept_proxy_from is set, the
-	// RAW TCP listener is wrapped, so the PROXY header a trusted peer sends is
-	// read off the stream BEFORE the TLS handshake (as on the plain TCP path)
-	// and conn.RemoteAddr() becomes the real client. Untrusted peers have any
-	// header IGNORED (no spoofing); non-PROXY clients start the handshake at
-	// once (a ClientHello can never look like a PROXY signature).
-	var inner net.Listener = raw
+	// Trusted inbound PROXY v2 (accept_proxy_from): a trusted relay's
+	// connection starts with its header, read off the raw stream BEFORE the
+	// TLS handshake (handleTLSConn), as on the plain TCP path. Every other
+	// peer's bytes go to the handshake as they are: a header from them is
+	// not looked at (and a ClientHello never looks like one).
 	if l.proxyTrust.enabled() {
-		pol, perr := l.proxyTrust.policy()
-		if perr != nil {
-			raw.Close()
-			return fmt.Errorf("TLS listener %s accept_proxy_from: %v", l.Name, perr)
-		}
-		inner = &proxyproto.Listener{
-			Listener:          raw,
-			Policy:            pol,
-			ReadHeaderTimeout: tlsProxyHeaderTimeout,
-			// With accept_proxy_key_file a trusted peer's header must be
-			// signed; the library drops the connection otherwise.
-			ValidateHeader: func(h *proxyproto.Header) error { return l.proxyTrust.verify(h, nil, false) },
-		}
 		logging.Info("TLS listener %s accepts inbound PROXY-v2 from %v", l.Name, l.AcceptProxyFrom)
 	}
-	listener := tls.NewListener(inner, tlsConfig)
 
-	e.tlsListeners = append(e.tlsListeners, listener)
+	e.tlsListeners = append(e.tlsListeners, raw)
 	logging.Info("TLS listener %s started on %s", l.Name, l.Addr)
 
-	e.startAcceptLoop(listener, l.Name, func(c net.Conn) { e.handleTLSConn(c, l, handler) })
+	e.startAcceptLoop(raw, l.Name, func(c net.Conn) { e.handleTLSConn(c, tlsConfig, l, handler) })
 
 	return nil
 }
 
 // tlsProxyHeaderTimeout bounds how long a TLS-terminating listener waits for
-// an inbound PROXY-v2 header (and, for any peer, for the first byte).
+// a trusted relay's PROXY v2 header.
 const tlsProxyHeaderTimeout = 10 * time.Second
 
 // l4TLSHandshakeTimeout bounds the TLS handshake on a TLS-terminating L4
@@ -1195,12 +1242,13 @@ const tlsProxyHeaderTimeout = 10 * time.Second
 // before the backend is dialed, so an unauthenticated client never reaches it.
 const l4TLSHandshakeTimeout = 10 * time.Second
 
-func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *ProxyEventHandler) {
-	defer clientConn.Close()
+// handleTLSConn serves one connection of a TLS-terminating TCP listener:
+// rawConn is the accepted socket (the key of its l4Conns entry).
+func (e *Engine) handleTLSConn(rawConn net.Conn, tlsConfig *tls.Config, l *ListenerConfig, handler *ProxyEventHandler) {
+	defer rawConn.Close()
 
-	// The raw TCP peer (a trusted relay or the client itself) and the port it
-	// dialed; reading them from the transport does not touch the PROXY header.
-	rawConn := transportOf(clientConn)
+	// The TCP peer (a trusted relay or the client itself) and the port it
+	// dialed.
 	peer := rawConn.RemoteAddr()
 	dstPort := portOf(rawConn.LocalAddr())
 	peerTrusted := l.proxyTrust.trusts(peer)
@@ -1216,19 +1264,25 @@ func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *
 		}
 	}
 
-	// The resolved client: the PROXY-v2 source when a trusted relay sent a
-	// header, else the peer itself (proxyproto reads the header here, bounded
-	// by tlsProxyHeaderTimeout).
-	client := clientConn.RemoteAddr()
+	// The resolved client: the peer itself, or for a trusted relay the
+	// client its PROXY v2 header names (the relay for a LOCAL header). The
+	// header is required and read here, before the handshake, bounded by
+	// tlsProxyHeaderTimeout: a relay's connection without a valid one is
+	// closed, with no access record (it named no client, and the record
+	// would blame the relay, see serveTCP).
+	client := peer
+	if peerTrusted {
+		named, reason, cause := l.proxyTrust.relayClient(rawConn, tlsProxyHeaderTimeout)
+		if reason != "" {
+			e.proxyRefused(l, peer, reason, cause)
+			return
+		}
+		client = named
+	}
 	start := time.Now()
 	status := "no_route"
 	defer func() {
-		// One L4 access record per connection, as on the plain TCP path. Not
-		// for a trusted relay whose header never named a client: the record
-		// would blame the relay (see serveTCP).
-		if peerTrusted && client.String() == peer.String() {
-			return
-		}
+		// One L4 access record per connection, as on the plain TCP path.
 		durMs := float64(time.Since(start).Nanoseconds()) / 1e6
 		logging.AccessL4(ipStrOf(client), l.Protocol, dstPort, status, 0, 0, durMs)
 	}()
@@ -1237,23 +1291,24 @@ func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *
 	// client, before the handshake: a refused client costs no crypto. The
 	// client is recorded first, so a block added after the check still finds
 	// the connection (closeDenylisted).
-	e.setL4Client(clientConn, ipOf(client))
+	e.setL4Client(rawConn, ipOf(client))
 	if ok, st := handler.l4Admit(l, ipOf(client)); !ok {
 		status = st
 		return
 	}
 
-	logging.Info("[CONN] New tls client %s -> %s", client, clientConn.LocalAddr())
+	logging.Info("[CONN] New tls client %s -> %s", client, rawConn.LocalAddr())
 
 	// Complete the handshake (and the client-certificate check) before any
 	// backend is dialed.
-	if tc, ok := clientConn.(*tls.Conn); ok {
+	clientConn := tls.Server(rawConn, tlsConfig)
+	{
 		ctx := e.runCtx
 		if ctx == nil {
 			ctx = context.Background()
 		}
 		hctx, cancel := context.WithTimeout(ctx, l4TLSHandshakeTimeout)
-		err := tc.HandshakeContext(hctx)
+		err := clientConn.HandshakeContext(hctx)
 		cancel()
 		if err != nil {
 			logging.Debug("[CONN] TLS handshake with %s failed: %v", client, err)
@@ -1318,9 +1373,11 @@ func (e *Engine) handleTLSConn(clientConn net.Conn, l *ListenerConfig, handler *
 	balancer.OnConnect(originalTarget)
 	defer balancer.OnDisconnect(originalTarget)
 
-	// Send PROXY v2 if configured
+	// PROXY v2 to the backend. Its destination is the address the client
+	// (or its relay) connected to, as on the plain TCP path: that is what
+	// tells a backend which listener port a connection came in on.
 	if backend != nil && backend.SendProxyV2 {
-		header := proxyproto.HeaderProxyFromAddrs(2, client, backendConn.LocalAddr())
+		header := proxyproto.HeaderProxyFromAddrs(2, client, rawConn.LocalAddr())
 		if len(backend.SendProxyKey) > 0 {
 			if err := proxy.SignHeader(header, backend.SendProxyKey, time.Now()); err != nil {
 				logging.Error("Failed to sign PROXY v2 header on TLS conn: %v", err)

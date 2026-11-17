@@ -122,7 +122,9 @@ func TestL4Gates_TLS(t *testing.T) {
 	}
 }
 
-func TestL4Gates_UDP(t *testing.T) {
+func TestL4Gates_UDP(t *testing.T) { stUDPEngines(t, udpTestL4Gates_UDP) }
+
+func udpTestL4Gates_UDP(t *testing.T) {
 	for _, c := range stGateCases {
 		t.Run(c.name, func(t *testing.T) {
 			be, got := stUDPBackend(t, stEchoReply)
@@ -152,7 +154,7 @@ func TestL4Gates_UDP(t *testing.T) {
 
 // Behind a trusted relay (accept_proxy_from) the policy applies to the client
 // the PROXY v2 header names — not to the relay, whose own address is
-// infrastructure — and a relay that sends no header is itself the client.
+// infrastructure — and a relay's connection without a header is refused.
 func TestL4Gates_TrustedRelayTCP(t *testing.T) {
 	echo, accepted := stTCPEchoBackend(t)
 	addr := stFreeTCPAddr(t)
@@ -194,14 +196,17 @@ func TestL4Gates_TrustedRelayTCP(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	t.Run("relay without header is the client", func(t *testing.T) {
-		stBlock(t, "127.0.0.1")
+	t.Run("relay without header is refused", func(t *testing.T) {
+		before := accepted.Load()
 		conn, err := net.Dial("tcp", addr)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer conn.Close()
 		stRefused(t, conn, "hello")
+		if n := accepted.Load(); n != before {
+			t.Fatalf("a relay's connection without a header reached the backend (%d connections)", n-before)
+		}
 	})
 }
 
@@ -249,7 +254,9 @@ func TestL4Gates_TrustedRelayTLS(t *testing.T) {
 	}
 }
 
-func TestL4Gates_TrustedRelayUDP(t *testing.T) {
+func TestL4Gates_TrustedRelayUDP(t *testing.T) { stUDPEngines(t, udpTestL4Gates_TrustedRelayUDP) }
+
+func udpTestL4Gates_TrustedRelayUDP(t *testing.T) {
 	be, got := stUDPBackend(t, stEchoReply)
 	addr := stFreeUDPAddr(t)
 	stStart(t, &config.Config{
@@ -343,7 +350,9 @@ func TestL4MaxConnections_TCP(t *testing.T) {
 	}
 }
 
-func TestL4MaxConnections_UDP(t *testing.T) {
+func TestL4MaxConnections_UDP(t *testing.T) { stUDPEngines(t, udpTestL4MaxConnections_UDP) }
+
+func udpTestL4MaxConnections_UDP(t *testing.T) {
 	sink, got := stUDPBackend(t, nil) // never answers: sessions end after the no-reply TTL
 	addr := stFreeUDPAddr(t)
 	e := stStart(t, &config.Config{

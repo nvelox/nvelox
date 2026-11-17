@@ -5,16 +5,30 @@ package core
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
-	"github.com/lesismal/nbio"
-
 	"nvelox/config"
 )
+
+// needsInterfaceBinding skips a test where a socket may not be bound to an
+// interface: before Linux 5.7 that takes CAP_NET_RAW, which a test run by
+// an ordinary user (in a container, say) does not have.
+func needsInterfaceBinding(t *testing.T) {
+	t.Helper()
+	c, err := listenUDPSocket("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}, "lo")
+	if errors.Is(err, syscall.EPERM) {
+		t.Skipf("a socket may not be bound to an interface here: %v", err)
+	}
+	if err == nil {
+		c.Close()
+	}
+}
 
 // firstNonLoopbackIPv4 returns an interface other than loopback that carries
 // an IPv4 address, for the negative case.
@@ -47,6 +61,11 @@ func firstNonLoopbackIPv4(t *testing.T) (string, net.IP) {
 // kernel files a host's own traffic to a local address under the interface
 // that carries the address.)
 func TestUDPInterfaces_TrustOnlyWhereListed(t *testing.T) {
+	stUDPEngines(t, udpTestUDPInterfaces_TrustOnlyWhereListed)
+}
+
+func udpTestUDPInterfaces_TrustOnlyWhereListed(t *testing.T) {
+	needsInterfaceBinding(t)
 	be, got := stUDPBackend(t, nil)
 	port := strings.TrimPrefix(stFreeUDPAddr(t), "127.0.0.1")
 	ifName, _ := firstNonLoopbackIPv4(t)
@@ -76,7 +95,9 @@ func TestUDPInterfaces_TrustOnlyWhereListed(t *testing.T) {
 	}
 }
 
-func TestUDPInterfaces_StartErrors(t *testing.T) {
+func TestUDPInterfaces_StartErrors(t *testing.T) { stUDPEngines(t, udpTestUDPInterfaces_StartErrors) }
+
+func udpTestUDPInterfaces_StartErrors(t *testing.T) {
 	ifName, _ := firstNonLoopbackIPv4(t)
 	for name, l := range map[string]config.Listener{
 		"unknown interface": {Name: "u", Bind: stFreeUDPAddr(t), Protocol: "udp", Backend: "be",
@@ -152,6 +173,11 @@ func recordingUDPBackend(t *testing.T) (string, func() []udpRec) {
 // it. (Here lo is listed; the same source sends once to 127.0.0.1, filed
 // under lo, and once to another address of this host.)
 func TestUDPInterfaces_SessionsKeepTheirOwnBackendSockets(t *testing.T) {
+	stUDPEngines(t, udpTestUDPInterfaces_SessionsKeepTheirOwnBackendSockets)
+}
+
+func udpTestUDPInterfaces_SessionsKeepTheirOwnBackendSockets(t *testing.T) {
+	needsInterfaceBinding(t)
 	_, otherIP := firstNonLoopbackIPv4(t)
 	be, recs := recordingUDPBackend(t)
 	_, port, _ := net.SplitHostPort(stFreeUDPAddr(t))
@@ -160,7 +186,6 @@ func TestUDPInterfaces_SessionsKeepTheirOwnBackendSockets(t *testing.T) {
 			AcceptProxyFrom: []string{"127.0.0.0/8"}, AcceptProxyInterfaces: []string{"lo"}}},
 		Backends: []config.Backend{{Name: "be", Servers: []string{be}}},
 	}, nil)
-	h := stHandler(e)
 	src, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
@@ -190,12 +215,16 @@ func TestUDPInterfaces_SessionsKeepTheirOwnBackendSockets(t *testing.T) {
 	}
 
 	// End the ordinary session; the trusted flow keeps its backend socket.
-	h.sessions.Range(func(k, v any) bool {
-		if ctx := v.(*ConnContext); !ctx.IsBackend && !ctx.PeerTrusted {
-			k.(*nbio.Conn).Close()
+	ended := 0
+	for _, s := range stUDPSessions(e) {
+		if !s.PeerTrusted {
+			s.Close()
+			ended++
 		}
-		return true
-	})
+	}
+	if ended != 1 {
+		t.Fatalf("%d ordinary sessions to end, want 1", ended)
+	}
 	time.Sleep(200 * time.Millisecond)
 	src.WriteToUDP(stUDPDatagramWithProxy(t, "198.51.100.80:4000", viaLo.String(), []byte("relayed-2")), viaLo)
 	if got := from("relayed-2"); got != trustedSock {

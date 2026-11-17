@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"nvelox/config"
 	"nvelox/core"
@@ -24,9 +25,23 @@ var (
 	Version = "dev"
 )
 
+// shutdownMargin is what the wait for the engine to stop, after SIGINT or
+// SIGTERM, allows beyond server.shutdown_timeout (the time the HTTP
+// requests in flight get). The engine's other limits come to less (5 s for
+// the admin API, 30 s for the L4 handlers to return): past the margin a
+// stop that hangs still ends the process.
+const shutdownMargin = 50 * time.Second
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// The first SIGINT or SIGTERM starts the shutdown, which lets the
+	// requests in flight finish. From then on the two signals have their
+	// usual effect again: a second one ends the process at once.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 
 	// SIGHUP: reopen the log files and reload the config.
 	// SIGUSR1: reopen the log files (logrotate postrotate).
@@ -79,6 +94,10 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 	if err != nil {
 		return fmt.Errorf("listener expansion: %w", err)
 	}
+
+	// Slots for the scheduler beside the event loops' own, before anything
+	// is served.
+	core.SpareSchedulerSlots()
 
 	engine := core.NewEngine(cfg)
 	engine.Listeners = expandedListeners
@@ -159,6 +178,19 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 	select {
 	case <-ctx.Done():
 		log.Println("Shutting down...")
+		// The engine stops on the same context: it accepts nothing new, lets
+		// the requests in flight finish within its limits, closes the rest
+		// and returns. Returning before it has would end the process, and
+		// with it every request still being answered.
+		limit := engine.ShutdownTimeout() + shutdownMargin
+		select {
+		case err := <-errCh:
+			if err != nil && err != context.Canceled {
+				return fmt.Errorf("engine stopped: %v", err)
+			}
+		case <-time.After(limit):
+			logging.Error("Shutdown did not finish within %v: exiting", limit)
+		}
 		return nil
 	case err := <-errCh:
 		if err == context.Canceled {

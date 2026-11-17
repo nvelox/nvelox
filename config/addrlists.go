@@ -39,6 +39,45 @@ func validateAddrLists(listeners []Listener) error {
 	return nil
 }
 
+// addrNet parses one entry as acl.ParseCIDR does: a CIDR, or an address as
+// a /32 or /128; nil if it is neither.
+func addrNet(s string) *net.IPNet {
+	s = strings.TrimSpace(s)
+	if _, n, err := net.ParseCIDR(s); err == nil {
+		return n
+	}
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return nil
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return &net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)}
+	}
+	return &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
+}
+
+// firstOverlap returns the first entry of a and entry of b whose ranges
+// share an address (two CIDR ranges do when one holds the other's first
+// address).
+func firstOverlap(a, b []string) (string, string, bool) {
+	for _, x := range a {
+		xn := addrNet(x)
+		if xn == nil {
+			continue
+		}
+		for _, y := range b {
+			yn := addrNet(y)
+			if yn == nil {
+				continue
+			}
+			if xn.Contains(yn.IP) || yn.Contains(xn.IP) {
+				return strings.TrimSpace(x), strings.TrimSpace(y), true
+			}
+		}
+	}
+	return "", "", false
+}
+
 // isAddrOrCIDR reports whether s (surrounding spaces ignored) is an IP
 // address or a CIDR — the forms acl.ParseCIDR accepts.
 func isAddrOrCIDR(s string) bool {

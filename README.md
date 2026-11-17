@@ -7,13 +7,14 @@
 
 ![logo](image.png)
 
-**High-Performance L4/L7 Load Balancer, Reverse Proxy & Web Server (Go + nbio)**
+**High-Performance L4/L7 Load Balancer, Reverse Proxy & Web Server**
 
 Nvelox is a lightweight, high-performance load balancer and reverse proxy written in Go. It handles TCP/UDP (L4) and HTTP/HTTPS (L7) traffic with features comparable to nginx and HAProxy — in a single static binary with simple YAML configuration.
 
 ## Why Nvelox?
 
 * **L4 + L7 in one binary** — TCP/UDP proxy, HTTP reverse proxy, static file server, FastCGI (PHP-FPM)
+* **Event-loop engine** — on Linux, HTTP/1.1, HTTP/2, HTTP/3, TCP and UDP traffic run on one epoll loop per core, with a zero-allocation HTTP parser and nvelox's own QUIC transport ([benchmark](docs/PERFORMANCE.md))
 * **Massive Scale** — Bind 10,000+ ports with a single config line (port ranges)
 * **HTTP/1.1 + HTTP/2 + HTTP/3** — Full protocol support including QUIC
 * **nginx-compatible features** — try_files, expires, FastCGI, regex routes, URL rewrite
@@ -22,10 +23,10 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 ## Features
 
 ### Core Proxy
-- **L4 TCP/UDP Proxy** — TCP relay with standard half-close semantics (back-pressured; when either side closes first, everything already read is delivered before the FIN is passed on), UDP via the nbio event loop with bounded sessions (at most 16,384, and 512 per client IP; a session its backend never answers ends after 10 s)
-- **L7 HTTP Reverse Proxy** — `httputil.ReverseProxy` with shared connection pool
+- **L4 TCP/UDP Proxy** — TCP relay (on the event loops on Linux) with standard half-close semantics (back-pressured; when either side closes first, everything already read is delivered before the FIN is passed on), UDP on the event loops on Linux (one socket per loop on a port, datagrams read and replies sent in batches) with bounded sessions (at most 16,384, and 512 per client IP; a session its backend never answers ends after 10 s)
+- **L7 HTTP Reverse Proxy** — HTTP/1.1 and HTTP/2 run on the event loops on Linux (strict zero-allocation parser, per-loop keep-alive pools to the backends, one write per loop pass for all of a connection's HTTP/2 streams); WebSocket, static files, FastCGI, caching and compression run on Go's `net/http` (proxying through `httputil.ReverseProxy`). Both apply the same routing, access rules, headers and access-log format
 - **HTTP/1.1 + HTTP/2** — automatic HTTP/2 via ALPN on HTTPS listeners
-- **HTTP/3 (QUIC)** — via quic-go with Alt-Svc header advertisement
+- **HTTP/3 (QUIC)** — on Linux served by the event loops on nvelox's own QUIC transport (CUBIC with pacing, path MTU discovery, clients that change address or network, Retry under load); via quic-go on other platforms. Alt-Svc header advertisement. 0-RTT is off: the first request of a resumed connection waits for the handshake, so a captured request cannot be replayed as early data. A request header section above 64 KiB is answered 431 (HTTP/1.1 and HTTP/2 keep their 1 MiB limit), and one that is not complete within the header timeout is answered 408
 - **WebSocket Proxying** — transparent upgrade detection and bidirectional relay
 - **Port Ranges** — bind `:10000-20000` with 1:1 port mapping for gaming/VoIP
 
@@ -61,7 +62,7 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 - **Per-IP Rate Limiting** — token bucket per client IP with LRU cleanup
 - **Per-Listener Rate Limiting** — global connection rate limit
 - **Request Body Size Limit** — reject oversized request bodies
-- **SSL to Backend** — TLS when connecting to upstream servers from HTTP/HTTPS listeners (mTLS supported); a broken `backend_tls` config fails startup / the reload, never falls back to plaintext
+- **SSL to Backend** — TLS when connecting to upstream servers from HTTP/HTTPS listeners (mTLS supported; `server_name` sets the name sent and checked on the certificate); a broken `backend_tls` config fails startup / the reload, never falls back to plaintext
 
 ### Resilience
 - **Active Health Checks** — TCP connect or HTTP GET with configurable interval/timeout
@@ -69,7 +70,7 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 - **Retries / Failover** — retry on connect failure, 502, 503; skip failed servers
 - **Circuit Breaker** — closed/open/half-open state machine per backend
 - **Configurable Timeouts** — per listener: `read_header`, `idle`, and `read` / `write`, which limit how long a client may stall, not how long a transfer may take (a quiet event stream, or a long upload or download that keeps moving, is never cut); applied per request after Host-based routing, so sites sharing a bind port can differ. Per backend: `connect`, `response_header` (time to start answering, else 504) and `read` (longest silence once answering)
-- **Graceful Drain** — finish in-flight connections on shutdown with configurable deadline
+- **Graceful Shutdown** — on `SIGINT` or `SIGTERM` nvelox accepts nothing new and answers the HTTP requests in flight (HTTP/1.1, HTTP/2 and HTTP/3) before it exits; `server.shutdown_timeout` sets how long it waits for them (default 10 s)
 
 ### Response Processing
 - **Header Manipulation** — add/set/remove on request and response (per-listener and per-route)
@@ -86,7 +87,7 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 - **Hot Reload** — SIGHUP reloads the whole config without dropping in-flight connections: backends (with sticky / CB / LeastConn state preserved on rename), per-listener routes / ACL / headers / error pages, TLS certs (Let's Encrypt rotation), and bind addresses (added or removed with 10s graceful drain). Pre-flight port-availability check ensures all-or-nothing apply. Open WebSocket tunnels are checked against the new rules: a tunnel the new config would refuse (IP lists, ACL, route, backend server) is closed, the others keep running.
 
 ### Extensibility
-- **PROXY Protocol v2** — pass client IP to backends in HAProxy format; accept it from trusted relays (`accept_proxy_from`)
+- **PROXY Protocol v2** — pass client IP to TCP, UDP and HTTP backends in HAProxy format (`send_proxy_v2`; for HTTP, every backend connection serves one client connection); accept it from trusted relays (`accept_proxy_from`) on TCP, UDP, HTTP and HTTPS listeners (HTTP/1.1, HTTP/2 and HTTP/3); a listed relay must send it, and is never taken for the client of what it relays
 - **DNS Service Discovery** — periodic hostname resolution with auto-update
 - **Modular Config** — split configs via `include` glob patterns
 - **Config Validation** — comprehensive validation at load time; keys that are parsed but not implemented (`sni_routes`, `throttle`, `tls.ocsp_stapling`, `routes[].scripts`) are rejected with an error naming the key, and `server.pid_file` / `workers` print a startup warning. Started as root with `server.user` / `group`, nvelox binds its ports and then switches to that user
@@ -98,9 +99,12 @@ graph TD
     Client -->|TCP/UDP/HTTP| Listeners
     subgraph Nvelox
         Listeners -->|IP Filter| ACL{ACL + Rate Limit}
-        ACL -->|L4 TCP| L4Relay[TCP relay, half-close]
-        ACL -->|L4 UDP| NBIOEngine[nbio UDP Event Loop]
+        ACL -->|L4 TCP| L4Relay[TCP relay on the event loops, half-close]
+        ACL -->|L4 UDP| NBIOEngine[UDP sessions on the event loops]
+        ACL -->|HTTP/1.1, HTTP/2| FastPath[HTTP/1.1 and HTTP/2 on the event loops]
         ACL -->|L7| HTTPServer[net/http Server]
+        FastPath -->|hand-over: upgrades, static, cache...| HTTPServer
+        FastPath -->|per-loop keep-alive| BackendPool
         ACL -->|FastCGI| FCGIClient[FastCGI Client]
         HTTPServer -->|Route Match| Router
         Router -->|Static| FileServer[Static Files]
@@ -119,7 +123,7 @@ graph TD
 | Feature | Nvelox | HAProxy | Nginx |
 | :--- | :--- | :--- | :--- |
 | **L4 + L7** | Both | Both | Both |
-| **HTTP/3** | Yes (quic-go) | Yes (quictls) | Yes (quic) |
+| **HTTP/3** | Yes (own QUIC transport on Linux) | Yes (quictls) | Yes (quic) |
 | **FastCGI (PHP)** | Yes | No | Yes |
 | **Static Files** | Yes | No | Yes |
 | **try_files** | Yes | No | Yes |
@@ -133,8 +137,11 @@ graph TD
 ## Quick Start
 
 ```bash
-# Build
-go build -o nvelox main.go
+# Build. The event loops are the module github.com/nvelox/ngx, whose
+# repository is private: a build from source needs access to it. Without
+# that access, take a binary from https://github.com/nvelox/nvelox/releases
+# or the image ghcr.io/nvelox/nvelox.
+GOPRIVATE=github.com/nvelox/ngx go build -o nvelox main.go
 
 # Run with example config
 ./nvelox -config examples/01-basic-tcp-proxy.yaml
@@ -286,6 +293,26 @@ backends:
       - "10.0.1.1:8080"
 ```
 
+### HTTP/3 limits
+
+The limits of HTTP/3 connections are settings under `server.http3`, for every listener with `http3: true`. Each is a size (`64KB`, `16MB`, `2GB`); the values below are the defaults.
+
+```yaml
+server:
+  http3:
+    max_header_size: "64KB"                # largest request header section; 431 above it
+    max_send_buffer: "16MB"                # most one connection holds of answers not yet acknowledged
+    max_stream_receive_window: "6MB"       # how far the upload window of one request grows (from 1 MiB)
+    max_connection_receive_window: "15MB"  # the same for all requests of a connection together
+    # max_send_memory: "2GB"               # all connections together: what they hold to send
+    # max_receive_memory: "2GB"            # all connections together: upload windows beyond the first
+    socket_buffer: "4MB"                   # asked for each UDP socket (one per event loop), to receive and to send
+```
+
+The two totals default to an eighth of the memory nvelox may use (64 MiB at the least). A reload applies all seven: the totals at once, `socket_buffer` to bind addresses started after it, the others to connections opened after it. `nvelox.example.yaml` says what each one costs and gains.
+
+The kernel grants a socket buffer up to `net.core.rmem_max` and `net.core.wmem_max` (208 KiB each by default), and all of it to a process started with `CAP_NET_ADMIN`. With a small receive buffer a fast upload loses datagrams before nvelox reads them. A listener whose sockets got less than `socket_buffer` says so in a startup warning; raising the two kernel limits to the value of `socket_buffer` or more settles it.
+
 ## Admin API, Metrics and Log Files
 
 ### Admin API
@@ -316,7 +343,7 @@ The `/metrics` endpoint has no authentication. An empty `metrics.bind` means `12
 |--------|--------|
 | `SIGHUP` | Reopen the log files, then reload the config and TLS certificates |
 | `SIGUSR1` | Reopen the log files |
-| `SIGINT`, `SIGTERM` | Graceful shutdown |
+| `SIGINT`, `SIGTERM` | Graceful shutdown: no new connections, the HTTP requests in flight are answered (for up to `server.shutdown_timeout`, 10 s by default), L4 sessions are closed, then nvelox exits. A second signal ends it at once |
 
 Log files are created with mode `0640` (directories `0750`); an existing file is tightened to `0640` when nvelox opens it. After logrotate renames the files, signal nvelox so it writes to the new ones:
 
@@ -379,7 +406,7 @@ See [`examples/`](examples/) for 30 ready-to-run configs with test commands:
 ## Testing
 
 ```bash
-go test ./...                    # All tests (22 packages)
+go test ./...                    # All tests
 go test -race ./...              # Race detector
 go test -v ./integration/...     # Integration tests
 go test -coverprofile=c.out ./... && go tool cover -html=c.out  # Coverage
@@ -394,9 +421,13 @@ core/
   engine.go          — Engine orchestration, lifecycle
   handler.go         — L4 accept gating + UDP proxy (nbio)
   l4tcp.go           — L4 TCP accept loop + per-connection proxying
+  l4fast_linux.go    — L4 TCP relay on the event loops (Linux)
   relay.go           — L4 TCP relay (half-close semantics, idle timeout)
   httpproxy/
     server.go        — L7 HTTP reverse proxy
+    fastparse.go     — Strict zero-allocation HTTP/1.1 parser
+    fast_linux.go    — HTTP/1.1 on the event loops, hand-over to net/http
+    fasttls_linux.go — HTTPS (HTTP/1.1) on the event loops
     router.go        — Route matching (host/path/regex)
     static.go        — Static files, try_files, expires
     fastcgi.go       — FastCGI client (PHP-FPM)

@@ -53,7 +53,9 @@ func TestL4Denied(t *testing.T) {
 }
 
 // TestL4DeniedExpiry confirms an expired block no longer denies (TTL-aware).
-func TestL4DeniedExpiry(t *testing.T) {
+func TestL4DeniedExpiry(t *testing.T) { stUDPEngines(t, udpTestL4DeniedExpiry) }
+
+func udpTestL4DeniedExpiry(t *testing.T) {
 	h := &ProxyEventHandler{}
 	l := &ListenerConfig{Name: "l4", Protocol: "udp"}
 	if err := l.prepare(); err != nil {

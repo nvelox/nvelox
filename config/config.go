@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -90,6 +91,43 @@ type ServerConfig struct {
 	// gw=<id>, so a request can be attributed to the gateway that first
 	// received it. Empty (default) → os.Hostname() is used at startup.
 	GatewayID string `yaml:"gateway_id,omitempty"`
+	// ShutdownTimeout is how long a stop (SIGINT or SIGTERM) lets the HTTP
+	// requests in flight finish before what is left is closed: a duration
+	// greater than 0. Empty: DefaultShutdownTimeout. A reload applies it.
+	ShutdownTimeout string `yaml:"shutdown_timeout,omitempty"`
+	// HTTP3 holds the limits of HTTP/3 connections (http3.go).
+	HTTP3 HTTP3Config `yaml:"http3,omitempty"`
+}
+
+// DefaultShutdownTimeout is server.shutdown_timeout when it is not set.
+const DefaultShutdownTimeout = 10 * time.Second
+
+// ResolveShutdownTimeout returns server.shutdown_timeout, and
+// DefaultShutdownTimeout when it is not set (or, in a config that was not
+// loaded through Load, not a duration greater than 0).
+func (s ServerConfig) ResolveShutdownTimeout() time.Duration {
+	if d, err := time.ParseDuration(s.ShutdownTimeout); err == nil && d > 0 {
+		return d
+	}
+	return DefaultShutdownTimeout
+}
+
+// validateShutdownTimeout checks server.shutdown_timeout: unset, or a
+// duration greater than 0. Zero is refused rather than given a meaning:
+// elsewhere in this file "0" lifts a limit, and a stop without a limit
+// would wait for ever on a request that never ends.
+func validateShutdownTimeout(val string) error {
+	if val == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(val)
+	if err != nil {
+		return err
+	}
+	if d <= 0 {
+		return fmt.Errorf("must be greater than 0 (it is how long a stop waits for the requests in flight; a small value such as \"1s\" makes a stop quick)")
+	}
+	return nil
 }
 
 type LoggingConfig struct {
@@ -183,19 +221,29 @@ type Listener struct {
 	TrustedProxies []string `yaml:"trusted_proxies,omitempty"`
 
 	// AcceptProxyFrom: CIDRs whose INBOUND PROXY-protocol-v2 header is trusted
-	// and used as the real client address at L4 (tcp, https-passthrough and
-	// udp listeners). Peers OUTSIDE this list have any inbound PROXY header
-	// IGNORED and are the client themselves. Empty (default) = trust nobody.
-	// Distinct from trusted_proxies (L7 XFF/X-Real-IP trust). Used behind a
-	// relay (another nvelox, HAProxy, ...) that prepends a PROXY-v2 header
-	// with the real client. A TCP handshake proves the peer address; a UDP
-	// datagram's source can be forged, so a udp listener should also set
+	// and used as the real client address: on tcp and udp listeners, and on
+	// http and https listeners for HTTP/1.1 and HTTP/2. Peers OUTSIDE this
+	// list have any inbound PROXY header IGNORED and are the client
+	// themselves. Empty (default) = trust nobody. Used behind a relay
+	// (another nvelox, HAProxy, ...) that prepends a PROXY-v2 header with the
+	// real client. A listed peer must send it: a tcp, http or https
+	// connection from one that does not start with a valid header (LOCAL
+	// for the relay's own traffic) is closed, a udp datagram without one is
+	// dropped. A TCP handshake proves the peer address; a UDP datagram's
+	// source can be forged, so a udp listener should also set
 	// AcceptProxyKeyFile or AcceptProxyInterfaces (startup warning otherwise).
+	//
+	// On an http or https listener the header comes first on the connection
+	// (before TLS). The client it names is the peer for every IP-based control
+	// and for trusted_proxies, which is a different thing (whose
+	// X-Forwarded-For is believed) and is matched against that client, not
+	// the relay. Listeners that share a bind address must set the same
+	// accept_proxy_from and accept_proxy_key_file.
 	AcceptProxyFrom []string `yaml:"accept_proxy_from,omitempty"`
 	// AcceptProxyKeyFile: shared keys, one per line (at least 32 characters,
 	// "#" starts a comment), that a trusted peer's PROXY header must be signed
 	// with (proxy/signature.go; nvelox signs with send_proxy_key_file). A
-	// header without a valid signature is refused (TCP) or dropped (UDP).
+	// header without a valid signature is refused (TCP, HTTP) or dropped (UDP).
 	// Every key in the file is accepted, so keys can be rotated: add the new
 	// key here, then sign with it, then remove the old one.
 	AcceptProxyKeyFile string `yaml:"accept_proxy_key_file,omitempty"`
@@ -604,6 +652,9 @@ type BackendTLSConfig struct {
 	ClientCert string `yaml:"client_cert,omitempty"`
 	ClientKey  string `yaml:"client_key,omitempty"`
 	Insecure   bool   `yaml:"insecure,omitempty"` // skip certificate verification
+	// ServerName is the name sent to the backend (SNI) and checked on its
+	// certificate. Empty: the host of the server's address.
+	ServerName string `yaml:"server_name,omitempty"`
 }
 
 // RetryConfig defines retry behavior on backend failure.
@@ -776,6 +827,12 @@ func readProxyKeyFile(path string) ([][]byte, error) {
 func validate(cfg *Config) error {
 	if cfg.Version != "2" {
 		return fmt.Errorf("unsupported version: %s (expected '2')", cfg.Version)
+	}
+	if err := validateShutdownTimeout(cfg.Server.ShutdownTimeout); err != nil {
+		return fmt.Errorf("server.shutdown_timeout: %v", err)
+	}
+	if err := validateHTTP3(cfg.Server.HTTP3); err != nil {
+		return err
 	}
 
 	backendNames := make(map[string]bool)
@@ -991,6 +1048,13 @@ func validate(cfg *Config) error {
 		if l.HTTP3 && l.Protocol != "https" {
 			return fmt.Errorf("listener %s: http3 requires protocol 'https'", l.Name)
 		}
+		// HTTP/3 through relays needs signed headers. A UDP source address
+		// is forged with one packet: with accept_proxy_from alone, anyone
+		// who can send a datagram that claims a relay's address could name
+		// any client.
+		if l.HTTP3 && len(l.AcceptProxyFrom) > 0 && l.AcceptProxyKeyFile == "" {
+			return fmt.Errorf("listener %s: http3 with accept_proxy_from needs accept_proxy_key_file: a relay's datagrams are told from forged ones by their signature only", l.Name)
+		}
 
 		// Validate server_names format (early per-listener check; cross-
 		// listener uniqueness is checked in the bind-group pass below).
@@ -1167,6 +1231,11 @@ func StartupWarnings(cfg *Config) []string {
 		if l.Protocol == "udp" && len(l.AcceptProxyFrom) > 0 && l.AcceptProxyKeyFile == "" && len(l.AcceptProxyInterfaces) == 0 {
 			out = append(out, fmt.Sprintf("listener %s: accept_proxy_from on a udp listener trusts the source address alone, which a datagram can forge: set accept_proxy_key_file or accept_proxy_interfaces, or make sure the network drops packets that claim those addresses", l.Name))
 		}
+		if l.Protocol == "http" || l.Protocol == "https" {
+			if tp, relay, ok := firstOverlap(l.TrustedProxies, l.AcceptProxyFrom); ok {
+				out = append(out, fmt.Sprintf("listener %s: trusted_proxies %s overlaps accept_proxy_from %s: a relay's PROXY header names the client, and trusted_proxies is matched against that client, so a relay does not belong in trusted_proxies (there it only covers the relay's own requests, such as health checks)", l.Name, tp, relay))
+			}
+		}
 	}
 	if cfg.Metrics.Enabled && everyAddress(cfg.Metrics.Bind) {
 		out = append(out, fmt.Sprintf("metrics.bind %q listens on every address, and the metrics endpoint has no authentication: bind a specific address or restrict the port with a firewall", cfg.Metrics.Bind))
@@ -1193,9 +1262,13 @@ func everyAddress(bind string) bool {
 }
 
 // ServerWarnings returns one warning per server.* key that is set but not
-// implemented: pid_file and workers. main prints these at startup. They are
+// implemented: pid_file and workers, and the keys of server.http3 that
+// change nothing on this platform. main prints these at startup. They are
 // warnings, not errors, because deployed configs carry these keys.
-func ServerWarnings(s ServerConfig) []string {
+func ServerWarnings(s ServerConfig) []string { return serverWarnings(s, runtime.GOOS) }
+
+// serverWarnings is ServerWarnings on the platform goos.
+func serverWarnings(s ServerConfig, goos string) []string {
 	var out []string
 	if s.PidFile != "" {
 		out = append(out, fmt.Sprintf("server.pid_file (%q) is set but not implemented: nvelox does not write a pid file", s.PidFile))
@@ -1203,7 +1276,7 @@ func ServerWarnings(s ServerConfig) []string {
 	if s.Workers > 0 {
 		out = append(out, fmt.Sprintf("server.workers (%d) is set but not implemented: nvelox always runs as one process", s.Workers))
 	}
-	return out
+	return append(out, http3Warnings(s.HTTP3, goos)...)
 }
 
 // validateServerName checks a server_names entry. Allows exact hostnames and
@@ -1229,6 +1302,24 @@ func validateServerName(s string) error {
 		return fmt.Errorf("server name must be a bare hostname")
 	}
 	return nil
+}
+
+// sameStrings reports whether a and b hold the same strings, in any order.
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]int, len(a))
+	for _, x := range a {
+		seen[x]++
+	}
+	for _, x := range b {
+		if seen[x] == 0 {
+			return false
+		}
+		seen[x]--
+	}
+	return true
 }
 
 // validateBindGroups enforces the nginx-style multi-server-per-port rules
@@ -1293,6 +1384,18 @@ func validateBindGroups(listeners []Listener) error {
 		}
 		if defaults > 1 {
 			return fmt.Errorf("bind %s: more than one listener marked default_server", bind)
+		}
+
+		// Rule: one relay list and key file per bind address. A relay's
+		// PROXY header arrives before the SNI or Host that selects the
+		// site, so every site on the port answers for the same relays.
+		if proto == "http" || proto == "https" {
+			for _, s := range sites[1:] {
+				if !sameStrings(s.AcceptProxyFrom, sites[0].AcceptProxyFrom) || s.AcceptProxyKeyFile != sites[0].AcceptProxyKeyFile {
+					return fmt.Errorf("bind %s: listeners %s and %s share a port but differ in accept_proxy_from or accept_proxy_key_file",
+						bind, sites[0].Name, s.Name)
+				}
+			}
 		}
 
 		// Rule: every non-default site in a multi-site group must declare

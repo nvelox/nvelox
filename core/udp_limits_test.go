@@ -21,6 +21,10 @@ import (
 // stayed dead until a restart. Now: refuse that client, and serve the next
 // one once a server is back.
 func TestUDP_NoHealthyServerDoesNotWedgePoller(t *testing.T) {
+	stUDPEngines(t, udpTestUDP_NoHealthyServerDoesNotWedgePoller)
+}
+
+func udpTestUDP_NoHealthyServerDoesNotWedgePoller(t *testing.T) {
 	echo, _ := stUDPBackend(t, stEchoReply)
 	addr := stFreeUDPAddr(t)
 	e := stStart(t, &config.Config{
@@ -68,7 +72,9 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 
 // H9a: a global session cap and a per-client-IP cap; a refused source gets
 // nothing, and its datagram never reaches the backend.
-func TestUDP_SessionLimits(t *testing.T) {
+func TestUDP_SessionLimits(t *testing.T) { stUDPEngines(t, udpTestUDP_SessionLimits) }
+
+func udpTestUDP_SessionLimits(t *testing.T) {
 	be, got := stUDPBackend(t, stEchoReply)
 	addr := stFreeUDPAddr(t)
 	e := stStart(t, &config.Config{
@@ -112,7 +118,9 @@ func TestUDP_SessionLimits(t *testing.T) {
 
 // H9a: a session whose backend never answers ends after the no-reply TTL and
 // frees its slot; one the backend answered keeps the idle timeout.
-func TestUDP_NoReplyTTL(t *testing.T) {
+func TestUDP_NoReplyTTL(t *testing.T) { stUDPEngines(t, udpTestUDP_NoReplyTTL) }
+
+func udpTestUDP_NoReplyTTL(t *testing.T) {
 	sink, got := stUDPBackend(t, nil)
 	addr := stFreeUDPAddr(t)
 	e := stStart(t, &config.Config{
@@ -145,7 +153,9 @@ func TestUDP_NoReplyTTL(t *testing.T) {
 
 // A backend reply up to the max UDP payload is relayed whole (the read buffer
 // is now borrowed from a pool per reply instead of held per session).
-func TestUDP_LargeReplyRelayedWhole(t *testing.T) {
+func TestUDP_LargeReplyRelayedWhole(t *testing.T) { stUDPEngines(t, udpTestUDP_LargeReplyRelayedWhole) }
+
+func udpTestUDP_LargeReplyRelayedWhole(t *testing.T) {
 	big := bytes.Repeat([]byte("0123456789abcdef"), 60000/16)
 	be, _ := stUDPBackend(t, func([]byte) []byte { return big })
 	addr := stFreeUDPAddr(t)
@@ -166,6 +176,10 @@ func TestUDP_LargeReplyRelayedWhole(t *testing.T) {
 // malformed header, or naming another client than the session's) is dropped
 // instead of being forwarded with no client to check or log.
 func TestUDP_TrustedRelayDatagramWithoutHeaderDropped(t *testing.T) {
+	stUDPEngines(t, udpTestUDP_TrustedRelayDatagramWithoutHeaderDropped)
+}
+
+func udpTestUDP_TrustedRelayDatagramWithoutHeaderDropped(t *testing.T) {
 	be, got := stUDPBackend(t, nil)
 	addr := stFreeUDPAddr(t)
 	stStart(t, &config.Config{
@@ -216,6 +230,10 @@ func TestUDP_TrustedRelayDatagramWithoutHeaderDropped(t *testing.T) {
 // Behind a trusted relay the per-client cap counts the client the PROXY header
 // names, not the relay (all relayed clients share the relay's address).
 func TestUDP_TrustedRelayPerClientCap(t *testing.T) {
+	stUDPEngines(t, udpTestUDP_TrustedRelayPerClientCap)
+}
+
+func udpTestUDP_TrustedRelayPerClientCap(t *testing.T) {
 	be, got := stUDPBackend(t, nil)
 	addr := stFreeUDPAddr(t)
 	stStart(t, &config.Config{
@@ -282,6 +300,10 @@ func TestUDPSessionLimiter(t *testing.T) {
 // header was checked. They now end at the first datagram and hold nothing,
 // so a real relayed client still gets in at once.
 func TestUDP_ForgedRelaySourcesHoldNothing(t *testing.T) {
+	stUDPEngines(t, udpTestUDP_ForgedRelaySourcesHoldNothing)
+}
+
+func udpTestUDP_ForgedRelaySourcesHoldNothing(t *testing.T) {
 	be, got := stUDPBackend(t, nil)
 	addr := stFreeUDPAddr(t)
 	stStart(t, &config.Config{
@@ -315,6 +337,10 @@ func TestUDP_ForgedRelaySourcesHoldNothing(t *testing.T) {
 // cap of their own; an empty datagram (which never reaches OnData) opens one
 // that ends after the pending timeout.
 func TestUDPRelayPendingSessionsCapped(t *testing.T) {
+	stUDPEngines(t, udpTestUDPRelayPendingSessionsCapped)
+}
+
+func udpTestUDPRelayPendingSessionsCapped(t *testing.T) {
 	be, _ := stUDPBackend(t, nil)
 	addr := stFreeUDPAddr(t)
 	const limit = 20
@@ -326,18 +352,13 @@ func TestUDPRelayPendingSessionsCapped(t *testing.T) {
 		e.udpMaxSessions = limit
 		e.udpRelayPendingTimeout = 300 * time.Millisecond
 	})
-	h := stHandler(e)
 	pending := func() int {
 		n := 0
-		h.sessions.Range(func(_, v any) bool {
-			ctx := v.(*ConnContext)
-			ctx.Mu.Lock()
-			if ctx.relayPending && !ctx.closed {
+		for _, s := range stUDPSessions(e) {
+			if s.RelayPending {
 				n++
 			}
-			ctx.Mu.Unlock()
-			return true
-		})
+		}
 		return n
 	}
 	raddr, _ := net.ResolveUDPAddr("udp", addr)

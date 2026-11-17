@@ -105,7 +105,19 @@ func (e *Engine) CheckClientIP(r *http.Request, clientIP net.IP) string {
 // matched as "/". Matching is case-sensitive; use path_regex with (?i) in
 // front of a case-insensitive backend.
 func (e *Engine) DecideClientIP(r *http.Request, clientIP net.IP) (string, int) {
-	path := httppath.Canonical(r.URL.Path)
+	return e.Decide(r.Method, r.URL.Path, r.Header, clientIP)
+}
+
+// HeaderGetter returns the first value of a request header (http.Header's
+// Get).
+type HeaderGetter interface {
+	Get(name string) string
+}
+
+// Decide is DecideClientIP for a request given by its method, decoded path
+// (r.URL.Path) and headers.
+func (e *Engine) Decide(method, urlPath string, h HeaderGetter, clientIP net.IP) (string, int) {
+	path := httppath.Canonical(urlPath)
 	if !strings.HasPrefix(path, "/") {
 		path = "/"
 	}
@@ -113,10 +125,11 @@ func (e *Engine) DecideClientIP(r *http.Request, clientIP net.IP) (string, int) 
 	if strings.Contains(path, ";") {
 		bare = httppath.WithoutParams(path)
 	}
-	for _, rule := range e.rules {
-		m := e.matches(r, path, clientIP, &rule)
+	for i := range e.rules {
+		rule := &e.rules[i]
+		m := e.matches(method, h, path, clientIP, rule)
 		if bare != path {
-			mb := e.matches(r, bare, clientIP, &rule)
+			mb := e.matches(method, h, bare, clientIP, rule)
 			if rule.Action == "deny" {
 				m = m || mb
 			} else {
@@ -130,7 +143,7 @@ func (e *Engine) DecideClientIP(r *http.Request, clientIP net.IP) (string, int) 
 	return "", 0 // no rule matched
 }
 
-func (e *Engine) matches(r *http.Request, path string, clientIP net.IP, rule *CompiledRule) bool {
+func (e *Engine) matches(method string, h HeaderGetter, path string, clientIP net.IP, rule *CompiledRule) bool {
 	// Check path prefix
 	if rule.PathPrefix != "" && !strings.HasPrefix(path, rule.PathPrefix) {
 		return false
@@ -157,14 +170,14 @@ func (e *Engine) matches(r *http.Request, path string, clientIP net.IP, rule *Co
 
 	// Check method (normalize to uppercase — rule methods compiled uppercase)
 	if len(rule.Methods) > 0 {
-		if !rule.Methods[strings.ToUpper(r.Method)] {
+		if !rule.Methods[strings.ToUpper(method)] {
 			return false
 		}
 	}
 
 	// Check headers
 	for name, value := range rule.Headers {
-		if r.Header.Get(name) != value {
+		if h.Get(name) != value {
 			return false
 		}
 	}

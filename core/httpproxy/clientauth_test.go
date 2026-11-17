@@ -4,6 +4,7 @@ package httpproxy
 // shared bind. M5: backend_tls fails closed on the HTTP and WebSocket paths.
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -11,6 +12,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -20,12 +22,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"nvelox/config"
 	"nvelox/lb"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 )
 
 // caPKI is a test CA issuing server and client certificates.
@@ -106,14 +112,29 @@ func mtlsSite(t *testing.T, pki *caPKI, name string, names []string, def bool, c
 	return NewHTTPServer(l, balancers, backends, nil, nil, nil, nil, nil)
 }
 
+// freeAddr returns a loopback address whose port nobody holds, for TCP or
+// for UDP: a group that serves HTTP/3 binds both, and a port the kernel
+// gives out as free for TCP may be the UDP port of a QUIC client, of this
+// test process or of another one on the machine.
 func freeAddr(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	var held error
+	for i := 0; i < 100; i++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := ln.Addr().String()
+		pc, err := net.ListenPacket("udp", addr)
+		ln.Close()
+		if err == nil {
+			pc.Close()
+			return addr
+		}
+		held = err
 	}
-	defer ln.Close()
-	return ln.Addr().String()
+	t.Fatalf("no port that is free for TCP and UDP alike: %v", held)
+	return ""
 }
 
 func startGroup(t *testing.T, addr string, sites ...*HTTPServer) *BindGroup {
@@ -224,34 +245,139 @@ func TestHTTPS_ClientAuthRequireSingleSite(t *testing.T) {
 	}
 }
 
-// HTTP/3 shares the group's tls.Config: its QUIC config must hand the
-// client_auth site its policy by SNI (and h3 ALPN), and the other sites none.
-func TestHTTP3_ClientAuthConfig(t *testing.T) {
+// HTTP/3 shares the group's tls.Config: each site gets its own client_auth
+// policy by SNI there too, on connections that resume a session as on new
+// ones.
+func TestHTTP3_ClientAuth(t *testing.T) {
+	quicGoPath(t)
+	clientAuthOverHTTP3(t, func(addr string, sites ...*HTTPServer) {
+		if g := startGroup(t, addr, sites...); g.http3Server == nil {
+			t.Fatal("http3 server not started")
+		}
+	})
+}
+
+// h3SiteGet does one request over a new HTTP/3 connection: SNI sni, Host
+// host, the client certificate cert when given, sessions kept in cache when
+// given. It returns the status and body and whether the connection resumed
+// a session, or the error.
+func h3SiteGet(pki *caPKI, addr, sni, host string, cert *tls.Certificate, cache tls.ClientSessionCache) (code int, body string, resumed bool, err error) {
+	cfg := &tls.Config{RootCAs: pki.pool, ServerName: sni, NextProtos: []string{http3.NextProtoH3}, ClientSessionCache: cache}
+	if cert != nil {
+		cfg.Certificates = []tls.Certificate{*cert}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := quic.DialAddr(ctx, addr, cfg, nil)
+	if err != nil {
+		return 0, "", false, err
+	}
+	defer conn.CloseWithError(0, "")
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+"/", nil)
+	resp, err := (&http3.Transport{}).NewClientConn(conn).RoundTrip(req)
+	if err != nil {
+		return 0, "", false, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b), conn.ConnectionState().TLS.DidResume, err
+}
+
+// refusedInHandshake reports whether err is a QUIC connection the server
+// ended with a TLS alert.
+func refusedInHandshake(err error) bool {
+	var te *quic.TransportError
+	return errors.As(err, &te) && te.Remote && te.ErrorCode >= 0x100 && te.ErrorCode < 0x200
+}
+
+// anySession is a client session cache that offers the last session stored
+// in it to every server: a client that resumes where it has no business
+// to.
+type anySession struct {
+	mu sync.Mutex
+	cs *tls.ClientSessionState
+}
+
+func (c *anySession) Get(string) (*tls.ClientSessionState, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cs, c.cs != nil
+}
+
+func (c *anySession) Put(_ string, cs *tls.ClientSessionState) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cs != nil {
+		c.cs = cs
+	}
+}
+
+// clientAuthOverHTTP3 checks client_auth over HTTP/3 on a group of three
+// sites that start runs: "a.test" requires a certificate of the test CA,
+// "c.test" one of another CA, and "b.test", the default site, asks for
+// none.
+func clientAuthOverHTTP3(t *testing.T, start func(addr string, sites ...*HTTPServer)) {
 	pki := newCAPKI(t, "h3-ca")
-	a := mtlsSite(t, pki, "a", []string{"a.test"}, false, "require", pki.caPath)
-	a.Listener.HTTP3 = true
-	b := mtlsSite(t, pki, "b", []string{"b.test"}, true, "", "")
-	g := startGroup(t, freeAddr(t), a, b)
-	if g.http3Server == nil {
-		t.Fatal("http3 server not started")
+	other := newCAPKI(t, "h3-other-ca")
+	sites := []*HTTPServer{
+		mtlsSite(t, pki, "a", []string{"a.test"}, false, "require", pki.caPath),
+		mtlsSite(t, pki, "b", []string{"b.test"}, true, "", ""),
+		mtlsSite(t, pki, "c", []string{"c.test"}, false, "require", other.caPath),
 	}
-	get := g.http3Server.TLSConfig.GetConfigForClient
-	if get == nil {
-		t.Fatal("HTTP/3 TLS config has no GetConfigForClient: client_auth cannot apply per site")
+	for _, s := range sites {
+		s.Listener.HTTP3 = true
 	}
-	cfg, err := get(&tls.ClientHelloInfo{ServerName: "a.test"})
-	if err != nil || cfg == nil {
-		t.Fatalf("a.test: cfg=%v err=%v", cfg, err)
+	addr := freeAddr(t)
+	start(addr, sites...)
+	certA, certC := pki.clientCert(t), other.clientCert(t)
+
+	served := func(what, sni, host string, cert *tls.Certificate, cache tls.ClientSessionCache, wantCode int, wantBody string, wantResumed bool) {
+		t.Helper()
+		code, body, resumed, err := h3SiteGet(pki, addr, sni, host, cert, cache)
+		if err != nil || code != wantCode || wantBody != "" && body != wantBody {
+			t.Errorf("%s: status %d, body %q, err %v; want %d %q", what, code, body, err, wantCode, wantBody)
+		}
+		if resumed != wantResumed {
+			t.Errorf("%s: the connection resumed a session: %v, want %v", what, resumed, wantResumed)
+		}
 	}
-	if cfg.ClientAuth != tls.RequireAndVerifyClientCert || cfg.ClientCAs == nil {
-		t.Fatalf("a.test over HTTP/3: ClientAuth=%v ClientCAs=%v, want RequireAndVerifyClientCert with the CA", cfg.ClientAuth, cfg.ClientCAs)
+	refused := func(what, sni string, cert *tls.Certificate, cache tls.ClientSessionCache) {
+		t.Helper()
+		code, body, _, err := h3SiteGet(pki, addr, sni, sni, cert, cache)
+		if !refusedInHandshake(err) {
+			t.Errorf("%s: status %d, body %q, err %v; want the handshake refused", what, code, body, err)
+		}
 	}
-	if len(cfg.NextProtos) != 1 || cfg.NextProtos[0] != "h3" {
-		t.Fatalf("a.test over HTTP/3: NextProtos=%v, want [h3]", cfg.NextProtos)
-	}
-	if cfg, err := get(&tls.ClientHelloInfo{ServerName: "b.test"}); err != nil || (cfg != nil && cfg.ClientAuth != tls.NoClientCert) {
-		t.Fatalf("b.test over HTTP/3 must not ask for a client cert: cfg=%v err=%v", cfg, err)
-	}
+
+	// Each site's own policy, chosen by the handshake's server name.
+	served("a.test with its CA's certificate", "a.test", "a.test", &certA, nil, 200, "site=a", false)
+	refused("a.test without a certificate", "a.test", nil, nil)
+	refused("a.test with another CA's certificate", "a.test", &certC, nil)
+	served("b.test without a certificate", "b.test", "b.test", nil, nil, 200, "site=b", false)
+	served("c.test with its CA's certificate", "c.test", "c.test", &certC, nil, 200, "site=c", false)
+	refused("c.test with another CA's certificate", "c.test", &certA, nil)
+	// A handshake as the site that asks for nothing does not open the
+	// sites that ask: the request is for another connection.
+	served("a.test asked on b.test's connection", "b.test", "a.test", nil, nil, http.StatusMisdirectedRequest, "", false)
+	served("a.test asked on b.test's connection, with a certificate", "b.test", "a.test", &certA, nil, http.StatusMisdirectedRequest, "", false)
+	served("a.test asked on c.test's connection", "c.test", "a.test", &certC, nil, http.StatusMisdirectedRequest, "", false)
+
+	// A client that comes back to a.test resumes its session, which holds
+	// its certificate.
+	cache := tls.NewLRUClientSessionCache(4)
+	served("a.test, first connection", "a.test", "a.test", &certA, cache, 200, "site=a", false)
+	served("a.test, second connection", "a.test", "a.test", &certA, cache, 200, "site=a", true)
+
+	// A session is no way around another site's policy. One of b.test,
+	// made without a certificate, does not stand in for the certificate
+	// a.test requires; one of a.test does not carry its certificate over to
+	// c.test, whose CA did not issue it.
+	fromB := &anySession{}
+	served("b.test, for its session", "b.test", "b.test", nil, fromB, 200, "site=b", false)
+	refused("a.test with b.test's session and no certificate", "a.test", nil, fromB)
+	fromA := &anySession{}
+	served("a.test, for its session", "a.test", "a.test", &certA, fromA, 200, "site=a", false)
+	refused("c.test with a.test's session", "c.test", &certA, fromA)
 }
 
 // A site whose client CA cannot be loaded fails the bind group's start.

@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"nvelox/config"
@@ -29,6 +30,7 @@ import (
 	"nvelox/core/sticky"
 	"nvelox/core/tlsutil"
 	"nvelox/lb"
+	"nvelox/proxy"
 )
 
 // ConnLimiterI is the interface for connection limiting.
@@ -108,8 +110,13 @@ type HTTPServer struct {
 	plainTransports   map[string]*http.Transport
 	backendTransports map[string]*http.Transport
 	backendSchemes    map[string]string // "https" when backend_tls is enabled
-	altSvcHeader      string
-	closeOnce         sync.Once // guards Close() against double-invocation
+	// backendFastTLS holds, per backend_tls backend, the TLS client config
+	// the event-loop fast path dials with: the backend's (the same checks
+	// as its Transport's), HTTP/1.1 only, with a session cache of its own.
+	// Built with the site, so a reload starts with new ones.
+	backendFastTLS map[string]*tls.Config
+	altSvcHeader   string
+	closeOnce      sync.Once // guards Close() against double-invocation
 
 	// Upgraded (WebSocket) connections relayed through this site, in the
 	// bind group's shared set, and the group's reload generation this site
@@ -117,10 +124,17 @@ type HTTPServer struct {
 	tunnelsMu sync.Mutex
 	tunnels   *tunnelSet
 	tunnelGen uint64
+
+	// fastCfg is the site's configuration as the event-loop fast path
+	// applies it (fast.go), built on first use.
+	fastCfg atomic.Pointer[fastSiteConfig]
 }
 
 // ListenerConfig mirrors core.ListenerConfig to avoid circular imports.
 type ListenerConfig struct {
+	// ProxyTrust is the listener's accept_proxy_from: the relays whose
+	// PROXY v2 header names the real client (nil: none).
+	ProxyTrust     *proxy.Trust
 	Name           string
 	Addr           string
 	Protocol       string
@@ -234,6 +248,7 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 	// ServerName from the target), so they get the same verification.
 	s.backendTransports = make(map[string]*http.Transport)
 	s.backendSchemes = make(map[string]string)
+	s.backendFastTLS = make(map[string]*tls.Config)
 	for name, be := range backends {
 		if be == nil {
 			continue
@@ -247,8 +262,21 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 			logging.Error("[HTTP] backend %q: backend_tls invalid: %v — requests to it fail with 502 (never sent in plaintext)", name, err)
 			continue
 		}
+		if tlsCfg.ServerName == "" && be.ResolveInterval != "" {
+			// The servers are replaced by the addresses their names
+			// resolve to: the name to check is still the one configured.
+			if host, ok := commonServerHost(be.Servers); ok {
+				tlsCfg.ServerName = host
+			} else {
+				logging.Warn("[HTTP] backend %q: resolve_interval with backend_tls and servers of different names: each server's certificate is checked against its resolved address; set backend_tls.server_name", name)
+			}
+		}
 		s.backendTransports[name] = newBackendTransport(l, be, tlsCfg)
 		s.backendSchemes[name] = "https"
+		fast := tlsCfg.Clone()
+		fast.NextProtos = []string{"http/1.1"}
+		fast.ClientSessionCache = tls.NewLRUClientSessionCache(backendTLSSessions)
+		s.backendFastTLS[name] = fast
 	}
 
 	// http.Server / TLS / HTTP/3 setup now lives on BindGroup. Site is
@@ -398,6 +426,30 @@ func BuildBackendTLSConfig(cfg config.BackendTLSConfig) (*tls.Config, error) {
 	return buildBackendTLSConfig(cfg)
 }
 
+// backendTLSSessions is how many TLS sessions the fast path keeps per
+// backend to resume (one per server name).
+const backendTLSSessions = 64
+
+// commonServerHost returns the host name all of servers share, when they
+// share one and it is a name, not an address.
+func commonServerHost(servers []string) (string, bool) {
+	host := ""
+	for _, s := range servers {
+		h := s
+		if sh, _, err := net.SplitHostPort(s); err == nil {
+			h = sh
+		}
+		h = strings.Trim(h, "[]")
+		if h == "" || net.ParseIP(h) != nil || (host != "" && !strings.EqualFold(h, host)) {
+			return "", false
+		}
+		if host == "" {
+			host = h
+		}
+	}
+	return host, host != ""
+}
+
 // buildBackendTLSConfig turns a BackendTLSConfig into a *tls.Config suitable
 // for use as Transport.TLSClientConfig.
 //
@@ -408,6 +460,7 @@ func BuildBackendTLSConfig(cfg config.BackendTLSConfig) (*tls.Config, error) {
 func buildBackendTLSConfig(cfg config.BackendTLSConfig) (*tls.Config, error) {
 	t := &tls.Config{
 		MinVersion: tls.VersionTLS12,
+		ServerName: cfg.ServerName,
 	}
 
 	if cfg.Insecure {

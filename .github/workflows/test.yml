@@ -27,6 +27,23 @@ jobs:
         go-version: '1.27.x'
         check-latest: true
 
+    # The event loops are the private module github.com/nvelox/ngx. A
+    # read-only deploy key of that repository is in the secret
+    # NGX_DEPLOY_KEY; git reaches the module over SSH with it, and Go is
+    # told not to ask the public proxy or checksum database for it. The
+    # host key is GitHub's published one, pinned. A run without the secret
+    # (a pull request from a fork) stops at the build.
+    - name: Access to the ngx module
+      env:
+        NGX_DEPLOY_KEY: ${{ secrets.NGX_DEPLOY_KEY }}
+      run: |
+        mkdir -p ~/.ssh && chmod 700 ~/.ssh
+        printf '%s\n' "$NGX_DEPLOY_KEY" > ~/.ssh/ngx_deploy && chmod 600 ~/.ssh/ngx_deploy
+        echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
+        git config --global url."git@github.com:nvelox/ngx".insteadOf "https://github.com/nvelox/ngx"
+        git config --global core.sshCommand "ssh -i ~/.ssh/ngx_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+        echo "GOPRIVATE=github.com/nvelox/ngx" >> "$GITHUB_ENV"
+
     - name: Build
       run: go build -v ./...
 

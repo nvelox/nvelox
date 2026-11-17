@@ -755,6 +755,23 @@ func TestValidateBindGroups_Rejections(t *testing.T) {
 			want: "different protocols",
 		},
 		{
+			name: "different relay lists on one bind",
+			in: []Listener{
+				func() Listener {
+					l := mkListener("a", ":443", "https")
+					l.DefaultServer = true
+					l.AcceptProxyFrom = []string{"10.0.0.0/8"}
+					return l
+				}(),
+				func() Listener {
+					l := mkListener("b", ":443", "https")
+					l.AcceptProxyFrom = []string{"10.1.0.0/16"}
+					return l
+				}(),
+			},
+			want: "accept_proxy_from",
+		},
+		{
 			name: "two default_server",
 			in: []Listener{
 				func() Listener { l := mkListener("a", ":443", "https"); l.DefaultServer = true; return l }(),

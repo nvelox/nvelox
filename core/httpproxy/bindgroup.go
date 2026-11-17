@@ -7,14 +7,18 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"nvelox/config"
 	"nvelox/core/logging"
 	"nvelox/core/servegate"
 	"nvelox/core/tlsutil"
 
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
 
@@ -27,12 +31,23 @@ import (
 // adds multi-cert SNI dispatch for groups with multiple HTTPS sites. Phase D
 // adds Host-header dispatch so the right Site handles each request.
 type BindGroup struct {
+	proxyWarned atomic.Int64 // when a refused relay connection was last logged (unix nanos)
 	addr        string
 	protocol    string // "http" or "https"
 	httpServer  *http.Server
 	http3Server *http3.Server
 	http3Conn   net.PacketConn // the HTTP/3 socket Start bound
-	primary     *HTTPServer    // for shared TLS / HTTP3 config; first site
+	// h3Running counts the HTTP/3 requests being served, and h3LastDone is
+	// when one last finished (Unix nanoseconds): Stop lets them finish.
+	h3Running  atomic.Int64
+	h3LastDone atomic.Int64
+	// h3Relay wraps that socket when the group trusts UDP relays
+	// (accept_proxy_from): h3relay.go. nil: QUIC reads the socket itself.
+	h3Relay *h3RelayConn
+	// h3loops is the group's HTTP/3 when the event loops serve it
+	// (h3conn_linux.go); the three fields above are then unused.
+	h3loops *quicServer
+	primary *HTTPServer // for shared TLS / HTTP3 config; first site
 
 	// Site dispatch state. Lives behind an atomic.Pointer so ReplaceSites
 	// (called by Engine.Reload on listener config changes) can swap the
@@ -58,7 +73,24 @@ type BindGroup struct {
 	// the new sites, CloseTunnelsOf closes those of blocked clients and Stop
 	// closes them all.
 	tunnels tunnelSet
+
+	// fast serves the group from the event loops (fast_linux.go); its
+	// handed-over connections go to httpServer. nil: httpServer serves the
+	// socket itself.
+	fast *fastServer
+
+	// bound is the address Start bound (the port chosen for ":0").
+	bound net.Addr
+
+	// clientBackends lists net/http's connections that hold backend
+	// connections of their own (send_proxy_v2, proxysend.go): net.Conn ->
+	// *clientBackends, until the connection closes.
+	clientBackends sync.Map
 }
+
+// BoundAddr returns the address the group's TCP socket is bound to (nil
+// before Start).
+func (g *BindGroup) BoundAddr() net.Addr { return g.bound }
 
 // siteSet is the immutable snapshot of sites the bind group dispatches to.
 // Pre-computed exact / wildcard / default lookup tables so pickSite is one
@@ -172,11 +204,39 @@ const (
 	defaultIdleTimeout       = 120 * time.Second
 )
 
+// http3MaxHeaderBytes is the largest header section of an HTTP/3 request
+// where server.http3.max_header_size names none; a larger one is answered
+// 431. quic-go reserves the length a HEADERS frame announces before the
+// frame's bytes arrive, so this is also the memory one request stream can
+// hold by sending a few bytes. Under net/http's default of 1 MiB, which
+// HTTP/1.1 and HTTP/2 keep, the 100 request streams of one connection held
+// 100 MiB that way. (The event loops set nothing aside for what a frame
+// announces, and have the same default: h3stream_linux.go.)
+const http3MaxHeaderBytes = config.DefaultHTTP3MaxHeaderSize
+
 // ServeHTTP picks the Site that owns r.Host and delegates. Single-site
 // bind groups skip the lookup entirely (zero overhead for the common case).
 // The site applies its own read/write limits (stall.go), so two sites
 // sharing the same bind port can carry different values.
 func (g *BindGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.ProtoMajor == 3 && g.h3loops == nil && g.proxyTrust().Enabled() {
+		// A request that came through a trusted UDP relay is its client's
+		// (h3relay.go); a relay's connection that names no client is not
+		// served. (HTTP/3 on the event loops names the client itself.)
+		if remote, err := netip.ParseAddrPort(r.RemoteAddr); err == nil {
+			client, ok := g.h3Client(remote)
+			if !ok {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			r.RemoteAddr = client.String()
+		}
+	}
+	if r.TLS == nil {
+		// A TLS connection the fast path handed over carries its state in
+		// the context (fasttls_linux.go).
+		r.TLS = fastTLSState(r)
+	}
 	ss := g.sites.Load()
 	if ss == nil || len(ss.all) == 0 {
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
@@ -193,10 +253,15 @@ func (g *BindGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // siteFor is the site of ss (not empty) that serves r: the only one, else
 // the one r.Host names (pickSite).
 func (g *BindGroup) siteFor(ss *siteSet, r *http.Request) *HTTPServer {
+	return g.siteForHost(ss, r.Host)
+}
+
+// siteForHost is the site of ss (not empty) that serves a request for host
+// (a Host header value).
+func (g *BindGroup) siteForHost(ss *siteSet, host string) *HTTPServer {
 	if len(ss.all) == 1 {
 		return ss.all[0]
 	}
-	host := r.Host
 	// Strip port if present. IPv6 literals are bracketed; SplitHostPort
 	// handles both.
 	if i := strings.LastIndex(host, ":"); i != -1 {
@@ -388,6 +453,7 @@ func (g *BindGroup) ReplaceSites(newSites []*HTTPServer) error {
 		s.setTunnelSet(&g.tunnels, gen)
 	}
 	g.sites.Store(buildSiteSet(newSites))
+	g.warnH3RelayNeedsRestart()
 
 	// Primary tracks the first site; update so subsequent ReloadCerts
 	// / Stop pick up the right reference for shared-TLS-profile lookups.
@@ -501,6 +567,8 @@ func (g *BindGroup) Start() error {
 		Handler:           g,
 		ReadHeaderTimeout: readHeaderTO,
 		IdleTimeout:       idleTO,
+		ConnContext:       g.connContext,
+		ConnState:         g.connState,
 	}
 
 	primary := g.primary
@@ -532,33 +600,90 @@ func (g *BindGroup) Start() error {
 		// Bind before returning: a port that cannot be bound fails Start
 		// (it used to fail in a goroutine, logged, while nvelox ran on
 		// without it), and once Start returns every socket is held, so the
-		// process may give up root (server.user).
-		ln, err := tls.Listen("tcp", g.addr, g.httpServer.TLSConfig)
+		// process may give up root (server.user). The fast path does the
+		// handshakes itself (fasttls_linux.go).
+		fast := fastPathEnabled()
+		var ln net.Listener
+		ln, err = net.Listen("tcp", g.addr)
+		if err == nil && !fast {
+			// net/http accepts: a trusted relay's PROXY header is read
+			// under the TLS handshake.
+			ln = tls.NewListener(&proxyListener{Listener: ln, g: g, timeout: readHeaderTO}, g.httpServer.TLSConfig)
+		}
 		if err != nil {
 			return fmt.Errorf("listen %s: %w", g.addr, err)
 		}
-		if anyH3 {
+		g.bound = ln.Addr()
+		h3Loops := false
+		if anyH3 && fast {
+			if h3Loops, err = g.bindH3Loops(tlsCfg, idleTO); err != nil {
+				ln.Close()
+				return fmt.Errorf("listen %s/udp (HTTP/3): %w", g.addr, err)
+			}
+		}
+		if anyH3 && !h3Loops {
 			pc, err := net.ListenPacket("udp", g.addr)
 			if err != nil {
 				ln.Close()
 				return fmt.Errorf("listen %s/udp (HTTP/3): %w", g.addr, err)
 			}
 			g.http3Conn = pc
+			// With trusted relays the socket is read through the layer
+			// that checks and takes off their PROXY header (h3relay.go).
+			var quicConn net.PacketConn = pc
+			if uc, ok := pc.(*net.UDPConn); ok && g.proxyTrust().Enabled() {
+				g.h3Relay = newH3RelayConn(uc, g)
+				quicConn = g.h3Relay
+			}
+			// The limits of server.http3 that the quic-go server has:
+			// they are this server's from here on.
+			lim := http3Limits()
 			g.http3Server = &http3.Server{
 				Addr:      g.addr,
-				Handler:   g,
+				Handler:   h3Handler{g},
 				TLSConfig: http3.ConfigureTLSConfig(tlsCfg.Clone()),
+				// 0-RTT stays off. Given no QUIC config, quic-go accepts
+				// it, and a request that arrives as early data can be
+				// replayed: whoever captured a client's first flight could
+				// have it served again for as long as the session ticket is
+				// valid. Without it, the first request of a resumed
+				// connection waits for the handshake. How far the receive
+				// windows grow is the configuration's (by default the
+				// numbers quic-go has itself). Every other field stays
+				// zero, which quic-go fills with the defaults it uses when
+				// it is given no config.
+				QUICConfig: &quic.Config{
+					Allow0RTT:                  false,
+					MaxStreamReceiveWindow:     uint64(lim.MaxStreamReceiveWindow),
+					MaxConnectionReceiveWindow: uint64(lim.MaxConnectionReceiveWindow),
+				},
+				MaxHeaderBytes: int(lim.MaxHeaderSize),
+				// A QUIC connection's requests to send_proxy_v2 backends
+				// go over backend connections of its own (proxysend.go),
+				// closed with it.
+				ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
+					// The client is the one a trusted relay named, when the
+					// connection came through one.
+					cb := &clientBackends{live: func() (net.Addr, net.Addr) { return g.h3ClientAddr(c.RemoteAddr()), c.LocalAddr() }}
+					context.AfterFunc(c.Context(), cb.close)
+					return withClientBackends(ctx, cb)
+				},
 			}
 			go func() {
 				if !g.serveGate.Wait(g.gateDone) {
 					pc.Close()
 					return
 				}
-				if err := g.http3Server.Serve(pc); err != nil && err != http.ErrServerClosed {
+				if err := g.http3Server.Serve(quicConn); err != nil && err != http.ErrServerClosed {
 					logging.Error("[HTTP3] Server error: %v", err)
 				}
 			}()
 			logging.Info("[HTTP3] QUIC listener started on %s", g.addr)
+		}
+		if fast {
+			g.startFastTLS(ln, readHeaderTO, idleTO)
+			g.serveH3Loops()
+			return nil
 		}
 		go func() {
 			if !g.serveGate.Wait(g.gateDone) {
@@ -574,12 +699,16 @@ func (g *BindGroup) Start() error {
 		if err != nil {
 			return fmt.Errorf("listen %s: %w", g.addr, err)
 		}
+		g.bound = ln.Addr()
+		if fastPathEnabled() {
+			return g.startFast(ln, readHeaderTO, idleTO)
+		}
 		go func() {
 			if !g.serveGate.Wait(g.gateDone) {
 				ln.Close()
 				return
 			}
-			if err := g.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+			if err := g.httpServer.Serve(&proxyListener{Listener: ln, g: g, timeout: readHeaderTO}); err != nil && err != http.ErrServerClosed {
 				logging.Error("[HTTP] Server error: %v", err)
 			}
 		}()
@@ -861,21 +990,92 @@ func (g *BindGroup) pickSiteCert(sni string) *siteCert {
 	return state.defaultCert
 }
 
-// Stop gracefully shuts the group's HTTP and HTTP/3 listeners, closes its
-// sites, then closes every WebSocket tunnel of the group (replaced site
-// instances included): http.Server.Shutdown neither waits for nor closes
-// hijacked connections.
-func (g *BindGroup) Stop(ctx context.Context) error {
+// h3Handler serves the group's HTTP/3 requests, counted while they run.
+type h3Handler struct{ g *BindGroup }
+
+func (h h3Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.g.h3Running.Add(1)
+	defer func() {
+		// The time first: whoever sees no request running sees it.
+		h.g.h3LastDone.Store(time.Now().UnixNano())
+		h.g.h3Running.Add(-1)
+	}()
+	h.g.ServeHTTP(w, r)
+}
+
+// Stop gives the clients h3StopLinger after the last HTTP/3 request was
+// answered to take what is still on its way to them, looking every
+// h3StopPoll.
+const (
+	h3StopLinger = time.Second
+	h3StopPoll   = 10 * time.Millisecond
+)
+
+// stopHTTP3 ends the group's HTTP/3 server: every connection is told to
+// send no new request (GOAWAY; one that arrives all the same is refused
+// as not processed), the requests in flight finish, and what is left when
+// ctx ends is closed.
+//
+// The server's own Shutdown waits until every client has closed its
+// connection, which an idle client may not do and one that is gone never
+// does: on a busy listener it would run to ctx's end every time. Waited
+// for here are the requests. A response is on its way for a moment after
+// its handler has returned (its last packets, or ones to be sent again),
+// and closing a QUIC connection drops what it has not delivered, so the
+// connections stay until h3StopLinger after the last request was answered;
+// the ones whose clients close them sooner, as a client told to go away
+// does, are not waited for, and a listener whose clients are all idle
+// stops at once.
+func (g *BindGroup) stopHTTP3(ctx context.Context) {
 	if g.http3Server != nil {
-		g.http3Server.Close()
+		wait, done := context.WithCancel(ctx)
+		go func() {
+			defer done()
+			for g.h3Running.Load() > 0 || time.Since(time.Unix(0, g.h3LastDone.Load())) < h3StopLinger {
+				select {
+				case <-wait.Done():
+					return
+				case <-time.After(h3StopPoll):
+				}
+			}
+		}()
+		// Returns when every connection is closed or wait has ended, and
+		// closes the ones still open then.
+		g.http3Server.Shutdown(wait)
+		done()
 	}
 	if g.http3Conn != nil {
 		g.http3Conn.Close() // Serve does not close a socket it was handed
 	}
+}
+
+// Stop gracefully shuts the group's HTTP and HTTP/3 listeners (no new
+// connections, the requests in flight finish, what is left at ctx's end is
+// closed), closes its sites, then closes every WebSocket tunnel of the
+// group (replaced site instances included): http.Server.Shutdown neither
+// waits for nor closes hijacked connections.
+func (g *BindGroup) Stop(ctx context.Context) error {
+	// HTTP/3 stops as the TCP side does, and at the same time.
+	h3Stopped := make(chan struct{})
+	go func() {
+		defer close(h3Stopped)
+		g.stopHTTP3(ctx)
+	}()
 	var err error
 	if g.httpServer != nil {
-		err = g.httpServer.Shutdown(ctx)
+		if g.fast != nil {
+			drained := make(chan bool, 1)
+			go func() { drained <- g.fast.shutdown(ctx.Done()) }()
+			err = g.httpServer.Shutdown(ctx)
+			if !<-drained && err == nil {
+				err = ctx.Err()
+			}
+		} else {
+			err = g.httpServer.Shutdown(ctx)
+		}
 	}
+	<-h3Stopped
+	g.stopH3Loops()
 	for _, s := range g.siteList() {
 		s.Close()
 	}

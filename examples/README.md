@@ -5,8 +5,9 @@ Each YAML file demonstrates a specific feature. Run nvelox with any config and t
 ## Prerequisites
 
 ```bash
-# Build nvelox
-go build -o nvelox main.go
+# Build nvelox (needs access to the private module github.com/nvelox/ngx;
+# without it, use a release binary: https://github.com/nvelox/nvelox/releases)
+GOPRIVATE=github.com/nvelox/ngx go build -o nvelox main.go
 
 # Generate TLS certs (required for examples 05-07, 28)
 ./examples/generate-certs.sh

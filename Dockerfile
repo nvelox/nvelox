@@ -1,3 +1,7 @@
+# This image compiles nvelox from source, which needs access to the private
+# module github.com/nvelox/ngx (the event loops). The released images are
+# built from the release binaries with Dockerfile.goreleaser.
+
 # Build Stage
 FROM golang:1.27-alpine AS builder
 
