@@ -90,7 +90,7 @@ type sizeRule struct {
 
 // The smallest window is the one every connection starts with
 // (core/httpproxy, h3StreamWindow and h3ConnWindow), and the smallest send
-// buffer what a connection may hold whatever its path carries (core/quic,
+// buffer what a connection may hold whatever its path carries (ngx/quic,
 // sendBufferMin).
 var (
 	http3HeaderSize    = sizeRule{"max_header_size", 1 << 10, 1 << 20, DefaultHTTP3MaxHeaderSize}

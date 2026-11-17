@@ -2,7 +2,7 @@
 
 package httpproxy
 
-// QUIC on the event loops. The transport itself is core/quic, which does no
+// QUIC on the event loops. The transport itself is ngx/quic, which does no
 // I/O: this file gives it sockets, a clock and timers.
 //
 // A server has one UDP socket per loop, all bound to its address with
@@ -70,10 +70,10 @@ import (
 
 	"nvelox/config"
 	"nvelox/core/logging"
-	"nvelox/core/quic"
 	"nvelox/proxy"
 
 	"github.com/nvelox/ngx"
+	"github.com/nvelox/ngx/quic"
 	"golang.org/x/sys/unix"
 )
 
@@ -123,10 +123,10 @@ var quicNameSize = uint32(unsafe.Sizeof(unix.RawSockaddrInet6{}))
 
 // quicSendMemory is how much the QUIC connections of the process may hold
 // together that their clients have not acknowledged. Past it a connection
-// holds little more than a few packets at a time (core/quic, the send
+// holds little more than a few packets at a time (ngx/quic, the send
 // buffer): clients that ask for much and take nothing do not get to fill
 // the machine. The same amount again is what the connections may be
-// granted together beyond their first receive windows (core/quic, the
+// granted together beyond their first receive windows (ngx/quic, the
 // receive windows): clients that upload to backends which take nothing do
 // not get to fill it either.
 func quicSendMemory() int64 { return sendMemoryOf(machineMemory(), memoryLimits()) }

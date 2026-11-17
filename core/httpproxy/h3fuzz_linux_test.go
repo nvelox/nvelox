@@ -15,9 +15,9 @@ import (
 	"time"
 
 	"nvelox/config"
-	"nvelox/core/h3"
 	"nvelox/lb"
 
+	"github.com/nvelox/ngx/h3"
 	"github.com/quic-go/quic-go"
 )
 

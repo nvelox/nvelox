@@ -18,9 +18,8 @@ import (
 	"strconv"
 	"time"
 
-	"nvelox/core/h3"
-
 	"github.com/nvelox/ngx"
+	"github.com/nvelox/ngx/h3"
 	"golang.org/x/sys/unix"
 )
 

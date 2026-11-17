@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	nvquic "nvelox/core/quic"
+	nvquic "github.com/nvelox/ngx/quic"
 
 	"unsafe"
 

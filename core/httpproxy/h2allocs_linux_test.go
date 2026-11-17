@@ -11,12 +11,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nvelox/ngx/h2"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 	"golang.org/x/sys/unix"
 
 	"nvelox/config"
-	"nvelox/core/h2"
 )
 
 // allocsBackend answers every read with resp, on raw sockets (it allocates

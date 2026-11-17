@@ -12,9 +12,8 @@ import (
 	"time"
 
 	"github.com/nvelox/ngx"
+	"github.com/nvelox/ngx/h2"
 	"golang.org/x/sys/unix"
-
-	"nvelox/core/h2"
 )
 
 // An HTTP/2 stream is one exchange of the fast path: h2stream is its client
