@@ -27,8 +27,12 @@ dockers:
       - --label=org.opencontainers.image.title={{ .ProjectName }}
       - --label=org.opencontainers.image.version={{ .Tag }}
       - --label=org.opencontainers.image.revision={{ .FullCommit }}
+      - --label=org.opencontainers.image.licenses=LicenseRef-PolyForm-Internal-Use-1.0.0
     extra_files:
       - nvelox.example.yaml
+      - LICENSE
+      - NOTICE
+      - THIRD_PARTY_NOTICES.md
   - image_templates:
       - ghcr.io/nvelox/nvelox:{{ .Tag }}-arm64
       - ghcr.io/nvelox/nvelox:{{ .Major }}.{{ .Minor }}-arm64
@@ -39,8 +43,12 @@ dockers:
       - --label=org.opencontainers.image.title={{ .ProjectName }}
       - --label=org.opencontainers.image.version={{ .Tag }}
       - --label=org.opencontainers.image.revision={{ .FullCommit }}
+      - --label=org.opencontainers.image.licenses=LicenseRef-PolyForm-Internal-Use-1.0.0
     extra_files:
       - nvelox.example.yaml
+      - LICENSE
+      - NOTICE
+      - THIRD_PARTY_NOTICES.md
     goarch: arm64
 
 docker_manifests:
@@ -69,6 +77,12 @@ archives:
       {{- .Os }}_
       {{- .Arch }}
       {{- if .Arm }}v{{ .Arm }}{{ end }}
+    # The license texts travel with every archive.
+    files:
+      - LICENSE
+      - NOTICE
+      - THIRD_PARTY_NOTICES.md
+      - README.md
 
 checksum:
   name_template: 'checksums.txt'

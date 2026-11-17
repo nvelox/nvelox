@@ -4,6 +4,7 @@ RUN apk add --no-cache ca-certificates tzdata mailcap
 RUN addgroup -S nvelox && adduser -S nvelox -G nvelox
 COPY nvelox /usr/local/bin/nvelox
 COPY nvelox.example.yaml /etc/nvelox/nvelox.conf
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /usr/share/licenses/nvelox/
 RUN mkdir -p /etc/nvelox/config.d /var/log/nvelox \
     && chown -R nvelox:nvelox /etc/nvelox /var/log/nvelox
 USER nvelox

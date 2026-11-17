@@ -1,0 +1,14 @@
+nvelox
+Copyright (c) 2025-2026 Nvelox
+
+From version 2.0.0-rc.2 on, nvelox is licensed under the PolyForm Internal Use
+License 1.0.0: see the file LICENSE, or
+https://polyformproject.org/licenses/internal-use/1.0.0
+
+Earlier versions were released under the MIT License. That license
+continues to apply to those versions.
+
+The nvelox binaries and images contain the event-loop engine of nvelox
+(github.com/nvelox/ngx, Copyright (c) Nvelox, all rights reserved), which
+is licensed to you as part of them under the same terms, and third-party
+software under its own licenses: see THIRD_PARTY_NOTICES.md.

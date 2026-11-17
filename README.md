@@ -1,4 +1,4 @@
-![License](https://img.shields.io/github/license/nvelox/nvelox)
+![License](https://img.shields.io/badge/license-PolyForm%20Internal%20Use%201.0.0-blue)
 ![Go Version](https://img.shields.io/github/go-mod/go-version/nvelox/nvelox)
 ![Latest Release](https://img.shields.io/github/v/release/nvelox/nvelox?include_prereleases&label=latest%20release&color=blue)
 ![Build Status](https://github.com/nvelox/nvelox/actions/workflows/release.yml/badge.svg)
@@ -453,4 +453,11 @@ proxy/               — PROXY Protocol v2
 
 ## License
 
-MIT License.
+nvelox is source-available: the code is public, and from version 2.0.0-rc.2 it is licensed under the
+[PolyForm Internal Use License 1.0.0](LICENSE). In short (the license text is what counts):
+
+- You may use nvelox, and change it, for the internal business operations of you and your company, free of charge.
+- You may not distribute it, changed or unchanged.
+
+Versions up to 1.3.0 were released under the MIT License, which continues to apply to those versions. The licenses
+of the third-party software in the binaries and images are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

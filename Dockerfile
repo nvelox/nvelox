@@ -42,6 +42,9 @@ COPY --from=builder /app/nvelox /usr/local/bin/nvelox
 # Copy Example Config as Default
 COPY nvelox.example.yaml /etc/nvelox/nvelox.conf
 
+# The license texts travel with the image
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /usr/share/licenses/nvelox/
+
 # Create Config and Log Directories
 RUN mkdir -p /etc/nvelox/config.d && \
     mkdir -p /var/log/nvelox && \
