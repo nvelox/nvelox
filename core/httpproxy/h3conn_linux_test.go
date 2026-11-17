@@ -23,9 +23,9 @@ import (
 	"time"
 
 	"nvelox/config"
-	"nvelox/core/h3"
 	"nvelox/lb"
 
+	"github.com/nvelox/ngx/h3"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2/hpack"

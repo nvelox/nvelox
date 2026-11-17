@@ -13,11 +13,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nvelox/ngx/h2"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 
 	"nvelox/config"
-	"nvelox/core/h2"
 )
 
 // fuzzFields turns fuzz input into a field list: each field is a length

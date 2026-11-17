@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"github.com/nvelox/ngx"
+	"github.com/nvelox/ngx/h2"
 	"golang.org/x/sys/unix"
 
-	"nvelox/core/h2"
 	"nvelox/core/logging"
 )
 

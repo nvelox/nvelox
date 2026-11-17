@@ -11,7 +11,7 @@ import (
 	"io"
 	"net"
 
-	"nvelox/core/h3"
+	"github.com/nvelox/ngx/h3"
 )
 
 // slowRequest starts a request the loops do not serve. One that breaks a

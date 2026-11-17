@@ -16,11 +16,11 @@ import (
 	"sync"
 	"testing"
 
+	nvquic "github.com/nvelox/ngx/quic"
 	"nvelox/config"
-	"nvelox/core/h3"
 	"nvelox/core/logging"
-	nvquic "nvelox/core/quic"
 
+	"github.com/nvelox/ngx/h3"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/quicvarint"
 	"golang.org/x/sys/unix"

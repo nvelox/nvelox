@@ -3,7 +3,7 @@
 package httpproxy
 
 // HTTP/3 on the event loops: the fast path's exchange core on QUIC streams
-// (quicloop_linux.go, core/quic), with the wire format of core/h3. A
+// (quicloop_linux.go, ngx/quic), with the wire format of ngx/h3. A
 // request stream is to the exchange core what an HTTP/2 stream is
 // (h2stream_linux.go), and the request head goes through the same header
 // block rules (h2req.go).
@@ -17,14 +17,14 @@ import (
 	"time"
 
 	"github.com/nvelox/ngx"
+	"github.com/nvelox/ngx/h3"
+	"github.com/nvelox/ngx/quic"
 
-	"nvelox/core/h3"
 	"nvelox/core/logging"
-	"nvelox/core/quic"
 )
 
 // h3OnLoops serves a group's HTTP/3 from the event loops, on nvelox's own
-// QUIC transport (core/quic), in place of the quic-go server, which serves
+// QUIC transport (ngx/quic), in place of the quic-go server, which serves
 // it where there are no event loops. A variable for the tests, which also
 // run what the quic-go server does: nothing else sets it.
 var h3OnLoops = true
@@ -40,7 +40,7 @@ const (
 	// connection, and per unidirectional stream. With them alone an
 	// upload moves no more than a mebibyte per round trip; how far the
 	// first two grow for an upload that its backend takes as fast as
-	// the path brings it (core/quic, the receive windows) is the
+	// the path brings it (ngx/quic, the receive windows) is the
 	// configuration's: server.http3.max_stream_receive_window and
 	// max_connection_receive_window, by default the quic-go server's
 	// numbers.

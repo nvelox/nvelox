@@ -23,7 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"nvelox/core/h2"
+	"github.com/nvelox/ngx/h2"
 )
 
 // The bridge: a request of an HTTP/2 connection that the event loops do not
