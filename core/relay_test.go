@@ -15,8 +15,6 @@ import (
 	"testing"
 	"time"
 	"unsafe"
-
-	"github.com/pires/go-proxyproto"
 )
 
 // tcpPair returns the two ends of a fresh loopback TCP connection.
@@ -307,49 +305,4 @@ func TestRelayL4_BackendResetAborts(t *testing.T) {
 	if _, err := readAllWithin(t, f.client, 2*time.Second); isTimeout(err) {
 		t.Fatal("client not released after backend reset")
 	}
-}
-
-func TestReadInboundProxyV2(t *testing.T) {
-	realClient := &net.TCPAddr{IP: net.ParseIP("203.0.113.7"), Port: 4242}
-	dst := &net.TCPAddr{IP: net.ParseIP("198.51.100.1"), Port: 443}
-	var hdr bytes.Buffer
-	if _, err := proxyproto.HeaderProxyFromAddrs(2, realClient, dst).WriteTo(&hdr); err != nil {
-		t.Fatal(err)
-	}
-
-	t.Run("header split across writes, payload kept", func(t *testing.T) {
-		a, b := tcpPair(t)
-		go func() {
-			raw := hdr.Bytes()
-			a.Write(raw[:5])
-			time.Sleep(20 * time.Millisecond)
-			a.Write(append(append([]byte{}, raw[5:]...), "payload"...))
-		}()
-		src, pending, err := readInboundProxyV2(b, b.RemoteAddr(), time.Second)
-		if err != nil || src.String() != realClient.String() || string(pending) != "payload" {
-			t.Fatalf("src=%v pending=%q err=%v", src, pending, err)
-		}
-	})
-	t.Run("raw stream falls back to peer, bytes intact", func(t *testing.T) {
-		a, b := tcpPair(t)
-		a.Write([]byte("\x16\x03\x01hello"))
-		src, pending, err := readInboundProxyV2(b, b.RemoteAddr(), time.Second)
-		if err != nil || src.String() != b.RemoteAddr().String() || string(pending) != "\x16\x03\x01hello" {
-			t.Fatalf("src=%v pending=%q err=%v", src, pending, err)
-		}
-	})
-	t.Run("incomplete header times out to peer, bytes intact", func(t *testing.T) {
-		a, b := tcpPair(t)
-		a.Write(hdr.Bytes()[:10])
-		src, pending, err := readInboundProxyV2(b, b.RemoteAddr(), 100*time.Millisecond)
-		if err != nil || src.String() != b.RemoteAddr().String() || !bytes.Equal(pending, hdr.Bytes()[:10]) {
-			t.Fatalf("src=%v pending=%q err=%v", src, pending, err)
-		}
-		// The read deadline must be cleared for the relay afterwards.
-		go a.Write([]byte("z"))
-		one := make([]byte, 1)
-		if _, err := b.Read(one); err != nil {
-			t.Fatalf("conn unusable after header wait: %v", err)
-		}
-	})
 }

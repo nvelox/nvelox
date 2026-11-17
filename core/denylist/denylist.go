@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -74,7 +75,18 @@ type Dynamic struct {
 	subMu   sync.Mutex
 	subs    map[int]func() // OnAdd callbacks
 	nextSub int
+
+	// size is len(exact)+len(ranges), kept under mu, so that Empty can
+	// answer without the lock.
+	size atomic.Int64
 }
+
+// syncSize records the entry count; d.mu held for writing.
+func (d *Dynamic) syncSize() { d.size.Store(int64(len(d.exact) + len(d.ranges))) }
+
+// Empty reports whether the list holds no entry (expired ones included):
+// when it does, Blocked is false for every address.
+func (d *Dynamic) Empty() bool { return d.size.Load() == 0 }
 
 // Entry is the public view of a denylist row (List / admin API).
 type Entry struct {
@@ -133,6 +145,7 @@ func (d *Dynamic) add(ipOrCIDR string, ttl time.Duration) (Entry, error) {
 		ones, bits := ipnet.Mask.Size()
 		d.mu.Lock()
 		defer d.mu.Unlock()
+		defer d.syncSize()
 		if ones == bits { // /32 or /128 → single host
 			key := ip.String()
 			d.exact[key] = entry{cidr: key, expiresAt: exp}
@@ -147,6 +160,7 @@ func (d *Dynamic) add(ipOrCIDR string, ttl time.Duration) (Entry, error) {
 		key := ip.String()
 		d.mu.Lock()
 		defer d.mu.Unlock()
+		defer d.syncSize()
 		d.exact[key] = entry{cidr: key, expiresAt: exp}
 		return Entry{CIDR: key, ExpiresAt: expPtr(exp)}, nil
 	}
@@ -216,6 +230,7 @@ func (d *Dynamic) Remove(ipOrCIDR string) bool {
 	ipOrCIDR = strings.TrimSpace(ipOrCIDR)
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	defer d.syncSize()
 	if ip, ipnet, err := net.ParseCIDR(ipOrCIDR); err == nil {
 		ones, bits := ipnet.Mask.Size()
 		if ones == bits {
@@ -277,6 +292,7 @@ func (d *Dynamic) Sweep() int {
 	now := time.Now()
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	defer d.syncSize()
 	removed := 0
 	for k, e := range d.exact {
 		if !e.expiresAt.IsZero() && !now.Before(e.expiresAt) {

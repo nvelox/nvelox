@@ -21,13 +21,9 @@ import (
 // queue — see relay.go. UDP stays on nbio (no half-close there).
 
 // inboundProxyHeaderWait bounds how long a TRUSTED peer (accept_proxy_from)
-// gets to deliver its inbound PROXY-v2 header before nvelox falls back to the
-// peer address (unchanged from the previous data path).
+// gets to deliver its inbound PROXY-v2 header; its connection is closed
+// when the header is not complete by then.
 const inboundProxyHeaderWait = 5 * time.Second
-
-// maxInboundProxyHeaderBuf caps what is read while waiting for that header
-// (a v2 header is at most 16+65535 bytes).
-const maxInboundProxyHeaderBuf = 1 << 20
 
 type tcpListener struct {
 	ln net.Listener
@@ -91,7 +87,7 @@ func (e *Engine) dialL4Backend(target string, timeout time.Duration) (net.Conn, 
 // nbio TCP engine's Stop closed every TCP conn) and the drain fast.
 func (e *Engine) closeL4Conns() {
 	e.l4Conns.Range(func(k, _ any) bool {
-		k.(net.Conn).Close()
+		k.(io.Closer).Close()
 		return true
 	})
 }
@@ -163,30 +159,22 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 		}
 	}()
 
-	// Determine the real client. For a trusted peer, read its inbound PROXY-v2
-	// header off the stream BEFORE dialing, so the access policy runs on the
-	// client it names; payload bytes read past it are forwarded first.
+	// Determine the real client. A trusted peer's connection must start
+	// with its PROXY-v2 header, read off the stream BEFORE dialing (and not
+	// one byte past it), so the access policy runs on the client it names:
+	// the relay itself for a LOCAL header. A relay's connection without a
+	// valid header (and, with accept_proxy_key_file, a valid signature) is
+	// closed: the relay is never taken for the client of what it relays.
 	// Untrusted peers skip this entirely (a forged header can never spoof).
-	// A trusted peer that sends no header is itself the client.
 	src := clientConn.RemoteAddr()
-	var pending []byte
 	if peerTrusted {
-		var err error
-		var hdr *proxyproto.Header
-		hdr, src, pending, err = readInboundProxyV2Header(clientConn, src, inboundProxyHeaderWait)
-		if err != nil {
-			sessErr = err
+		named, reason, cause := l.proxyTrust.relayClient(clientConn, inboundProxyHeaderWait)
+		if reason != "" {
+			e.proxyRefused(l, clientConn.RemoteAddr(), reason, cause)
+			sessErr = cause
 			return
 		}
-		// With accept_proxy_key_file a header that names a client must be
-		// signed; the connection is refused otherwise.
-		if hdr != nil {
-			if err := l.proxyTrust.verify(hdr, nil, false); err != nil {
-				logging.Warn("[PROXY] listener %s: refusing %s: %v", l.Name, clientConn.RemoteAddr(), err)
-				sessErr = err
-				return
-			}
-		}
+		src = named
 		realClientIP = ipStrOf(src)
 		clientResolved = true
 		e.setL4Client(clientConn, ipOf(src))
@@ -261,13 +249,6 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 			return
 		}
 	}
-	if len(pending) > 0 {
-		if _, err := backendConn.Write(pending); err != nil {
-			logging.Error("Failed to flush buffer: %v", err)
-			sessErr = err
-			return
-		}
-	}
 
 	realClientIP = ipStrOf(src)
 	clientResolved = true
@@ -277,44 +258,4 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 
 	res := relayL4(clientConn, backendConn, l4IdleTimeout(l))
 	sessErr = res.Err
-}
-
-// readInboundProxyV2 reads a TRUSTED peer's inbound PROXY-v2 header off the
-// raw stream, waiting at most wait. It returns the real client (fallback when
-// the stream is not PROXY-v2, carries a LOCAL/malformed header, or the header
-// never completes) plus any bytes read past the header, which the caller must
-// forward to the backend before relaying.
-func readInboundProxyV2(c net.Conn, fallback net.Addr, wait time.Duration) (net.Addr, []byte, error) {
-	_, src, rest, err := readInboundProxyV2Header(c, fallback, wait)
-	return src, rest, err
-}
-
-// readInboundProxyV2Header is readInboundProxyV2 also returning the parsed
-// header (nil when the client is the fallback) for a signature check.
-func readInboundProxyV2Header(c net.Conn, fallback net.Addr, wait time.Duration) (*proxyproto.Header, net.Addr, []byte, error) {
-	c.SetReadDeadline(time.Now().Add(wait))
-	defer c.SetReadDeadline(time.Time{})
-	var buf []byte
-	tmp := make([]byte, 4096)
-	for {
-		n, err := c.Read(tmp)
-		buf = append(buf, tmp[:n]...)
-		if done, hdr, consumed := tryParseInboundProxyV2Header(buf); done {
-			if hdr == nil {
-				return nil, fallback, buf[consumed:], nil
-			}
-			return hdr, hdr.SourceAddr, buf[consumed:], nil
-		}
-		if err != nil {
-			if isTimeout(err) || errors.Is(err, io.EOF) {
-				// Header never completed (or the peer half-closed first): fall
-				// back to the peer address and forward the bytes intact.
-				return nil, fallback, buf, nil
-			}
-			return nil, nil, nil, err
-		}
-		if len(buf) >= maxInboundProxyHeaderBuf {
-			return nil, fallback, buf, nil
-		}
-	}
 }

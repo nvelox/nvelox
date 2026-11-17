@@ -15,21 +15,22 @@ import (
 // datagram's destination address does not say where a packet from the network
 // arrived (Linux accepts packets for any local address on any interface), so
 // each listed interface gets sockets bound to it (SO_BINDTODEVICE): the kernel
-// hands them only packets that arrived on that interface. Those sockets run in
-// a UDP engine of their own, whose sessions are known to have arrived on a
-// listed interface; a datagram claiming a relay's source address that arrives
-// elsewhere lands on the listener's ordinary socket and is a direct client.
+// hands them only packets that arrived on that interface. The sessions of
+// those sockets are known to have arrived on a listed interface; a datagram
+// claiming a relay's source address that arrives elsewhere lands on the
+// listener's ordinary socket and is a direct client.
 //
-// The interface-bound sockets and the listener's own socket share the port
-// (SO_REUSEADDR), and Linux lets any program on the machine bind a UDP port
-// shared that way: the docs ask for a privileged port or a machine (container,
-// VM) of nvelox's own.
+// The interface-bound sockets and the listener's own socket share the port.
+// On the event loops (udpfast_linux.go) with SO_REUSEPORT, which only a
+// socket of the same user can join. With nbio (listenShared, listenDevice;
+// tests only on Linux, where the interfaces are supported) with
+// SO_REUSEADDR, which lets any program on the machine bind the port.
 
 // udpInterfacePlan is what planUDPInterfaces decides at startup.
 type udpInterfacePlan struct {
 	deviceAddrs []string          // interface-bound sockets (the interface engine)
 	deviceOf    map[string]string // their local address -> interface name
-	sharedPorts map[int]bool      // ports whose sockets share the port (SO_REUSEADDR)
+	sharedPorts map[int]bool      // ports whose sockets share the port
 	onDevice    map[string]bool   // listener addresses whose own socket is interface-bound
 }
 

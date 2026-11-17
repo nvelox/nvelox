@@ -48,11 +48,14 @@ docker_manifests:
     image_templates:
       - ghcr.io/nvelox/nvelox:{{ .Tag }}-amd64
       - ghcr.io/nvelox/nvelox:{{ .Tag }}-arm64
+  # The two moving tags below are not pushed for a pre-release tag.
   - name_template: ghcr.io/nvelox/nvelox:{{ .Major }}.{{ .Minor }}
+    skip_push: auto
     image_templates:
       - ghcr.io/nvelox/nvelox:{{ .Major }}.{{ .Minor }}-amd64
       - ghcr.io/nvelox/nvelox:{{ .Major }}.{{ .Minor }}-arm64
   - name_template: ghcr.io/nvelox/nvelox:latest
+    skip_push: auto
     image_templates:
       - ghcr.io/nvelox/nvelox:{{ .Tag }}-amd64
       - ghcr.io/nvelox/nvelox:{{ .Tag }}-arm64
@@ -80,6 +83,9 @@ snapshot:
 # release summary in the tag message itself.
 release:
   name_template: "{{.ProjectName}} {{.Tag}}"
+  # A tag with a pre-release part (v2.0.0-rc.1) is published as a
+  # pre-release: it is not "Latest".
+  prerelease: auto
 
 changelog:
   sort: asc

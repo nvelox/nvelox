@@ -1,6 +1,7 @@
 package core
 
 import (
+	"io"
 	"net"
 	"sync/atomic"
 
@@ -48,7 +49,7 @@ func (e *Engine) closeDenylisted() {
 	}
 	e.l4Conns.Range(func(k, v any) bool {
 		if ip := v.(*l4Client).ip.Load(); ip != nil && blocked(*ip) {
-			go k.(net.Conn).Close()
+			go k.(io.Closer).Close()
 			n++
 		}
 		return true
@@ -78,5 +79,8 @@ func (h *ProxyEventHandler) closeSessionsOf(blocked func(net.IP) bool) int {
 		}
 		return true
 	})
+	if u := h.engine.udpFast; u != nil {
+		n += u.closeSessionsOf(blocked)
+	}
 	return n
 }

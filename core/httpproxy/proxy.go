@@ -196,6 +196,15 @@ func (s *HTTPServer) proxyOnce(out http.ResponseWriter, r *http.Request, rec *st
 	} else if t, ok := s.plainTransports[u.backendName]; ok {
 		transport = t
 	}
+	if be := s.Backends[u.backendName]; sendsProxy(be) {
+		// The backend's connections start with one client's PROXY header:
+		// the request goes over the ones of its own client connection
+		// (proxysend.go). Without one to name, it is not sent at all.
+		transport = clientBackendsOf(r.Context()).transport(r.Context(), s, u.backendName, transport, be.SendProxyKey)
+		if transport == nil {
+			return outcomeBadGateway, errNoProxyClient
+		}
+	}
 
 	var (
 		connStarted atomic.Bool // the transport began getting a connection
@@ -246,6 +255,18 @@ func (s *HTTPServer) proxyOnce(out http.ResponseWriter, r *http.Request, rec *st
 				return errRetryStatus
 			}
 			report(true)
+			// The headers ServeHTTP set on every response. ReverseProxy
+			// clears the response header map after it forwards a 1xx
+			// (103 Early Hints), which dropped them from the final
+			// response; set again, they are back (Set: no duplicates).
+			h := out.Header()
+			h.Set("X-Content-Type-Options", "nosniff")
+			if s.altSvcHeader != "" {
+				h.Set("Alt-Svc", s.altSvcHeader)
+			}
+			if u.reqIDOn {
+				h.Set(requestIDHeader, u.reqID)
+			}
 			applyResponseHeaders(resp.Header, &s.Listener.Headers)
 			if u.routeHeaders != nil {
 				applyResponseHeaders(resp.Header, u.routeHeaders)
@@ -276,8 +297,14 @@ func (s *HTTPServer) proxyOnce(out http.ResponseWriter, r *http.Request, rec *st
 			}
 		},
 	}
+	// The body is copied through a pooled buffer: one of the listener's
+	// buffering.response_buffer size when it sets one, else one of the
+	// shared 32 KiB buffers. Without a pool ReverseProxy allocates the
+	// buffer anew for every response.
 	if s.BufferPool != nil {
 		proxy.BufferPool = s.BufferPool
+	} else {
+		proxy.BufferPool = sharedBuffers{}
 	}
 
 	trace := &httptrace.ClientTrace{

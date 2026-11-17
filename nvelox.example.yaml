@@ -20,6 +20,64 @@ server:
   # group: "nvelox"
   # pid_file / workers are accepted but not implemented (no pid file, one
   # process); setting them prints a startup WARNING.
+  # shutdown_timeout: how long a stop (SIGINT or SIGTERM) lets the HTTP
+  # requests in flight finish; what is left then is closed. Nothing new is
+  # accepted on the HTTP ports meanwhile, so this is also the longest that a
+  # request which does not end (an event stream, a long download) can hold
+  # up a restart. Where another instance takes the traffic meanwhile a long
+  # wait costs nothing; a single instance may want a short one. A duration
+  # greater than 0, default "10s"; a reload applies it. A second signal
+  # ends nvelox at once.
+  # shutdown_timeout: "10s"
+  # http3: the limits of HTTP/3 connections, for every listener with
+  # `http3: true`. Each is a size: a whole number with B, KB, MB or GB
+  # (KB is 1024 bytes). Zero is not taken. Not set, each has the default
+  # shown. A reload applies them: the two totals at once, socket_buffer to
+  # the bind addresses started after it, the others to the connections
+  # opened after it.
+  # http3:
+  #   # The largest header section a request may have; a larger one is
+  #   # answered 431. A connection may have 100 requests open, and so hold
+  #   # 100 heads that are on their way: 6.4 MiB with 64KB, 100 MiB with
+  #   # 1MB. 1KB to 1MB. (HTTP/1.1 and HTTP/2 take 1 MiB.)
+  #   max_header_size: "64KB"
+  #   # The most one connection holds of answers its client has not
+  #   # acknowledged yet. What a connection holds follows what its path
+  #   # carries, up to this, so it is also the most a download moves per
+  #   # round trip: 16MB holds back no path, 4MB holds a download over a
+  #   # path of 100 ms to about 270 Mbit/s. 256KB to 1GB.
+  #   max_send_buffer: "16MB"
+  #   # How far the windows for what a client sends grow: for one request's
+  #   # body, and for all the requests of a connection together. Each
+  #   # starts at 1 MiB and doubles while the backend takes an upload as
+  #   # fast as the path brings it. They are the most an upload moves per
+  #   # round trip, and the most nvelox holds for a connection whose
+  #   # backend stops taking. A request's window grows only while the
+  #   # connection's can be one and a half times as large. 1MB (nothing
+  #   # grows) to 1GB.
+  #   max_stream_receive_window: "6MB"
+  #   max_connection_receive_window: "15MB"
+  #   # For all HTTP/3 connections together: what they hold to send, and
+  #   # what they are granted beyond their first receive windows. Past the
+  #   # first a connection takes 16 KiB at a time; past the second no
+  #   # window grows. 1MB to 1024GB. Not set: an eighth of the memory
+  #   # nvelox may use (the machine's, or its control group's limit), and
+  #   # 64 MiB at the least.
+  #   max_send_memory: "2GB"
+  #   max_receive_memory: "2GB"
+  #   # What nvelox asks the kernel for as the receive and as the send
+  #   # buffer of each UDP socket of an HTTP/3 listener (one socket per
+  #   # event loop). A burst of a fast client's datagrams waits there
+  #   # until nvelox reads it; what does not fit is dropped, which slows
+  #   # an upload down. The kernel grants up to net.core.rmem_max and
+  #   # wmem_max (208 KiB each unless they were raised), and all of it to
+  #   # a process started with CAP_NET_ADMIN. A listener whose sockets got
+  #   # less says so in a startup WARNING. 64KB to 64MB.
+  #   socket_buffer: "4MB"
+  #   # max_send_buffer, the two totals and socket_buffer belong to the
+  #   # QUIC transport nvelox runs on Linux. On other platforms they change
+  #   # nothing (a startup WARNING says so) and the other three are read
+  #   # when a bind address starts.
 
 # ─── Logging ───────────────────────────────────────────────
 # Log files are created 0640 in 0750 directories (an existing file is
@@ -110,6 +168,11 @@ listeners:
     bind: ":443"
     protocol: "https"
     http3: true  # QUIC on same port, advertises Alt-Svc
+    #   HTTP/3 does not take 0-RTT: the first request of a resumed connection
+    #   waits for the handshake, so a captured request cannot be replayed as
+    #   early data. A request header section above 64 KiB is answered 431
+    #   over HTTP/3 (HTTP/1.1 and HTTP/2 keep their 1 MiB limit); that and
+    #   the other limits of HTTP/3 connections are settings: server.http3.
     backend: "web-cluster"
     # Multiple HTTPS listeners may share the same `bind:` — see the
     # "Multi-server-per-port" section below for how SNI + server_names
@@ -143,14 +206,35 @@ listeners:
     #   makes every IP-based control forgeable; prefer externalTrafficPolicy:
     #   Local and/or firewall the listener to the proxy.
     # accept_proxy_from: ["10.50.0.0/16"]
-    #   L4 inbound PROXY-protocol-v2 trust (tcp, https-passthrough and udp
+    #   Inbound PROXY-protocol-v2 trust (tcp, udp, http and https
     #   listeners). For peers in these CIDRs, nvelox parses the inbound
-    #   PROXY-v2 header and uses its source as the real client (then forwards
-    #   it via send_proxy_v2 to the backend). Peers OUTSIDE the list have any
-    #   inbound PROXY header IGNORED and are the client themselves. Empty
-    #   (default) = trust nobody. Use this behind a relay (another nvelox,
-    #   HAProxy, a load balancer) that prepends a PROXY-v2 header, to keep the
-    #   real client IP across the hop.
+    #   PROXY-v2 header and uses its source as the real client. Peers OUTSIDE
+    #   the list have any inbound PROXY header IGNORED and are the client
+    #   themselves. Empty (default) = trust nobody. Use this behind a relay
+    #   (another nvelox, HAProxy, a load balancer) that prepends a PROXY-v2
+    #   header, to keep the real client IP across the hop.
+    #   A listed peer MUST send the header: first on every connection (tcp,
+    #   http and https listeners; a LOCAL header for the relay's own
+    #   traffic, such as health checks) and in every datagram (udp). A
+    #   connection that starts with anything else, or with a header that
+    #   does not parse, is closed and counted
+    #   (nvelox_proxy_header_rejected_total); a datagram without a valid
+    #   header is dropped. A listed peer is never taken for the client of
+    #   what it relays.
+    #   tcp and udp listeners: the client is passed on to the backend with
+    #   send_proxy_v2.
+    #   http and https listeners (HTTP/1.1 and HTTP/2): the header comes
+    #   before TLS. The client it names is the client for the access log,
+    #   ip_allowlist, ip_denylist, ip_rate_limit, acl and X-Forwarded-For;
+    #   trusted_proxies is matched against that client too, so a relay is
+    #   not listed there. Listeners that share a port set the same
+    #   accept_proxy_from and accept_proxy_key_file.
+    #   https listeners with http3: a UDP relay puts the header in front of
+    #   every datagram, signed (accept_proxy_key_file is required with
+    #   http3). On Linux a reload that changes accept_proxy_from holds for
+    #   HTTP/3 at once, as for HTTP/1.1 and HTTP/2; on other platforms
+    #   HTTP/3 takes it from the next restart, so start the listener with
+    #   it set there.
     #   TCP: the handshake proves the peer's address, so only a listed peer
     #   can supply a header. UDP: a datagram's source address can be forged,
     #   so anyone who can send packets claiming a listed address can name any
@@ -161,8 +245,8 @@ listeners:
     #   A trusted peer's PROXY header must carry a valid signature made with
     #   one of these keys (one per line, at least 32 characters, e.g.
     #   `openssl rand -hex 32`; "#" comments; chmod 600). An unsigned or
-    #   wrongly signed header refuses the TCP connection / drops the UDP
-    #   datagram; a peer that sends no header is itself the client. The
+    #   wrongly signed header refuses the TCP or HTTP connection / drops the
+    #   UDP datagram. The
     #   sending nvelox signs with send_proxy_key_file. Rotation without a
     #   restart: add the new key on the receivers (SIGHUP), put it first on
     #   the senders (SIGHUP), then remove the old key from the receivers.
@@ -173,13 +257,13 @@ listeners:
     #   addressed to one of its addresses. A datagram claiming a listed
     #   address that arrives on another interface is an ordinary client
     #   datagram. For relays that cannot sign their headers.
-    #   The listener shares its port with sockets bound to these interfaces,
-    #   and any program on the machine can bind a UDP port shared that way:
-    #   where other users or services run on the machine, use a port below
-    #   1024 (only privileged programs bind those) or run nvelox alone in its
-    #   own container or VM. A program on this machine can also send from
-    #   the machine's own addresses, and such a datagram counts as arriving
-    #   on the interface that has the address: keep this machine's addresses
+    #   The listener shares its port with sockets bound to these interfaces
+    #   (SO_REUSEPORT): only a program running as the same user as the one
+    #   nvelox was started by can bind such a port too (root, when nvelox
+    #   starts as root and switches to server.user). A program on this
+    #   machine can also send from the machine's own addresses, and such a
+    #   datagram counts as arriving on the interface that has the address:
+    #   keep this machine's addresses
     #   out of accept_proxy_from (a startup WARNING names them), and where
     #   untrusted programs run here use accept_proxy_key_file instead. The
     #   interfaces and their addresses are read at start: restart nvelox
@@ -435,6 +519,14 @@ backends:
     #   - TCP backends: header sent once per connection (STREAM variant).
     #   - UDP backends: header prepended to each datagram (DGRAM variant)
     #     so QUIC/HTTP3 backends can recover the client IP per packet.
+    #   - HTTP backends (http and https listeners, every HTTP version):
+    #     header sent once per backend connection, before the TLS handshake
+    #     of a backend_tls backend. A backend connection then serves one
+    #     client connection only and is closed with it; a client connection
+    #     keeps as many idle ones as it had in use at the same time in the
+    #     last seconds, at least four. HTTP health checks send a LOCAL
+    #     header (TCP checks send nothing). The backend must expect the
+    #     header on every connection.
     send_proxy_v2: false
     # send_proxy_key_file: "/etc/nvelox/proxy.keys"  # sign the header (with
     #   the first key) for a receiver that sets accept_proxy_key_file; for
@@ -500,6 +592,9 @@ backends:
     #   ca_cert: "/etc/ssl/ca.pem"
     #   client_cert: "/etc/ssl/client.pem"       # mTLS to backend
     #   client_key:  "/etc/ssl/client.key"       # both or neither
+    #   server_name: "app.internal"              # name sent (SNI) and checked on
+    #                                            # the certificate; default: the
+    #                                            # host of the server's address
     #   insecure: false
 
     # DNS service discovery (re-resolve hostnames in `servers:`).

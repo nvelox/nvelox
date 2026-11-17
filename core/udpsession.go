@@ -167,7 +167,9 @@ func newUDPDrops(reg *metrics.Registry) *udpDrops {
 		reg = metrics.Default
 	}
 	d := &udpDrops{reasons: make(map[string]*udpDropReason)}
-	for _, r := range []string{udpDropSessionLimit, udpDropSourceLimit, udpDropNoProxyHeader, udpDropClientChanged} {
+	// Every reason that has a log text: one that is missing here would be
+	// dropped by note without a count or a line.
+	for r := range udpDropText {
 		d.reasons[r] = &udpDropReason{counter: reg.GetCounter("nvelox_udp_dropped_total", map[string]string{"reason": r})}
 	}
 	return d
@@ -176,22 +178,39 @@ func newUDPDrops(reg *metrics.Registry) *udpDrops {
 // note records one drop on listener from who (the client, or the relay for a
 // datagram drop); the log line names the latest one.
 func (d *udpDrops) note(reason, listener string, who net.Addr) {
+	if n, due := d.count(reason); due {
+		logging.Warn("[UDP] %s: dropped %d since the last report (%s) — latest on listener %s from %s",
+			udpDropText[reason], n, reason, listener, ipStrOf(who))
+	}
+}
+
+// noteIP is note for an address already taken apart (nothing is formatted
+// unless a line is due).
+func (d *udpDrops) noteIP(reason, listener string, who netip.Addr) {
+	if n, due := d.count(reason); due {
+		logging.Warn("[UDP] %s: dropped %d since the last report (%s) — latest on listener %s from %s",
+			udpDropText[reason], n, reason, listener, who.Unmap())
+	}
+}
+
+// count counts one drop for reason. due reports that a log line is to be
+// written now, for the n drops since the previous one.
+func (d *udpDrops) count(reason string) (n int64, due bool) {
 	r := d.reasons[reason]
 	if r == nil {
-		return
+		return 0, false
 	}
 	r.counter.Inc()
 	r.pending.Add(1)
 	now := time.Now().UnixNano()
 	last := r.lastLog.Load()
 	if last != 0 && now-last < int64(udpDropLogEvery) {
-		return
+		return 0, false
 	}
 	if !r.lastLog.CompareAndSwap(last, now) {
-		return
+		return 0, false
 	}
-	logging.Warn("[UDP] %s: dropped %d since the last report (%s) — latest on listener %s from %s",
-		udpDropText[reason], r.pending.Swap(0), reason, listener, ipStrOf(who))
+	return r.pending.Swap(0), true
 }
 
 var udpDropText = map[string]string{

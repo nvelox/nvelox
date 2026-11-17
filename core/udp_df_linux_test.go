@@ -17,7 +17,9 @@ import (
 // MTU: Don't Fragment is off (PMTUDISC_DONT) on the socket a UDP session dials to
 // its backend. Runs the real path: engine, UDP listener, send_proxy_v2 backend,
 // a 1,400 B datagram (the payload that was lost through the FIN edge).
-func TestUDPBackendSocketDFOff(t *testing.T) {
+func TestUDPBackendSocketDFOff(t *testing.T) { stUDPEngines(t, udpTestUDPBackendSocketDFOff) }
+
+func udpTestUDPBackendSocketDFOff(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		host  string
@@ -85,34 +87,16 @@ func TestUDPBackendSocketDFOff(t *testing.T) {
 				}
 			}
 
-			// Start assigns e.UDPPool under reloadMu; taking it orders this read after.
-			e.reloadMu.Lock()
-			pool := e.UDPPool
-			e.reloadMu.Unlock()
-			pool.mu.RLock()
-			var conns []net.Conn
-			for _, s := range pool.sessions {
-				conns = append(conns, s.BackendConn)
+			var sessions []stUDPSession
+			for _, s := range stUDPSessions(e) {
+				if s.HasBackend {
+					sessions = append(sessions, s)
+				}
 			}
-			pool.mu.RUnlock()
-			if len(conns) != 1 {
-				t.Fatalf("%d backend sessions, want 1", len(conns))
+			if len(sessions) != 1 {
+				t.Fatalf("%d sessions with a backend socket, want 1", len(sessions))
 			}
-			uc, ok := conns[0].(*net.UDPConn)
-			if !ok {
-				t.Fatalf("backend conn is %T, want *net.UDPConn", conns[0])
-			}
-			raw, err := uc.SyscallConn()
-			if err != nil {
-				t.Fatal(err)
-			}
-			var v int
-			var gerr error
-			if err := raw.Control(func(fd uintptr) {
-				v, gerr = syscall.GetsockoptInt(int(fd), tc.level, tc.opt)
-			}); err != nil {
-				t.Fatal(err)
-			}
+			v, gerr := sessions[0].BackendSockopt(tc.level, tc.opt)
 			if gerr != nil || v != tc.want {
 				t.Fatalf("MTU_DISCOVER = %d (%v), want PMTUDISC_DONT (%d)", v, gerr, tc.want)
 			}

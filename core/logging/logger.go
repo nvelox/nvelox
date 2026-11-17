@@ -5,7 +5,9 @@ import (
 	"io"
 	"log"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"unicode/utf8"
 )
@@ -86,7 +88,26 @@ type loggerState struct {
 	// inside them (log rotation).
 	accessFile *logFile
 	errorFile  *logFile
+	// accessW is what accessLog writes to: accessFile, or stdout behind a
+	// mutex. AccessHTTP and WriteAccess write whole lines to it directly.
+	accessW io.Writer
 }
+
+// lockedWriter serializes writes to a shared stream (stdout), so that lines
+// written through it are never interleaved.
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+// stdoutAccess is the access log's destination when it has no file.
+var stdoutAccess = &lockedWriter{w: os.Stdout}
 
 // current holds the active logger state. Init swaps a fresh state in
 // atomically; all read helpers take a snapshot pointer with Load.
@@ -96,7 +117,8 @@ func init() {
 	// Safe defaults so logging doesn't panic if a helper is called before
 	// Init (e.g. unit-test paths that forget to init).
 	current.Store(&loggerState{
-		accessLog: log.New(os.Stdout, "", 0),
+		accessLog: log.New(stdoutAccess, "", 0),
+		accessW:   stdoutAccess,
 		errorLog:  log.New(os.Stderr, "", log.LstdFlags),
 		level:     WarnLevel,
 	})
@@ -166,7 +188,7 @@ func Init(logLevel string, accessPath, errorPath string) error {
 	next.errorLog = log.New(errWriter, "", log.LstdFlags) // Prefix handled in helpers
 
 	// Setup Access Log
-	var accessWriter io.Writer = os.Stdout
+	var accessWriter io.Writer = stdoutAccess
 	if accessPath != "" {
 		f, warn, err := openLogFile(accessPath)
 		if err != nil {
@@ -182,6 +204,7 @@ func Init(logLevel string, accessPath, errorPath string) error {
 		accessWriter = next.accessFile // Access log usually file only or stdout
 	}
 	next.accessLog = log.New(accessWriter, "", 0) // Raw format
+	next.accessW = accessWriter
 
 	// Atomic swap: concurrent readers see either the old or the new
 	// state in full — never a torn mix.
@@ -191,6 +214,9 @@ func Init(logLevel string, accessPath, errorPath string) error {
 	}
 	return nil
 }
+
+// Enabled reports whether messages of level l are logged now.
+func Enabled(l Level) bool { return current.Load().level <= l }
 
 func Debug(format string, v ...interface{}) {
 	s := current.Load()
@@ -303,12 +329,79 @@ func escapeQuoted(s string) string {
 // headers ("" when absent) and tls whether it arrived over TLS (HTTPS,
 // including HTTP/3).
 func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes int64, duration float64, backend, userAgent, fetchSite, fetchDest string, tls bool, requestID, site string) {
+	bp := lineBufs.Get().(*[]byte)
+	b := AppendAccessHTTP((*bp)[:0], clientIP, host, method, path, proto, status, bytes, duration, backend, userAgent,
+		fetchSite, fetchDest, tls, requestID, site)
+	WriteAccess(b)
+	*bp = b
+	lineBufs.Put(bp)
+}
+
+var lineBufs = sync.Pool{New: func() any { b := make([]byte, 0, 512); return &b }}
+
+// WriteAccess writes complete access-log lines (each ending in a newline)
+// to the access log in one write.
+func WriteAccess(p []byte) {
+	if len(p) == 0 {
+		return
+	}
+	_, _ = current.Load().accessW.Write(p)
+}
+
+// AppendAccessHTTP appends the line AccessHTTP logs, newline included, to b.
+// The format: CLF-like, then the backend, the User-Agent and trailing
+// key=value tokens.
+//
+// User-Agent is appended as a quoted field; the browser Fetch Metadata
+// (fetch_site, fetch_dest — "-" when absent), the scheme, the correlation id
+// (rid), the gateway identity (gw) and the site/listener name follow as
+// trailing key=value tokens. All are appended LAST so a consumer can treat
+// them as optional and stay back-compatible with the old format; rid, gw and
+// site stay the final three, so a consumer anchored on that tail keeps
+// matching. CRLF-sanitized like the rest; the UA, the Fetch Metadata and an
+// inbound-derived rid are attacker-influenced.
+func AppendAccessHTTP(b []byte, clientIP, host, method, path, proto string, status int, bytes int64, duration float64, backend, userAgent, fetchSite, fetchDest string, tls bool, requestID, site string) []byte {
+	b = AppendAccessHTTPHead(b, clientIP, host, method, path, proto)
+	b = AppendAccessHTTPMid(b, status, bytes, duration, backend)
+	return AppendAccessHTTPTail(b, userAgent, fetchSite, fetchDest, tls, requestID, site)
+}
+
+// AppendAccessHTTPHead appends the part of the AccessHTTP line known when a
+// request arrives, up to the status: `client - host "METHOD path proto" `.
+func AppendAccessHTTPHead(b []byte, clientIP, host, method, path, proto string) []byte {
 	if host == "" {
 		host = "-"
 	}
+	b = appendSanitized(b, clientIP)
+	b = append(b, " - "...)
+	b = appendSanitized(b, host)
+	b = append(b, ' ', '"')
+	b = appendSanitized(b, method)
+	b = append(b, ' ')
+	b = appendQuotedField(b, path)
+	b = append(b, ' ')
+	b = appendSanitized(b, proto)
+	return append(b, '"', ' ')
+}
+
+// AppendAccessHTTPMid appends the outcome part of the AccessHTTP line:
+// `status bytes durationms -> backend`.
+func AppendAccessHTTPMid(b []byte, status int, bytes int64, duration float64, backend string) []byte {
 	if backend == "" {
 		backend = "-"
 	}
+	b = strconv.AppendInt(b, int64(status), 10)
+	b = append(b, ' ')
+	b = strconv.AppendInt(b, bytes, 10)
+	b = append(b, ' ')
+	b = strconv.AppendFloat(b, duration, 'f', 3, 64)
+	b = append(b, "ms -> "...)
+	return appendSanitized(b, backend)
+}
+
+// AppendAccessHTTPTail appends the rest of the AccessHTTP line: the
+// User-Agent and the key=value tokens, then the newline.
+func AppendAccessHTTPTail(b []byte, userAgent, fetchSite, fetchDest string, tls bool, requestID, site string) []byte {
 	if requestID == "" {
 		requestID = "-"
 	}
@@ -319,29 +412,80 @@ func AccessHTTP(clientIP, host, method, path, proto string, status int, bytes in
 	if tls {
 		scheme = "https"
 	}
-	// User-Agent is appended as a quoted field; the browser Fetch Metadata
-	// (fetch_site, fetch_dest — "-" when absent), the scheme, the correlation id
-	// (rid), the gateway identity (gw) and the site/listener name follow as
-	// trailing key=value tokens. All are appended LAST so a consumer can treat
-	// them as optional and stay back-compatible with the old format; rid, gw and
-	// site stay the final three, so a consumer anchored on that tail keeps
-	// matching. CRLF-sanitized like the rest; the UA, the Fetch Metadata and an
-	// inbound-derived rid are attacker-influenced.
-	current.Load().accessLog.Printf("%s - %s \"%s %s %s\" %d %d %.3fms -> %s \"%s\" fetch_site=%s fetch_dest=%s scheme=%s rid=%s gw=%s site=%s",
-		SanitizeLogField(clientIP),
-		SanitizeLogField(host),
-		SanitizeLogField(method),
-		SanitizeLogField(escapeQuoted(path)),
-		SanitizeLogField(proto),
-		status, bytes, duration,
-		SanitizeLogField(backend),
-		SanitizeLogField(escapeQuoted(clipUA(userAgent))),
-		fetchMetaToken(fetchSite),
-		fetchMetaToken(fetchDest),
-		scheme,
-		SanitizeLogField(requestID),
-		SanitizeLogField(gateway()),
-		SanitizeLogField(site))
+	b = append(b, ' ', '"')
+	b = appendQuotedField(b, clipUA(userAgent))
+	b = append(b, "\" fetch_site="...)
+	b = appendFetchMetaToken(b, fetchSite)
+	b = append(b, " fetch_dest="...)
+	b = appendFetchMetaToken(b, fetchDest)
+	b = append(b, " scheme="...)
+	b = append(b, scheme...)
+	b = append(b, " rid="...)
+	b = appendSanitized(b, requestID)
+	b = append(b, " gw="...)
+	b = appendSanitized(b, gateway())
+	b = append(b, " site="...)
+	b = appendSanitized(b, site)
+	return append(b, '\n')
+}
+
+// appendSanitized appends SanitizeLogField(s).
+func appendSanitized(b []byte, s string) []byte {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 0x20 && c != 0x7f:
+			b = append(b, c)
+		case c == '\n':
+			b = append(b, '\\', 'n')
+		case c == '\r':
+			b = append(b, '\\', 'r')
+		case c == '\t':
+			b = append(b, '\\', 't')
+		default:
+			b = append(b, '?')
+		}
+	}
+	return b
+}
+
+// appendQuotedField appends SanitizeLogField(escapeQuoted(s)).
+func appendQuotedField(b []byte, s string) []byte {
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; c {
+		case '"':
+			b = append(b, `\x22`...)
+		case '\\':
+			b = append(b, `\x5C`...)
+		default:
+			b = appendSanitized(b, s[i:i+1])
+		}
+	}
+	return b
+}
+
+// appendFetchMetaToken appends fetchMetaToken(v).
+func appendFetchMetaToken(b []byte, v string) []byte {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return append(b, '-')
+	}
+	if len(v) > maxFetchMetaLen {
+		v = v[:maxFetchMetaLen]
+	}
+	if v == "-" {
+		return append(b, '_')
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-':
+			b = append(b, c)
+		default:
+			b = append(b, '_')
+		}
+	}
+	return b
 }
 
 // AccessL4 logs one raw TCP/UDP connection (or rejection) to the SAME access log

@@ -101,6 +101,10 @@ func dcExpectClosed(t *testing.T, c net.Conn, what string) {
 // tunnel — and leaves another client's open. (The denylist is otherwise
 // checked only when a connection, session or request starts.)
 func TestDenylistAddClosesOpenConnections(t *testing.T) {
+	stUDPEngines(t, udpTestDenylistAddClosesOpenConnections)
+}
+
+func udpTestDenylistAddClosesOpenConnections(t *testing.T) {
 	const blockedIP, otherIP, relayIP = "127.0.0.71", "127.0.0.72", "127.0.0.73"
 	const relayedBlocked, relayedOther = "203.0.113.71", "203.0.113.72"
 	pki := newSTPKI(t, "denyclose")
@@ -182,19 +186,14 @@ func TestDenylistAddClosesOpenConnections(t *testing.T) {
 	dcExpectClosed(t, wsBlocked, "WebSocket tunnel")
 	// The UDP session ends; a datagram from the same socket then starts a new
 	// session, which the denylist refuses.
-	h := stHandler(e)
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		open := false
-		h.sessions.Range(func(_, v any) bool {
-			ctx := v.(*ConnContext)
-			ctx.Mu.Lock()
-			if !ctx.IsBackend && !ctx.closed && ctx.RealClientIP == blockedIP {
+		for _, s := range stUDPSessions(e) {
+			if s.RealClientIP == blockedIP {
 				open = true
 			}
-			ctx.Mu.Unlock()
-			return !open
-		})
+		}
 		if !open {
 			break
 		}

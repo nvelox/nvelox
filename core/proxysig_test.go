@@ -49,7 +49,9 @@ func signedTCPHeader(t *testing.T, c net.Conn, key []byte, client string) {
 	}
 }
 
-func TestSignedProxy_UDPReceiver(t *testing.T) {
+func TestSignedProxy_UDPReceiver(t *testing.T) { stUDPEngines(t, udpTestSignedProxy_UDPReceiver) }
+
+func udpTestSignedProxy_UDPReceiver(t *testing.T) {
 	be, got := stUDPBackend(t, nil)
 	addr := stFreeUDPAddr(t)
 	stStart(t, &config.Config{
@@ -109,9 +111,12 @@ func TestSignedProxy_TCPReceiver(t *testing.T) {
 	if err := stEcho(ok, "hello"); err != nil {
 		t.Fatalf("signed header: %v", err)
 	}
-	// A trusted peer without a header is itself the client (no forgery).
-	if err := stEcho(dial(), "hello"); err != nil {
-		t.Fatalf("relay without a header: %v", err)
+	// A trusted peer without a header is refused: it is never taken for
+	// the client of what it relays.
+	before := accepted.Load()
+	stRefused(t, dial(), "hello")
+	if n := accepted.Load(); n != before {
+		t.Fatalf("a relay's connection without a header reached the backend (%d)", n-before)
 	}
 }
 
@@ -153,7 +158,9 @@ func TestSignedProxy_TLSReceiver(t *testing.T) {
 // TestSignedProxy_Senders: with send_proxy_key_file the header nvelox writes
 // to a TCP backend, and to a UDP backend with every datagram, verifies with
 // the key (over the datagram for UDP).
-func TestSignedProxy_Senders(t *testing.T) {
+func TestSignedProxy_Senders(t *testing.T) { stUDPEngines(t, udpTestSignedProxy_Senders) }
+
+func udpTestSignedProxy_Senders(t *testing.T) {
 	// TCP: a raw backend that reads and keeps the header.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -267,6 +274,10 @@ func TestSignedProxy_KeyRotationByReload(t *testing.T) {
 // keys (a trust change needs a restart), so an unsigned header is still
 // dropped.
 func TestSignedProxy_ReloadChangingTrustKeepsIt(t *testing.T) {
+	stUDPEngines(t, udpTestSignedProxy_ReloadChangingTrustKeepsIt)
+}
+
+func udpTestSignedProxy_ReloadChangingTrustKeepsIt(t *testing.T) {
 	be, got := stUDPBackend(t, nil)
 	addr := stFreeUDPAddr(t)
 	signedCfg := &config.Config{
@@ -292,6 +303,10 @@ func TestSignedProxy_ReloadChangingTrustKeepsIt(t *testing.T) {
 // with an empty payload its signature would otherwise verify — admits no
 // client, and a datagram header at the start of a TCP connection is refused.
 func TestSignedProxy_TransportMustMatch(t *testing.T) {
+	stUDPEngines(t, udpTestSignedProxy_TransportMustMatch)
+}
+
+func udpTestSignedProxy_TransportMustMatch(t *testing.T) {
 	udpBE, _ := stUDPBackend(t, nil)
 	echo, _ := stTCPEchoBackend(t)
 	udpAddr, tcpAddr := stFreeUDPAddr(t), stFreeTCPAddr(t)
@@ -317,15 +332,11 @@ func TestSignedProxy_TransportMustMatch(t *testing.T) {
 	}
 	stUDPExchange("127.0.0.1", udpAddr, raw, 300*time.Millisecond)
 	admitted := false
-	stHandler(e).sessions.Range(func(_, v any) bool {
-		ctx := v.(*ConnContext)
-		ctx.Mu.Lock()
-		if ctx.ClientResolved && ctx.RealClientIP == "198.51.100.92" {
+	for _, s := range stUDPSessions(e) {
+		if s.ClientResolved && s.RealClientIP == "198.51.100.92" {
 			admitted = true
 		}
-		ctx.Mu.Unlock()
-		return true
-	})
+	}
 	if admitted {
 		t.Fatal("a signed stream header replayed as a datagram admitted its client")
 	}
@@ -348,6 +359,10 @@ func TestSignedProxy_TransportMustMatch(t *testing.T) {
 // backend's send_proxy_key_file applies to the datagrams of UDP sessions
 // already running, so the old key can be retired on the receivers.
 func TestSignedProxy_UDPSenderUsesTheCurrentKey(t *testing.T) {
+	stUDPEngines(t, udpTestSignedProxy_UDPSenderUsesTheCurrentKey)
+}
+
+func udpTestSignedProxy_UDPSenderUsesTheCurrentKey(t *testing.T) {
 	be, got := stUDPBackend(t, nil)
 	addr := stFreeUDPAddr(t)
 	mk := func(key []byte) *config.Config {
