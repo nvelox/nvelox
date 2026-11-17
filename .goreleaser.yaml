@@ -1,0 +1,112 @@
+version: 2
+
+project_name: nvelox
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      # {{.Tag}} is "v1.0.0" (with the "v"); {{.Version}} is "1.0.0".
+      # The source default is "dev", so a release binary reports
+      # "nvelox v1.0.0" while a `go build` reports "nvelox dev".
+      - -s -w -X main.Version={{.Tag}}
+
+dockers:
+  - image_templates:
+      - ghcr.io/nvelox/nvelox:{{ .Tag }}-amd64
+      - ghcr.io/nvelox/nvelox:{{ .Major }}.{{ .Minor }}-amd64
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    build_flag_templates:
+      - --platform=linux/amd64
+      - --label=org.opencontainers.image.title={{ .ProjectName }}
+      - --label=org.opencontainers.image.version={{ .Tag }}
+      - --label=org.opencontainers.image.revision={{ .FullCommit }}
+      - --label=org.opencontainers.image.licenses=LicenseRef-PolyForm-Internal-Use-1.0.0
+    extra_files:
+      - nvelox.example.yaml
+      - LICENSE
+      - NOTICE
+      - THIRD_PARTY_NOTICES.md
+  - image_templates:
+      - ghcr.io/nvelox/nvelox:{{ .Tag }}-arm64
+      - ghcr.io/nvelox/nvelox:{{ .Major }}.{{ .Minor }}-arm64
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    build_flag_templates:
+      - --platform=linux/arm64
+      - --label=org.opencontainers.image.title={{ .ProjectName }}
+      - --label=org.opencontainers.image.version={{ .Tag }}
+      - --label=org.opencontainers.image.revision={{ .FullCommit }}
+      - --label=org.opencontainers.image.licenses=LicenseRef-PolyForm-Internal-Use-1.0.0
+    extra_files:
+      - nvelox.example.yaml
+      - LICENSE
+      - NOTICE
+      - THIRD_PARTY_NOTICES.md
+    goarch: arm64
+
+docker_manifests:
+  - name_template: ghcr.io/nvelox/nvelox:{{ .Tag }}
+    image_templates:
+      - ghcr.io/nvelox/nvelox:{{ .Tag }}-amd64
+      - ghcr.io/nvelox/nvelox:{{ .Tag }}-arm64
+  # The two moving tags below are not pushed for a pre-release tag.
+  - name_template: ghcr.io/nvelox/nvelox:{{ .Major }}.{{ .Minor }}
+    skip_push: auto
+    image_templates:
+      - ghcr.io/nvelox/nvelox:{{ .Major }}.{{ .Minor }}-amd64
+      - ghcr.io/nvelox/nvelox:{{ .Major }}.{{ .Minor }}-arm64
+  - name_template: ghcr.io/nvelox/nvelox:latest
+    skip_push: auto
+    image_templates:
+      - ghcr.io/nvelox/nvelox:{{ .Tag }}-amd64
+      - ghcr.io/nvelox/nvelox:{{ .Tag }}-arm64
+
+archives:
+  - format: tar.gz
+    # this name template makes the directory within the archive the name of the binary
+    # (plus the extension)
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Os }}_
+      {{- .Arch }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+    # The license texts travel with every archive.
+    files:
+      - LICENSE
+      - NOTICE
+      - THIRD_PARTY_NOTICES.md
+      - README.md
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  version_template: "{{ .Tag }}-next"
+
+# Release page title and shape. Body content is fed in via the workflow's
+# `--release-notes` flag — see .github/workflows/release.yml. That file
+# pulls the tag's annotation message (`git tag -a vX -m "..."`) into a
+# notes file before goreleaser runs, so operators only need to write the
+# release summary in the tag message itself.
+release:
+  name_template: "{{.ProjectName}} {{.Tag}}"
+  # A tag with a pre-release part (v2.0.0-rc.1) is published as a
+  # pre-release: it is not "Latest".
+  prerelease: auto
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - 'Merge pull request'
+      - 'Merge branch'

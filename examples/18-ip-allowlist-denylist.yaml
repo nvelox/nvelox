@@ -1,0 +1,18 @@
+## 18 — IP Allowlist / Denylist
+## Only allow localhost; deny everything else.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "ip-filter"
+    bind: ":9000"
+    protocol: "http"
+    backend: "backend"
+    ip_allowlist:
+      - "127.0.0.0/8"
+      - "::1/128"
+backends:
+  - name: "backend"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"

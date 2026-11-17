@@ -1,0 +1,10 @@
+nvelox
+Copyright (c) 2025-2026 Nvelox
+
+nvelox is licensed under the PolyForm Internal Use License 1.0.0: see the
+file LICENSE, or https://polyformproject.org/licenses/internal-use/1.0.0
+
+The nvelox binaries and images contain the ngx engine
+(github.com/nvelox/ngx, Copyright (c) Nvelox, all rights reserved), which
+is licensed to you as part of them under the same terms, and third-party
+software under its own licenses: see THIRD_PARTY_NOTICES.md.

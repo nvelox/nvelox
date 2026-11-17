@@ -1,0 +1,463 @@
+![License](https://img.shields.io/badge/license-PolyForm%20Internal%20Use%201.0.0-blue)
+![Go Version](https://img.shields.io/github/go-mod/go-version/nvelox/nvelox)
+![Latest Release](https://img.shields.io/github/v/release/nvelox/nvelox?include_prereleases&label=latest%20release&color=blue)
+![Build Status](https://github.com/nvelox/nvelox/actions/workflows/release.yml/badge.svg)
+
+# Nvelox
+
+![logo](image.png)
+
+**High-Performance L4/L7 Load Balancer, Reverse Proxy & Web Server**
+
+Nvelox is a lightweight, high-performance load balancer and reverse proxy written in Go. It handles TCP/UDP (L4) and HTTP/HTTPS (L7) traffic with features comparable to nginx and HAProxy — in a single static binary with simple YAML configuration.
+
+## Why Nvelox?
+
+* **L4 + L7 in one binary** — TCP/UDP proxy, HTTP reverse proxy, static file server, FastCGI (PHP-FPM)
+* **ngx engine** — on Linux, HTTP/1.1, HTTP/2, HTTP/3, TCP and UDP traffic run on the ngx engine, one epoll loop per core, with a zero-allocation HTTP parser and nvelox's own QUIC transport ([benchmark](docs/PERFORMANCE.md))
+* **Massive Scale** — Bind 10,000+ ports with a single config line (port ranges)
+* **HTTP/1.1 + HTTP/2 + HTTP/3** — Full protocol support including QUIC
+* **nginx-compatible features** — try_files, expires, FastCGI, regex routes, URL rewrite
+* **Simple YAML config** — No complex directive syntax
+
+## Features
+
+### Core Proxy
+- **L4 TCP/UDP Proxy** — TCP relay (on the event loops on Linux) with standard half-close semantics (back-pressured; when either side closes first, everything already read is delivered before the FIN is passed on), UDP on the event loops on Linux (one socket per loop on a port, datagrams read and replies sent in batches) with bounded sessions (at most 16,384, and 512 per client IP; a session its backend never answers ends after 10 s)
+- **L7 HTTP Reverse Proxy** — HTTP/1.1 and HTTP/2 run on the event loops on Linux (strict zero-allocation parser, per-loop keep-alive pools to the backends, one write per loop pass for all of a connection's HTTP/2 streams); WebSocket, static files, FastCGI, caching and compression run on Go's `net/http` (proxying through `httputil.ReverseProxy`). Both apply the same routing, access rules, headers and access-log format
+- **HTTP/1.1 + HTTP/2** — automatic HTTP/2 via ALPN on HTTPS listeners
+- **HTTP/3 (QUIC)** — on Linux served by the event loops on nvelox's own QUIC transport (CUBIC with pacing, path MTU discovery, clients that change address or network, Retry under load); via quic-go on other platforms. Alt-Svc header advertisement. 0-RTT is off: the first request of a resumed connection waits for the handshake, so a captured request cannot be replayed as early data. A request header section above 64 KiB is answered 431 (HTTP/1.1 and HTTP/2 keep their 1 MiB limit), and one that is not complete within the header timeout is answered 408
+- **WebSocket Proxying** — transparent upgrade detection and bidirectional relay
+- **Port Ranges** — bind `:10000-20000` with 1:1 port mapping for gaming/VoIP
+
+### Load Balancing
+- **Round Robin** — cycle through backends
+- **Least Connections** — accurate per-connection tracking via OnConnect/OnDisconnect
+- **Random** — random server selection
+- **Sticky Sessions** — cookie, header, or IP-hash based session persistence
+- **Connection Draining** — mark servers as draining (no new connections, existing continue)
+- **Max Connections** — per-backend concurrency limit: 503 on HTTP when full, new TCP connections / UDP sessions refused
+
+### Routing (L7)
+- **Multi-server-per-port** — multiple HTTPS sites share one bind address (nginx-style); each picks its own TLS cert via SNI and dispatches by Host header. `server_names` + `default_server` control matching, leftmost wildcards (`*.foo.com`) supported.
+- **Host-based routing** — route by `Host` header (first-match-wins)
+- **Path prefix routing** — route by URL path prefix
+- **Regex routing** — regex path matching with capture groups
+- **URL Rewriting** — `$1`-style substitution from regex captures
+- **Redirect Rules** — 301/302 with variable substitution (`${host}`, `${path}`, `${uri}`, `${scheme}`, `${query}`, `${port}`)
+
+### Static Files & PHP
+- **Static File Serving** — serve from document root with directory index support and optional directory listings (`autoindex`)
+- **try_files** — nginx-style `$uri`, `$uri/`, `/fallback$is_args$args`
+- **expires** — `1y`, `30d`, `1h`, `-1` (no-cache), sets Cache-Control/Expires headers
+- **FastCGI (PHP-FPM)** — forward to PHP-FPM via TCP or Unix socket with `split_path_info`, custom params
+
+### Security
+- **TLS Termination** — on any TCP or HTTPS listener
+- **Client Certificate Auth (mTLS)** — `client_auth: require` / `request` with `client_ca` verification on TLS-terminating TCP, HTTPS and HTTP/3 listeners; per site (by SNI) when sites share a port
+- **ACLs** — match by source IP/CIDR, HTTP method, path, headers; allow/deny actions (TCP/UDP listeners: source IP only)
+- **IP Allowlist/Denylist** — CIDR-based per-listener filtering on HTTP, TCP and UDP listeners (behind a trusted PROXY v2 relay, on the client it names)
+- **Signed PROXY v2 headers** — relays and receivers share a key so a forged header (a spoofed UDP source) cannot name a client; keys rotate on reload
+- **Interface-bound relay trust** — for UDP relays that cannot sign: trust their PROXY headers only on datagrams that arrived on chosen network interfaces (`accept_proxy_interfaces`, Linux)
+- **Per-IP Rate Limiting** — token bucket per client IP with LRU cleanup
+- **Per-Listener Rate Limiting** — global connection rate limit
+- **Request Body Size Limit** — reject oversized request bodies
+- **SSL to Backend** — TLS when connecting to upstream servers from HTTP/HTTPS listeners (mTLS supported; `server_name` sets the name sent and checked on the certificate); a broken `backend_tls` config fails startup / the reload, never falls back to plaintext
+
+### Resilience
+- **Active Health Checks** — TCP connect or HTTP GET with configurable interval/timeout
+- **Passive Health Checks** — mark down after N consecutive failures
+- **Retries / Failover** — retry on connect failure, 502, 503; skip failed servers
+- **Circuit Breaker** — closed/open/half-open state machine per backend
+- **Configurable Timeouts** — per listener: `read_header`, `idle`, and `read` / `write`, which limit how long a client may stall, not how long a transfer may take (a quiet event stream, or a long upload or download that keeps moving, is never cut); applied per request after Host-based routing, so sites sharing a bind port can differ. Per backend: `connect`, `response_header` (time to start answering, else 504) and `read` (longest silence once answering)
+- **Graceful Shutdown** — on `SIGINT` or `SIGTERM` nvelox accepts nothing new and answers the HTTP requests in flight (HTTP/1.1, HTTP/2 and HTTP/3) before it exits; `server.shutdown_timeout` sets how long it waits for them (default 10 s)
+
+### Response Processing
+- **Header Manipulation** — add/set/remove on request and response (per-listener and per-route)
+- **X-Forwarded-For/X-Real-IP** — automatic proxy header injection
+- **Gzip Compression** — configurable content types and minimum size
+- **Response Caching** — in-memory cache with TTL, LRU eviction, Cache-Control support
+- **Request/Response Buffering** — sync.Pool-based buffer pool for reverse proxy
+- **Custom Error Pages** — styled HTML error pages (403, 404, 429, 502, 503, etc.)
+
+### Observability & Management
+- **Per-Request Access Logging** — method, path, status, bytes, latency, backend in CLF format
+- **Prometheus Metrics** — `/metrics` endpoint with counters, gauges, histograms
+- **Admin REST API** — runtime stats, drain/enable/disable servers
+- **Hot Reload** — SIGHUP reloads the whole config without dropping in-flight connections: backends (with sticky / CB / LeastConn state preserved on rename), per-listener routes / ACL / headers / error pages, TLS certs (Let's Encrypt rotation), and bind addresses (added or removed with 10s graceful drain). Pre-flight port-availability check ensures all-or-nothing apply. Open WebSocket tunnels are checked against the new rules: a tunnel the new config would refuse (IP lists, ACL, route, backend server) is closed, the others keep running.
+
+### Extensibility
+- **PROXY Protocol v2** — pass client IP to TCP, UDP and HTTP backends in HAProxy format (`send_proxy_v2`; for HTTP, every backend connection serves one client connection); accept it from trusted relays (`accept_proxy_from`) on TCP, UDP, HTTP and HTTPS listeners (HTTP/1.1, HTTP/2 and HTTP/3); a listed relay must send it, and is never taken for the client of what it relays
+- **DNS Service Discovery** — periodic hostname resolution with auto-update
+- **Modular Config** — split configs via `include` glob patterns
+- **Config Validation** — comprehensive validation at load time; keys that are parsed but not implemented (`sni_routes`, `throttle`, `tls.ocsp_stapling`, `routes[].scripts`) are rejected with an error naming the key, and `server.pid_file` / `workers` print a startup warning. Started as root with `server.user` / `group`, nvelox binds its ports and then switches to that user
+
+## Architecture
+
+```mermaid
+graph TD
+    Client -->|TCP/UDP/HTTP| Listeners
+    subgraph Nvelox
+        Listeners -->|IP Filter| ACL{ACL + Rate Limit}
+        ACL -->|L4 TCP| L4Relay[TCP relay on the event loops, half-close]
+        ACL -->|L4 UDP| NBIOEngine[UDP sessions on the event loops]
+        ACL -->|HTTP/1.1, HTTP/2| FastPath[HTTP/1.1 and HTTP/2 on the event loops]
+        ACL -->|L7| HTTPServer[net/http Server]
+        FastPath -->|hand-over: upgrades, static, cache...| HTTPServer
+        FastPath -->|per-loop keep-alive| BackendPool
+        ACL -->|FastCGI| FCGIClient[FastCGI Client]
+        HTTPServer -->|Route Match| Router
+        Router -->|Static| FileServer[Static Files]
+        Router -->|Proxy| ReverseProxy[httputil.ReverseProxy]
+        Router -->|Redirect| RedirectHandler
+        L4Relay -->|Dial| BackendPool
+        NBIOEngine -->|DialAsync| BackendPool
+        ReverseProxy -->|Shared Transport| BackendPool[Backend Pool]
+        FCGIClient --> PHPFPM[PHP-FPM]
+    end
+    BackendPool -->|Connection Pool| Backends(Backend Servers)
+```
+
+## Nvelox vs. nginx vs. HAProxy
+
+| Feature | Nvelox | HAProxy | Nginx |
+| :--- | :--- | :--- | :--- |
+| **L4 + L7** | Both | Both | Both |
+| **HTTP/3** | Yes (own QUIC transport on Linux) | Yes (quictls) | Yes (quic) |
+| **FastCGI (PHP)** | Yes | No | Yes |
+| **Static Files** | Yes | No | Yes |
+| **try_files** | Yes | No | Yes |
+| **Lua Scripting** | No | Yes (SPOE) | Yes |
+| **Port Ranges** | `:10000-20000` | Individual | Individual |
+| **Config Format** | YAML | Custom | Directives |
+| **Binary** | Static (Go) | Dynamic (C) | Dynamic (C) |
+| **Hot Reload** | SIGHUP | Hitless | SIGHUP |
+| **Memory (10k)** | ~40MB | ~150MB | ~100MB |
+
+## Quick Start
+
+```bash
+# Build. The ngx engine is the module github.com/nvelox/ngx, whose
+# repository is private: a build from source needs access to it. Without
+# that access, take a binary from https://github.com/nvelox/nvelox/releases
+# or the image ghcr.io/nvelox/nvelox.
+GOPRIVATE=github.com/nvelox/ngx go build -o nvelox main.go
+
+# Run with example config
+./nvelox -config examples/01-basic-tcp-proxy.yaml
+
+# See all 30 examples
+cat examples/README.md
+```
+
+## Configuration
+
+### Basic HTTP Proxy
+```yaml
+version: "2"
+listeners:
+  - name: "web"
+    bind: ":80"
+    protocol: "http"
+    backend: "servers"
+backends:
+  - name: "servers"
+    balance: "roundrobin"
+    servers:
+      - "10.0.0.1:8080"
+      - "10.0.0.2:8080"
+```
+
+### HTTPS + HTTP/2 + Routing + Compression
+```yaml
+listeners:
+  - name: "secure"
+    bind: ":443"
+    protocol: "https"
+    tls:
+      cert: "/etc/ssl/cert.pem"
+      key: "/etc/ssl/key.pem"
+    backend: "web"
+    compression:
+      enabled: true
+    headers:
+      response_add:
+        Strict-Transport-Security: "max-age=31536000"
+    routes:
+      - match:
+          host: "api.example.com"
+        backend: "api"
+      - match:
+          path_prefix: "/static"
+        static:
+          root: "/var/www/html"
+        expires: "1y"
+```
+
+### PHP-FPM with Static Files (nginx-equivalent)
+```yaml
+listeners:
+  - name: "php-app"
+    bind: ":80"
+    protocol: "http"
+    routes:
+      - match:
+          path_regex: "\\.(css|js|png|jpg|gif|ico)$"
+        static:
+          root: "/var/www/html"
+        try_files:
+          files: ["$uri"]
+          fallback: "=404"
+        expires: "1y"
+
+      - match:
+          path_regex: "\\.php(/|$)"
+        fastcgi:
+          pass: "127.0.0.1:9000"
+          document_root: "/var/www/html"
+          split_path_info: "^(.+\\.php)(/.*)$"
+
+      - match:
+          path_prefix: "/"
+        static:
+          root: "/var/www/html"
+        try_files:
+          files: ["$uri", "$uri/"]
+          fallback: "/index.php$is_args$args"
+```
+
+A `try_files` fallback that the route's own root has (a file, or a directory
+with an index, such as an SPA's `/`) is served by that route. Any other
+fallback is an internal redirect, as in nginx: `/index.php` (with the query
+string as `QUERY_STRING`) goes through the ACL and the routes again and lands
+on the PHP route. Static routes never serve `.php`, `.phtml`
+or `.phar` files as files. A `fastcgi` route needs `document_root`, and
+nvelox hands PHP-FPM only an existing `.php` file inside it — nvelox must see
+the document root at the same path as PHP-FPM.
+
+### Full Production (all features)
+```yaml
+version: "2"
+metrics:
+  enabled: true
+  bind: "127.0.0.1:9090"   # no auth: bind a private IP + firewall it to scrape remotely
+admin:
+  enabled: true
+  bind: "127.0.0.1:9091"
+  api_key: "<output of: openssl rand -hex 32>"   # required
+logging:
+  level: "info"
+  access_log: "/var/log/nvelox/access.log"
+  error_log: "/var/log/nvelox/error.log"
+
+listeners:
+  - name: "https"
+    bind: ":443"
+    protocol: "https"
+    http3: true
+    tls:
+      cert: "/etc/ssl/cert.pem"
+      key: "/etc/ssl/key.pem"
+    backend: "web"
+    compression: { enabled: true }
+    ip_rate_limit: { requests_per_second: 100, burst: 50 }
+    routes:
+      - match: { host: "api.example.com" }
+        backend: "api"
+
+  - name: "http-redirect"
+    bind: ":80"
+    protocol: "http"
+    routes:
+      - match: { path_prefix: "/" }
+        redirect: { url: "https://${host}${uri}", code: 301 }
+
+backends:
+  - name: "web"
+    balance: "roundrobin"
+    max_connections: 200
+    retry: { attempts: 2, on: "connect_failure,502" }
+    sticky_session: { type: "cookie", cookie_name: "SRV", ttl: "1h" }
+    health_check:
+      active: { type: "http", path: "/health", interval: "5s", timeout: "2s" }
+      passive: { max_fails: 3 }
+    circuit_breaker: { enabled: true, threshold: 5, timeout: "30s" }
+    servers:
+      - "10.0.0.1:8080"
+      - "10.0.0.2:8080"
+
+  - name: "api"
+    balance: "leastconn"
+    timeouts: { connect: "2s", response_header: "10s" }
+    servers:
+      - "10.0.1.1:8080"
+```
+
+### HTTP/3 limits
+
+The limits of HTTP/3 connections are settings under `server.http3`, for every listener with `http3: true`. Each is a size (`64KB`, `16MB`, `2GB`); the values below are the defaults.
+
+```yaml
+server:
+  http3:
+    max_header_size: "64KB"                # largest request header section; 431 above it
+    max_send_buffer: "16MB"                # most one connection holds of answers not yet acknowledged
+    max_stream_receive_window: "6MB"       # how far the upload window of one request grows (from 1 MiB)
+    max_connection_receive_window: "15MB"  # the same for all requests of a connection together
+    # max_send_memory: "2GB"               # all connections together: what they hold to send
+    # max_receive_memory: "2GB"            # all connections together: upload windows beyond the first
+    socket_buffer: "4MB"                   # asked for each UDP socket (one per event loop), to receive and to send
+```
+
+The two totals default to an eighth of the memory nvelox may use (64 MiB at the least). A reload applies all seven: the totals at once, `socket_buffer` to bind addresses started after it, the others to connections opened after it. `nvelox.example.yaml` says what each one costs and gains.
+
+The kernel grants a socket buffer up to `net.core.rmem_max` and `net.core.wmem_max` (208 KiB each by default), and all of it to a process started with `CAP_NET_ADMIN`. With a small receive buffer a fast upload loses datagrams before nvelox reads them. A listener whose sockets got less than `socket_buffer` says so in a startup warning; raising the two kernel limits to the value of `socket_buffer` or more settles it.
+
+## Admin API, Metrics and Log Files
+
+### Admin API
+- `admin.api_key` is **required** when `admin.enabled` is true: nvelox refuses to start without it. Clients send it as the `X-API-Key` header; it is compared in constant time. Use a long random key (`openssl rand -hex 32`).
+- An empty `admin.bind` means `127.0.0.1:9091`. On a loopback bind only loopback clients are served. On any other bind, firewall the port to the hosts that manage nvelox.
+- Call the API by its bind address: a request whose `Host` header is not the bind IP (or hostname) is refused with 403, so a DNS-rebinding web page cannot reach it. `localhost` also works on a loopback bind; a wildcard bind (`:9091`) accepts any IP literal.
+- `POST` requests need `Content-Type: application/json` (the body-less backend actions too), and browser cross-site requests (`Sec-Fetch-Site` / `Origin`) are refused with 403.
+- A valid key is always served. After 10 failed attempts from one IP within 10 minutes, that IP's further *failures* get `429` (with `Retry-After`) for 15 minutes.
+- The denylist refuses ranges wider than an IPv4 `/8` or an IPv6 `/16` (`0.0.0.0/0`, `::/0`, `::ffff:0:0/96`, …). `ttl_seconds` ≤ 0 keeps an entry until restart.
+- Adding an entry also closes what that client has open: WebSocket tunnels, L4 TCP and TLS connections and UDP sessions.
+
+```bash
+KEY=...   # admin.api_key
+curl -H "X-API-Key: $KEY" http://127.0.0.1:9091/api/v1/stats
+curl -X POST -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  "http://127.0.0.1:9091/api/v1/backends/web/drain?server=10.0.0.1:8080"
+curl -X POST -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"ip":"203.0.113.7","ttl_seconds":3600}' http://127.0.0.1:9091/api/v1/denylist
+curl -X DELETE -H "X-API-Key: $KEY" "http://127.0.0.1:9091/api/v1/denylist?cidr=203.0.113.7"
+```
+
+### Metrics
+The `/metrics` endpoint has no authentication. An empty `metrics.bind` means `127.0.0.1:9090`. To scrape from another host, bind a private interface IP and firewall the port to your Prometheus servers; never bind it to a public address. Inside a container loopback is unreachable from outside, so bind `0.0.0.0:9090` there and publish the port to trusted networks only. Slow or oversized requests are cut off (5 s header / 10 s read and write timeouts, 8 KiB of headers).
+
+### Signals and log rotation
+
+| Signal | Effect |
+|--------|--------|
+| `SIGHUP` | Reopen the log files, then reload the config and TLS certificates |
+| `SIGUSR1` | Reopen the log files |
+| `SIGINT`, `SIGTERM` | Graceful shutdown: no new connections, the HTTP requests in flight are answered (for up to `server.shutdown_timeout`, 10 s by default), L4 sessions are closed, then nvelox exits. A second signal ends it at once |
+
+Log files are created with mode `0640` (directories `0750`); an existing file is tightened to `0640` when nvelox opens it. After logrotate renames the files, signal nvelox so it writes to the new ones:
+
+```
+/var/log/nvelox/*.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640
+    sharedscripts
+    postrotate
+        systemctl kill -s USR1 nvelox.service 2>/dev/null || true
+        # without systemd: kill -USR1 $(pidof nvelox)
+    endscript
+}
+```
+
+Only the files nvelox opens itself are reopened. If a service manager appends nvelox's stdout/stderr to the same files, send that output to the journal instead.
+
+## Examples
+
+See [`examples/`](examples/) for 30 ready-to-run configs with test commands:
+
+| # | Feature | Config |
+|---|---------|--------|
+| 01 | Basic TCP proxy | `01-basic-tcp-proxy.yaml` |
+| 02 | Load balancing | `02-load-balancing.yaml` |
+| 03 | Health checks | `03-health-checks.yaml` |
+| 04 | Rate limiting | `04-rate-limiting.yaml` |
+| 05 | TLS termination | `05-tls-termination.yaml` |
+| 06 | HTTPS + HTTP/2 | `06-https-http2.yaml` |
+| 07 | HTTP/3 QUIC | `07-http3-quic.yaml` |
+| 08 | Host routing | `08-host-routing.yaml` |
+| 09 | Path routing | `09-path-routing.yaml` |
+| 10 | Regex + rewrite | `10-regex-rewrite.yaml` |
+| 11 | Redirects | `11-redirects.yaml` |
+| 12 | Header manipulation | `12-header-manipulation.yaml` |
+| 13 | Compression | `13-compression.yaml` |
+| 14 | Retries / failover | `14-retries-failover.yaml` |
+| 15 | Sticky sessions | `15-sticky-sessions.yaml` |
+| 16 | Max connections | `16-max-connections.yaml` |
+| 17 | ACL access control | `17-acl-access-control.yaml` |
+| 18 | IP allowlist/denylist | `18-ip-allowlist-denylist.yaml` |
+| 19 | Body size limit | `19-body-size-limit.yaml` |
+| 20 | Circuit breaker | `20-circuit-breaker.yaml` |
+| 21 | Prometheus metrics | `21-metrics-prometheus.yaml` |
+| 22 | Admin API | `22-admin-api.yaml` |
+| 23 | Timeouts | `23-timeouts.yaml` |
+| 24 | Caching | `24-caching.yaml` |
+| 25 | Port range | `25-port-range.yaml` |
+| 26 | PROXY protocol | `26-proxy-protocol.yaml` |
+| 27 | UDP proxy | `27-udp-proxy.yaml` |
+| 28 | Full production | `28-full-production.yaml` |
+| 29 | Static files + try_files | `29-static-files.yaml` |
+| 30 | PHP-FPM FastCGI | `30-php-fpm-fastcgi.yaml` |
+
+## Testing
+
+```bash
+go test ./...                    # All tests
+go test -race ./...              # Race detector
+go test -v ./integration/...     # Integration tests
+go test -coverprofile=c.out ./... && go tool cover -html=c.out  # Coverage
+```
+
+See [`examples/README.md`](examples/README.md) for manual real-world testing with curl.
+
+## Project Structure
+
+```
+core/
+  engine.go          — Engine orchestration, lifecycle
+  handler.go         — L4 accept gating + UDP proxy (nbio)
+  l4tcp.go           — L4 TCP accept loop + per-connection proxying
+  l4fast_linux.go    — L4 TCP relay on the event loops (Linux)
+  relay.go           — L4 TCP relay (half-close semantics, idle timeout)
+  httpproxy/
+    server.go        — L7 HTTP reverse proxy
+    fastparse.go     — Strict zero-allocation HTTP/1.1 parser
+    fast_linux.go    — HTTP/1.1 on the event loops, hand-over to net/http
+    fasttls_linux.go — HTTPS (HTTP/1.1) on the event loops
+    router.go        — Route matching (host/path/regex)
+    static.go        — Static files, try_files, expires
+    fastcgi.go       — FastCGI client (PHP-FPM)
+    compress.go      — Gzip compression
+    cache.go         — Response caching
+    errorhtml/       — Styled error pages
+  acl/               — Access control lists
+  admin/             — Admin REST API
+  circuitbreaker/    — Circuit breaker state machine
+  discovery/         — DNS service discovery
+  health/            — Active health checks
+  metrics/           — Prometheus metrics
+  middleware/        — Per-IP rate limiting
+  scripting/         — Lua VM pool (not wired into the engine)
+  sni/               — SNI-based TLS routing (not wired into the engine)
+  sticky/            — Sticky session store
+  throttle/          — Bandwidth throttling (not wired into the engine)
+  tlsutil/           — TLS versions/ciphers, client cert auth, SNI matching
+config/              — YAML config parsing + validation
+lb/                  — Load balancing algorithms
+proxy/               — PROXY Protocol v2
+```
+
+## License
+
+nvelox is source-available: the code is public, and it is licensed under the
+[PolyForm Internal Use License 1.0.0](LICENSE). In short (the license text is what counts):
+
+- You may use nvelox, and change it, for the internal business operations of you and your company, free of charge.
+- You may not distribute it, changed or unchanged.
+
+The licenses of the third-party software in the binaries and images are in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

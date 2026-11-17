@@ -1,0 +1,80 @@
+name: goreleaser
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual re-run: dispatch against an existing tag (Run workflow → pick the tag,
+  # or `gh workflow run goreleaser --ref vX.Y.Z`) to (re)build a release when the
+  # tag-push event didn't fire. GoReleaser reads the version from the checked-out
+  # tag, so dispatch against the TAG ref (not a branch), else it builds a snapshot.
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Release binaries and GHCR images are built with this Go. 1.27.x +
+          # check-latest picks up every 1.27 security release at tag time.
+          go-version: '1.27.x'
+          check-latest: true
+      # The ngx engine is the private module github.com/nvelox/ngx. A
+      # read-only deploy key of that repository is in the secret
+      # NGX_DEPLOY_KEY; git reaches the module over SSH with it, and Go is
+      # told not to ask the public proxy or checksum database for it. The
+      # host key is GitHub's published one, pinned. A run without the secret
+      # (a pull request from a fork) stops at the build.
+      - name: Access to the ngx module
+        env:
+          NGX_DEPLOY_KEY: ${{ secrets.NGX_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$NGX_DEPLOY_KEY" > ~/.ssh/ngx_deploy && chmod 600 ~/.ssh/ngx_deploy
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
+          git config --global url."git@github.com:nvelox/ngx".insteadOf "https://github.com/nvelox/ngx"
+          git config --global core.sshCommand "ssh -i ~/.ssh/ngx_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          echo "GOPRIVATE=github.com/nvelox/ngx" >> "$GITHUB_ENV"
+
+      # Pull the tag's annotation message into a file. goreleaser uses
+      # this as the release body — overrides its default auto-changelog,
+      # which is still appended below per .goreleaser.yaml's changelog
+      # settings. Operators write the human summary in
+      #   git tag -a vX.Y.Z -m "..."
+      # and that text appears on the GitHub release page.
+      - name: Extract tag annotation as release notes
+        run: |
+          git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > /tmp/release-notes.md
+          echo "--- release-notes.md preview ---"
+          cat /tmp/release-notes.md
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean --release-notes=/tmp/release-notes.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,30 @@
+## 08 — Host-Based Routing
+## Routes requests by Host header to different backends.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "host-router"
+    bind: ":9000"
+    protocol: "http"
+    backend: "web"
+    routes:
+      - match:
+          host: "api.localhost"
+        backend: "api"
+      - match:
+          host: "admin.localhost"
+        backend: "admin"
+backends:
+  - name: "web"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8081"
+  - name: "api"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8082"
+  - name: "admin"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8083"

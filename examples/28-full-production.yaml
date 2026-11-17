@@ -1,0 +1,109 @@
+## 28 — Full Production Config
+## Combines multiple features: HTTPS, HTTP/3, routing, health checks,
+## rate limiting, ACLs, compression, metrics, admin API.
+version: "2"
+# server.user / server.group are not implemented (nvelox does not drop
+# privileges; setting them only prints a startup warning). Run nvelox under
+# systemd User=/Group= with AmbientCapabilities=CAP_NET_BIND_SERVICE instead.
+
+logging:
+  level: "info"
+  access_log: "/tmp/nvelox-access.log"
+  error_log: "/tmp/nvelox-error.log"
+
+# Loopback only; bind a private IP and firewall the port to scrape remotely.
+metrics:
+  enabled: true
+  bind: "127.0.0.1:9090"
+  path: "/metrics"
+
+# api_key is required (startup error without it); see 22-admin-api.yaml.
+admin:
+  enabled: true
+  bind: "127.0.0.1:9091"
+  api_key: "replace-with-the-output-of-openssl-rand-hex-32"
+
+listeners:
+  # HTTP → redirect to HTTPS
+  - name: "http-redirect"
+    bind: ":9080"
+    protocol: "http"
+    backend: "web"
+    routes:
+      - match:
+          path_prefix: "/"
+        redirect:
+          url: "https://${host}:9443${path}"
+          code: 301
+
+  # HTTPS with HTTP/2 + routing
+  - name: "https-main"
+    bind: ":9443"
+    protocol: "https"
+    backend: "web"
+    tls:
+      cert: "examples/certs/server.pem"
+      key: "examples/certs/server-key.pem"
+    compression:
+      enabled: true
+    ip_rate_limit:
+      requests_per_second: 100
+      burst: 50
+    headers:
+      response_add:
+        Strict-Transport-Security: "max-age=31536000"
+        X-Content-Type-Options: "nosniff"
+    routes:
+      - match:
+          host: "api.localhost"
+        backend: "api"
+      - match:
+          path_prefix: "/api"
+        backend: "api"
+
+  # TCP passthrough for game servers
+  - name: "game-ports"
+    bind: ":9100-9105"
+    protocol: "tcp"
+    backend: "game"
+
+backends:
+  - name: "web"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8084"
+#      - "127.0.0.1:8082"
+    health_check:
+      active:
+        type: "http"
+        path: "/health"
+        interval: "5s"
+        timeout: "2s"
+      passive:
+        max_fails: 3
+    retry:
+      attempts: 2
+      on: "connect_failure,502"
+    sticky_session:
+      type: "cookie"
+      cookie_name: "NVELOX_SRV"
+      ttl: "30m"
+
+  - name: "api"
+    balance: "leastconn"
+    max_connections: 100
+    servers:
+      - "127.0.0.1:8083"
+    timeouts:
+      connect: "2s"
+      response_header: "10s"
+    circuit_breaker:
+      enabled: true
+      threshold: 5
+      timeout: "30s"
+      half_open_max: 3
+
+  - name: "game"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:8084"

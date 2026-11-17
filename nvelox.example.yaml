@@ -1,0 +1,627 @@
+# /etc/nvelox/nvelox.yaml — Complete Reference Configuration
+# Every feature is shown below. Remove what you don't need.
+
+version: "2"
+
+# ─── Server Settings ───────────────────────────────────────
+server:
+  # gateway_id: "gw-1"  # gw=<id> on HTTP access-log lines (default: hostname)
+  # user / group: started as root, nvelox binds every port, hands its log
+  # files to this user and then runs as it (like nginx); nothing is served
+  # before the switch. It exits if it cannot switch. Not root: a startup
+  # WARNING, and it runs as it is. The config, certificates and log directory
+  # must be readable by this user for reloads and log reopens; a reload cannot
+  # add a port below 1024 (restart for that) and does not change the user.
+  # Keep the config and every file it names (certificates, keys, CA files,
+  # PROXY key files, error pages) NOT writable by this user: nvelox reads them
+  # as root at start. The log directory may be; as root, nvelox does not
+  # follow a symbolic link at a log path.
+  # user: "nvelox"
+  # group: "nvelox"
+  # pid_file / workers are accepted but not implemented (no pid file, one
+  # process); setting them prints a startup WARNING.
+  # shutdown_timeout: how long a stop (SIGINT or SIGTERM) lets the HTTP
+  # requests in flight finish; what is left then is closed. Nothing new is
+  # accepted on the HTTP ports meanwhile, so this is also the longest that a
+  # request which does not end (an event stream, a long download) can hold
+  # up a restart. Where another instance takes the traffic meanwhile a long
+  # wait costs nothing; a single instance may want a short one. A duration
+  # greater than 0, default "10s"; a reload applies it. A second signal
+  # ends nvelox at once.
+  # shutdown_timeout: "10s"
+  # http3: the limits of HTTP/3 connections, for every listener with
+  # `http3: true`. Each is a size: a whole number with B, KB, MB or GB
+  # (KB is 1024 bytes). Zero is not taken. Not set, each has the default
+  # shown. A reload applies them: the two totals at once, socket_buffer to
+  # the bind addresses started after it, the others to the connections
+  # opened after it.
+  # http3:
+  #   # The largest header section a request may have; a larger one is
+  #   # answered 431. A connection may have 100 requests open, and so hold
+  #   # 100 heads that are on their way: 6.4 MiB with 64KB, 100 MiB with
+  #   # 1MB. 1KB to 1MB. (HTTP/1.1 and HTTP/2 take 1 MiB.)
+  #   max_header_size: "64KB"
+  #   # The most one connection holds of answers its client has not
+  #   # acknowledged yet. What a connection holds follows what its path
+  #   # carries, up to this, so it is also the most a download moves per
+  #   # round trip: 16MB holds back no path, 4MB holds a download over a
+  #   # path of 100 ms to about 270 Mbit/s. 256KB to 1GB.
+  #   max_send_buffer: "16MB"
+  #   # How far the windows for what a client sends grow: for one request's
+  #   # body, and for all the requests of a connection together. Each
+  #   # starts at 1 MiB and doubles while the backend takes an upload as
+  #   # fast as the path brings it. They are the most an upload moves per
+  #   # round trip, and the most nvelox holds for a connection whose
+  #   # backend stops taking. A request's window grows only while the
+  #   # connection's can be one and a half times as large. 1MB (nothing
+  #   # grows) to 1GB.
+  #   max_stream_receive_window: "6MB"
+  #   max_connection_receive_window: "15MB"
+  #   # For all HTTP/3 connections together: what they hold to send, and
+  #   # what they are granted beyond their first receive windows. Past the
+  #   # first a connection takes 16 KiB at a time; past the second no
+  #   # window grows. 1MB to 1024GB. Not set: an eighth of the memory
+  #   # nvelox may use (the machine's, or its control group's limit), and
+  #   # 64 MiB at the least.
+  #   max_send_memory: "2GB"
+  #   max_receive_memory: "2GB"
+  #   # What nvelox asks the kernel for as the receive and as the send
+  #   # buffer of each UDP socket of an HTTP/3 listener (one socket per
+  #   # event loop). A burst of a fast client's datagrams waits there
+  #   # until nvelox reads it; what does not fit is dropped, which slows
+  #   # an upload down. The kernel grants up to net.core.rmem_max and
+  #   # wmem_max (208 KiB each unless they were raised), and all of it to
+  #   # a process started with CAP_NET_ADMIN. A listener whose sockets got
+  #   # less says so in a startup WARNING. 64KB to 64MB.
+  #   socket_buffer: "4MB"
+  #   # max_send_buffer, the two totals and socket_buffer belong to the
+  #   # QUIC transport nvelox runs on Linux. On other platforms they change
+  #   # nothing (a startup WARNING says so) and the other three are read
+  #   # when a bind address starts.
+
+# ─── Logging ───────────────────────────────────────────────
+# Log files are created 0640 in 0750 directories (an existing file is
+# tightened to 0640). After logrotate moves them away, send SIGUSR1
+# (`kill -USR1 <pid>`, or `systemctl kill -s USR1 nvelox` under systemd)
+# and nvelox reopens both; SIGHUP reopens them too, then reloads.
+logging:
+  level: "info"  # debug, info, warning, error
+  access_log: "/var/log/nvelox/access.log"  # Per-request CLF format
+  error_log: "/var/log/nvelox/error.log"
+
+# ─── Prometheus Metrics ───────────────────────────────────
+# No authentication. Loopback only by default (an empty bind means
+# 127.0.0.1:9090). To scrape from another host, bind a private interface IP
+# and firewall the port to your Prometheus servers — never a public
+# address. In a container, loopback is unreachable from outside: bind
+# "0.0.0.0:9090" there and publish the port to trusted networks only.
+metrics:
+  enabled: true
+  bind: "127.0.0.1:9090"
+  path: "/metrics"
+
+# ─── Admin API ─────────────────────────────────────────────
+admin:
+  enabled: false
+  bind: "127.0.0.1:9091"  # empty = 127.0.0.1:9091 (loopback only)
+  # api_key is REQUIRED when enabled: nvelox refuses to start without it.
+  # Sent as the X-API-Key header and compared in constant time. Use a long
+  # random value (`openssl rand -hex 32`): a valid key is always served, and
+  # 10 failed attempts from one IP in 10m only throttle that IP's further
+  # failures (429) for 15m.
+  # api_key: "set-from-env-or-vault"
+  # Requests must name the bind address in the Host header, POST needs
+  # "Content-Type: application/json", and browser cross-site requests are
+  # refused. On a non-loopback bind, firewall the port to the managing hosts.
+  # Endpoints:
+  #   GET    /api/v1/stats
+  #   GET    /api/v1/backends
+  #   POST   /api/v1/backends/{name}/drain?server=addr
+  #   POST   /api/v1/backends/{name}/enable?server=addr
+  #   POST   /api/v1/backends/{name}/disable?server=addr
+  #   GET    /api/v1/denylist
+  #   POST   /api/v1/denylist {"ip": "<ip or cidr>", "ttl_seconds": N}
+  #          (ttl <= 0 = until restart; ranges wider than /8 IPv4 or
+  #          /16 IPv6 are refused). Also closes the client's open
+  #          WebSocket tunnels, TCP/TLS connections and UDP sessions.
+  #   DELETE /api/v1/denylist?cidr=<ip or cidr>
+
+# Hot reload: `kill -HUP $(pidof nvelox)` (or `systemctl reload nvelox`)
+# applies the current contents of this file without dropping connections.
+# Covers backends (balancer/sticky/CB state preserved on rename), per-
+# listener routes/ACL/headers, TLS certs (Let's Encrypt rotation), and
+# bind addresses (added or removed with 10s graceful drain). All-or-
+# nothing: pre-flight aborts the apply if any new bind addr is unbindable
+# or the new config is invalid. Open WebSocket tunnels are checked against
+# the new rules; one they would refuse is closed. See
+# examples/32-hot-reload.yaml.
+
+# ─── OpenTelemetry Tracing ─────────────────────────────────
+# tracing:
+#   enabled: true
+#   endpoint: "http://jaeger:4318"
+#   service: "nvelox"
+
+# ─── Modular Config Includes ──────────────────────────────
+include: "/etc/nvelox/config.d/*.yaml"
+
+# ═══════════════════════════════════════════════════════════
+# LISTENERS
+# ═══════════════════════════════════════════════════════════
+
+listeners:
+
+  # ─── HTTP → HTTPS redirect ─────────────────────────────
+  - name: "http-redirect"
+    bind: ":80"
+    protocol: "http"
+    routes:
+      - match:
+          path_prefix: "/"
+        redirect:
+          url: "https://${host}${uri}"  # Variable substitution
+          code: 301
+    # Redirect routes don't need a backend
+
+  # ─── HTTPS with HTTP/2 + HTTP/3 ────────────────────────
+  - name: "https-main"
+    bind: ":443"
+    protocol: "https"
+    http3: true  # QUIC on same port, advertises Alt-Svc
+    #   HTTP/3 does not take 0-RTT: the first request of a resumed connection
+    #   waits for the handshake, so a captured request cannot be replayed as
+    #   early data. A request header section above 64 KiB is answered 431
+    #   over HTTP/3 (HTTP/1.1 and HTTP/2 keep their 1 MiB limit); that and
+    #   the other limits of HTTP/3 connections are settings: server.http3.
+    backend: "web-cluster"
+    # Multiple HTTPS listeners may share the same `bind:` — see the
+    # "Multi-server-per-port" section below for how SNI + server_names
+    # route requests across them.
+    tls:
+      cert: "/etc/ssl/certs/server.pem"
+      key: "/etc/ssl/private/server.key"
+      # client_auth: "require"         # mTLS: "require" (verified cert needed),
+      #                                #   "request" (asked, not required), "none"
+      # client_ca: "/etc/ssl/ca.pem"   # PEM CA bundle; required by "require".
+      #   Per site when several https listeners share a bind (chosen by SNI);
+      #   a request whose Host names a client_auth site over a connection
+      #   whose SNI chose another site gets 421. Also applies to http3 and to
+      #   TLS-terminating tcp listeners. A missing / unparseable CA fails the
+      #   load. (ocsp_stapling is not implemented and is rejected.)
+      # min_version: "1.2"             # "1.2" or "1.3" (defaults 1.2)
+      # max_version: "1.3"             # defaults 1.3
+      # cipher_suites:                 # TLS 1.2 only; TLS 1.3 suites are
+      #   - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+      #   - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+    # trusted_proxies: ["10.0.0.2/32"]
+    #   When set, X-Forwarded-For / X-Real-IP from peers in these CIDRs
+    #   are trusted and appended; everyone else gets their forged
+    #   headers replaced with the authoritative peer IP. This list ALSO
+    #   governs nvelox's own client-IP decisions: the access log, ip_allowlist,
+    #   ip_denylist, ip_rate_limit and acl resolve the real client from XFF /
+    #   X-Real-IP for trusted peers. SECURITY: scope this to the real upstream
+    #   proxy IPs only — never a broad range. Behind a k8s Service with
+    #   externalTrafficPolicy:Cluster, kube-proxy SNATs every packet to a node
+    #   IP, so a broad CIDR (e.g. 10.0.0.0/8) trusts ALL inbound traffic and
+    #   makes every IP-based control forgeable; prefer externalTrafficPolicy:
+    #   Local and/or firewall the listener to the proxy.
+    # accept_proxy_from: ["10.50.0.0/16"]
+    #   Inbound PROXY-protocol-v2 trust (tcp, udp, http and https
+    #   listeners). For peers in these CIDRs, nvelox parses the inbound
+    #   PROXY-v2 header and uses its source as the real client. Peers OUTSIDE
+    #   the list have any inbound PROXY header IGNORED and are the client
+    #   themselves. Empty (default) = trust nobody. Use this behind a relay
+    #   (another nvelox, HAProxy, a load balancer) that prepends a PROXY-v2
+    #   header, to keep the real client IP across the hop.
+    #   A listed peer MUST send the header: first on every connection (tcp,
+    #   http and https listeners; a LOCAL header for the relay's own
+    #   traffic, such as health checks) and in every datagram (udp). A
+    #   connection that starts with anything else, or with a header that
+    #   does not parse, is closed and counted
+    #   (nvelox_proxy_header_rejected_total); a datagram without a valid
+    #   header is dropped. A listed peer is never taken for the client of
+    #   what it relays.
+    #   tcp and udp listeners: the client is passed on to the backend with
+    #   send_proxy_v2.
+    #   http and https listeners (HTTP/1.1 and HTTP/2): the header comes
+    #   before TLS. The client it names is the client for the access log,
+    #   ip_allowlist, ip_denylist, ip_rate_limit, acl and X-Forwarded-For;
+    #   trusted_proxies is matched against that client too, so a relay is
+    #   not listed there. Listeners that share a port set the same
+    #   accept_proxy_from and accept_proxy_key_file.
+    #   https listeners with http3: a UDP relay puts the header in front of
+    #   every datagram, signed (accept_proxy_key_file is required with
+    #   http3). On Linux a reload that changes accept_proxy_from holds for
+    #   HTTP/3 at once, as for HTTP/1.1 and HTTP/2; on other platforms
+    #   HTTP/3 takes it from the next restart, so start the listener with
+    #   it set there.
+    #   TCP: the handshake proves the peer's address, so only a listed peer
+    #   can supply a header. UDP: a datagram's source address can be forged,
+    #   so anyone who can send packets claiming a listed address can name any
+    #   client. Protect a UDP relay with accept_proxy_key_file or
+    #   accept_proxy_interfaces, or list it only where the network drops
+    #   such packets before they reach this host (startup WARNING otherwise).
+    # accept_proxy_key_file: "/etc/nvelox/proxy.keys"
+    #   A trusted peer's PROXY header must carry a valid signature made with
+    #   one of these keys (one per line, at least 32 characters, e.g.
+    #   `openssl rand -hex 32`; "#" comments; chmod 600). An unsigned or
+    #   wrongly signed header refuses the TCP or HTTP connection / drops the
+    #   UDP datagram. The
+    #   sending nvelox signs with send_proxy_key_file. Rotation without a
+    #   restart: add the new key on the receivers (SIGHUP), put it first on
+    #   the senders (SIGHUP), then remove the old key from the receivers.
+    # accept_proxy_interfaces: ["eth1"]
+    #   (udp listeners, Linux) A trusted peer's PROXY header counts only on
+    #   datagrams that arrived on one of these network interfaces — e.g. a
+    #   second network card, a VLAN or a tunnel that only the relays reach —
+    #   addressed to one of its addresses. A datagram claiming a listed
+    #   address that arrives on another interface is an ordinary client
+    #   datagram. For relays that cannot sign their headers.
+    #   The listener shares its port with sockets bound to these interfaces
+    #   (SO_REUSEPORT): only a program running as the same user as the one
+    #   nvelox was started by can bind such a port too (root, when nvelox
+    #   starts as root and switches to server.user). A program on this
+    #   machine can also send from the machine's own addresses, and such a
+    #   datagram counts as arriving on the interface that has the address:
+    #   keep this machine's addresses
+    #   out of accept_proxy_from (a startup WARNING names them), and where
+    #   untrusted programs run here use accept_proxy_key_file instead. The
+    #   interfaces and their addresses are read at start: restart nvelox
+    #   after they change (a reload does not re-read them).
+
+    # Timeouts (HTTP/HTTPS listeners). All values accept Go duration
+    # strings ("30s", "5m", "1h"). An explicit "0" means unlimited.
+    #
+    #   read_header — slowloris guard for header parsing. Shared across
+    #                 sites on the same bind port; the engine takes the
+    #                 max configured value (or 10s default).
+    #   read        — how long the client may stall while sending its
+    #                 request body (no byte arriving). 60s default.
+    #   write       — how long the client may stall while taking the
+    #                 response (a write waiting for it). 60s default.
+    #                 read and write count only time stuck: a quiet event
+    #                 stream, or an upload or download that keeps moving,
+    #                 is never cut. Applied per request after Host-based
+    #                 routing, so two sites sharing a bind can differ.
+    #   idle        — keep-alive idle between requests on a connection.
+    #                 Shared across sites; max wins. 120s default.
+    #   connect     — default dial timeout of this listener's backends
+    #                 (a backend's own timeouts.connect wins). 10s default.
+    timeouts:
+      read_header: "10s"
+      read: "30s"
+      write: "30s"
+      idle: "120s"
+
+    # Rate limiting
+    rate_limit:
+      connections_per_second: 500
+      burst: 100
+    ip_rate_limit:
+      requests_per_second: 50
+      burst: 20
+
+    # Security (ip_denylist / ip_allowlist / acl also work on tcp and udp
+    # listeners, per connection / UDP session; there an acl rule may only
+    # match source_ip). Entries must be IPs or CIDRs (a bad one fails the
+    # load); "0.0.0.0/0" here and in acl source_ip means every client, IPv6 too.
+    ip_denylist: ["192.168.100.0/24"]
+    # ip_allowlist: ["10.0.0.0/8"]  # If set, only listed CIDRs allowed
+    max_body_size: "10MB"
+    # ACL path_prefix / path_regex see the canonical path ("//admin",
+    # "/x/../admin" and "/%2e/admin" are "/admin"); a deny rule also matches
+    # the path without ";params". Matching is case-sensitive: write
+    # path_regex: "(?i)^/admin(/|$)" in front of a case-insensitive backend.
+    # A backslash ("\" or "%5C") is not a path separator and reaches the
+    # backend unchanged (as in nginx): in front of a backend that treats it
+    # as "/", match it too, e.g. path_regex: "^/admin([/\\\\]|$)".
+    acl:
+      - match:
+          method: ["DELETE"]
+          source_ip: ["0.0.0.0/0"]
+        action: "deny"
+
+    # Response processing
+    compression:
+      enabled: true
+      types: ["text/html", "application/json", "text/css", "application/javascript"]
+      min_length: 1024   # by Content-Length (as nginx); unknown length is compressed
+
+    # Only a 200 received in full is cached; Range / If-* requests bypass the
+    # cache. One entry holds at most 8MB (or max_size); unset max_size = 64MB.
+    cache:
+      enabled: true
+      max_size: "256MB"
+      default_ttl: "5m"
+      methods: ["GET"]
+
+    # Error pages (custom HTML files, falls back to built-in styled pages)
+    # error_pages:
+    #   404: "/var/www/errors/404.html"
+    #   502: "/var/www/errors/502.html"
+
+    # Header manipulation (applied to all routes on this listener)
+    headers:
+      request_add:
+        X-Proxy: "nvelox"
+      response_add:
+        Strict-Transport-Security: "max-age=31536000"
+        X-Content-Type-Options: "nosniff"
+      response_remove:
+        - "Server"
+
+    # L7 Routes (first match wins)
+    routes:
+      # API routing by host
+      - match:
+          host: "api.example.com"
+        backend: "api-servers"
+        headers:
+          request_add:
+            X-Route: "api"
+
+      # Regex route with URL rewrite
+      - match:
+          path_regex: "^/api/v(\\d+)/(.*)"
+        rewrite:
+          path: "/v$1/$2"
+        backend: "api-servers"
+
+      # Static assets with long cache
+      - match:
+          path_regex: "\\.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$"
+        static:
+          root: "/var/www/html"
+        try_files:
+          files: ["$uri"]
+          fallback: "=404"
+        expires: "1y"
+
+      # PHP files via FastCGI. document_root is required, and nvelox must
+      # see it at the same path as PHP-FPM: only an existing .php file
+      # inside it is handed to PHP-FPM — anything else is a 404 from nvelox.
+      - match:
+          path_regex: "\\.php(/|$)"
+        fastcgi:
+          pass: "127.0.0.1:9000"           # or "unix:/var/run/php-fpm.sock"
+          document_root: "/var/www/html"
+          split_path_info: "^(.+\\.php)(/.*)$"
+          params:
+            HTTPS: "on"
+
+      # Catch-all: try static, fall back to the PHP front controller. The
+      # fallback is an internal redirect (as in nginx): /index.php — with
+      # the query string as QUERY_STRING — goes through the ACL and the
+      # routes again and lands on the PHP route above. Static routes never
+      # serve .php/.phtml/.phar files as files.
+      - match:
+          path_prefix: "/"
+        static:
+          root: "/var/www/html"
+          index: ["index.html"]
+          # autoindex: true   # list a directory that has no index file (like
+          #                   # nginx autoindex): names, sizes and dates, no
+          #                   # dotfiles, no scripts, no symlinks out of the
+          #                   # root, at most 10,000 entries, GET/HEAD only
+        try_files:
+          files: ["$uri", "$uri/"]
+          fallback: "/index.php$is_args$args"
+
+      # (routes[].scripts — Lua hooks — are not implemented; a route that
+      # sets them is rejected at load.)
+
+  # ─── TCP L4 proxy (gaming/tunneling) ───────────────────
+  # L4 TCP sessions follow standard half-close semantics: when either side
+  # finishes (FIN), everything already read from it is delivered to the other
+  # side, then only that write direction is shut down; the opposite direction
+  # keeps flowing until it ends too. Only a real error (RST) aborts both.
+  #   timeouts.idle    — close a session after no bytes moved in EITHER
+  #                      direction for this long, including a half-closed
+  #                      one. Default 5m on plain tcp listeners ("0" =
+  #                      never); on tls-terminating tcp listeners only when set.
+  #   timeouts.connect — backend dial timeout (default 10s).
+  #   zero_copy        — accepted for compatibility; no effect (L4 TCP uses a
+  #                      16 KiB buffered copy per direction).
+  - name: "game-ports"
+    bind: ":10000-10100"
+    protocol: "tcp"
+    zero_copy: true
+    backend: "game-servers"
+
+  # ─── Dedicated-port MUX (range → one backend port) ─────
+  # Bind a whole dedicated range but forward EVERY port to ONE backend port
+  # (give the backend an explicit port → nvelox does NOT append the listener
+  # port, so all ports funnel to that one socket). With send_proxy_v2, the
+  # PROXY-v2 header's DESTINATION is the port the client actually hit (the
+  # dedicated port), so the single backend listener can de-multiplex the whole
+  # range from one socket — no per-port listener. accept_proxy_from lets the
+  # listener also trust a relayed inbound header. A PROXY-aware backend can
+  # serve 10k–100k dedicated ports this way without 10k–100k listeners.
+  # - name: "dedicated-mux"
+  #   bind: ":17000-17100"          # the dedicated range (grow as needed)
+  #   protocol: "tcp"
+  #   zero_copy: true
+  #   backend: "port-mux"           # backend MUST specify an explicit port (the mux port)
+  #   accept_proxy_from: ["10.50.0.0/16"]   # trust PROXY headers from your relays
+  # (and a matching backend, e.g.)
+  # backends:
+  #   - name: "port-mux"
+  #     servers: ["10.1.0.5:17999"]  # explicit mux port → all range ports land here
+  #     send_proxy_v2: true
+
+  # ─── TLS passthrough ───────────────────────────────────
+  # A tcp listener without a tls block forwards TLS untouched to its one
+  # backend. (sni_routes — routing passthrough by SNI — is not implemented;
+  # a listener that sets it is rejected at load.)
+
+  # ─── Multi-server-per-port (nginx-style) ───────────────
+  # Multiple HTTPS listeners may share the same `bind:`. Each is its own
+  # "site": its own cert, its own routes/headers/ACL, its own backend.
+  # nvelox picks the cert via SNI and dispatches by Host header. Exact
+  # name > leftmost wildcard > default_server. Detailed walkthrough in
+  # examples/31-multisite-per-port.yaml.
+  # - name: "api-site"
+  #   bind: ":8443"
+  #   protocol: "https"
+  #   server_names: ["api.example.com", "api.example.org"]
+  #   tls: { cert: "/etc/ssl/api.pem", key: "/etc/ssl/api.key" }
+  #   backend: "api-servers"
+  # - name: "web-site-default"
+  #   bind: ":8443"
+  #   protocol: "https"
+  #   default_server: true                        # catch-all for unknown SNI
+  #   tls: { cert: "/etc/ssl/wildcard.pem", key: "/etc/ssl/wildcard.key" }
+  #   backend: "web-cluster"
+
+  # ─── UDP proxy ─────────────────────────────────────────
+  # Each client source ip:port is one session (own backend socket). Fixed
+  # limits: 16384 sessions per process, 512 per client IP; a session ends
+  # 10s after its first datagram if the backend never answered, else 60s
+  # after the backend's last reply. With accept_proxy_from, every datagram
+  # from a trusted relay must carry a PROXY v2 header (others are dropped).
+  - name: "dns-proxy"
+    bind: ":5353"
+    protocol: "udp"
+    backend: "dns-servers"
+
+  # ─── Dedicated-UDP MUX (range → one backend UDP port) ──
+  # The UDP counterpart of "dedicated-mux" above. Funnel the
+  # whole dedicated UDP range to ONE backend UDP port (give the backend an
+  # explicit port so nvelox does NOT append the listener port). With
+  # send_proxy_v2 the per-datagram PROXY-v2 DGRAM header's DESTINATION is the
+  # dedicated port the client hit, so a PROXY-aware backend de-multiplexes the
+  # whole range from one socket. accept_proxy_from trusts a relay's inbound
+  # header so the REAL client (not the relay) is preserved end-to-end — over
+  # UDP only where the network drops forged relay addresses (see
+  # accept_proxy_from above). NOTE: the mux backend port must be firewalled to
+  # nvelox only — it trusts the PROXY header.
+  # - name: "dedicated-udp-mux"
+  #   bind: ":17000-17100"          # the dedicated UDP range
+  #   protocol: "udp"
+  #   backend: "udp-port-mux"       # backend MUST specify an explicit port (the UDP mux port)
+  #   accept_proxy_from: ["10.50.0.0/16"]   # trust PROXY headers from your relays
+  # (and a matching backend, e.g.)
+  # backends:
+  #   - name: "udp-port-mux"
+  #     servers: ["10.1.0.5:7444"]  # explicit UDP mux port
+  #     send_proxy_v2: true
+
+# ═══════════════════════════════════════════════════════════
+# BACKENDS
+# ═══════════════════════════════════════════════════════════
+
+backends:
+  - name: "web-cluster"
+    balance: "roundrobin"  # roundrobin, leastconn, random
+    max_connections: 200   # concurrent HTTP requests / TCP conns / UDP sessions
+    # send_proxy_v2 prepends a PROXY protocol v2 header so the backend
+    # sees the real client address.
+    #   - TCP backends: header sent once per connection (STREAM variant).
+    #   - UDP backends: header prepended to each datagram (DGRAM variant)
+    #     so QUIC/HTTP3 backends can recover the client IP per packet.
+    #   - HTTP backends (http and https listeners, every HTTP version):
+    #     header sent once per backend connection, before the TLS handshake
+    #     of a backend_tls backend. A backend connection then serves one
+    #     client connection only and is closed with it; a client connection
+    #     keeps as many idle ones as it had in use at the same time in the
+    #     last seconds, at least four. HTTP health checks send a LOCAL
+    #     header (TCP checks send nothing). The backend must expect the
+    #     header on every connection.
+    send_proxy_v2: false
+    # send_proxy_key_file: "/etc/nvelox/proxy.keys"  # sign the header (with
+    #   the first key) for a receiver that sets accept_proxy_key_file; for
+    #   UDP every datagram's header is signed over that datagram
+
+    # Timeouts of this backend. "0" means unlimited.
+    #   connect         — dial timeout (else the listener's, else 10s).
+    #   response_header — how long the backend may take to start answering
+    #                     once the request was sent; past it the client gets
+    #                     504 and the attempt counts as a failure. 60s default.
+    #   read            — (HTTP) the longest the backend may stay silent once
+    #                     it has started answering; past it the response is
+    #                     cut. No limit unless set. Leave it unset for event
+    #                     streams that can be quiet, or keep it above their
+    #                     keep-alive interval.
+    # write, idle and read_header are listener settings: refused here.
+    timeouts:
+      connect: "3s"
+      response_header: "30s"
+
+    # Retry on failure. "connect_failure": the server gave no response
+    # (the default when "on" is empty); "502" / "503": it answered with that
+    # status. A request is resent only if it never reached the server with
+    # its body untouched, or if it has no body and an idempotent method.
+    retry:
+      attempts: 3
+      on: "connect_failure,502,503"
+
+    # Sticky sessions. cookie: the cookie names the server (set on the first
+    # response, HttpOnly, SameSite=Lax, Secure over TLS); header: keyed by a
+    # hash of the header value (values over 256 bytes are ignored).
+    sticky_session:
+      type: "cookie"           # cookie, header, ip_hash
+      cookie_name: "NVELOX_SRV"
+      ttl: "1h"
+
+    # Health checks
+    health_check:
+      active:
+        type: "http"           # tcp or http
+        path: "/health"
+        interval: "5s"
+        timeout: "2s"
+      passive:
+        max_fails: 3           # Out of rotation for 30s after 3 consecutive backend failures
+
+    # Circuit breaker
+    circuit_breaker:
+      enabled: true
+      threshold: 5             # Failures to open circuit
+      timeout: "30s"           # Time before half-open probe
+      half_open_max: 2         # Probe requests in half-open state
+
+    # Backend TLS (connect to upstream via TLS — http/https listeners only;
+    # a tcp/udp listener on a backend_tls backend is rejected at load).
+    # Defaults are secure: InsecureSkipVerify=false, system roots,
+    # MinVersion=TLS1.2. Setting `insecure: true` explicitly opts out of cert
+    # verification and is logged at WARN on startup. A ca_cert or client
+    # key pair that cannot be loaded fails the load / reload — nvelox never
+    # falls back to plaintext.
+    # backend_tls:
+    #   enabled: true
+    #   ca_cert: "/etc/ssl/ca.pem"
+    #   client_cert: "/etc/ssl/client.pem"       # mTLS to backend
+    #   client_key:  "/etc/ssl/client.key"       # both or neither
+    #   server_name: "app.internal"              # name sent (SNI) and checked on
+    #                                            # the certificate; default: the
+    #                                            # host of the server's address
+    #   insecure: false
+
+    # DNS service discovery (re-resolve hostnames in `servers:`).
+    # resolve_interval: "30s"
+    # allow_private_ips: false                   # default. When true,
+    #   backend hostnames may resolve to RFC1918 / 127/8 / link-local /
+    #   CGNAT. Leave false unless backends actually live on a private
+    #   network — prevents DNS-rebinding SSRF on public hostnames.
+
+    servers:
+      - "10.0.0.1:8080"
+      - "10.0.0.2:8080"
+
+  - name: "api-servers"
+    balance: "leastconn"
+    servers:
+      - "10.0.1.1:8080"
+      - "10.0.1.2:8080"
+
+  - name: "game-servers"
+    balance: "roundrobin"
+    servers:
+      - "10.0.2.1"  # 1:1 port mapping (e.g., :10050 → 10.0.2.1:10050)
+      - "10.0.2.2"
+
+  - name: "dns-servers"
+    balance: "random"
+    servers:
+      - "10.0.3.1:53"
+      - "10.0.3.2:53"

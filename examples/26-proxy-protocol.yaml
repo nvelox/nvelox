@@ -1,0 +1,16 @@
+## 26 — PROXY Protocol v2
+## Sends HAProxy PROXY Protocol v2 header with client IP to backend.
+version: "2"
+logging:
+  level: "debug"
+listeners:
+  - name: "pp-proxy"
+    bind: ":9000"
+    protocol: "tcp"
+    backend: "pp-backend"
+backends:
+  - name: "pp-backend"
+    balance: "roundrobin"
+    send_proxy_v2: true
+    servers:
+      - "127.0.0.1:8081"

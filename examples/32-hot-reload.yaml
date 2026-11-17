@@ -1,0 +1,97 @@
+## 32 — SIGHUP Hot Reload
+## Send `kill -HUP $(pidof nvelox)` (or `systemctl reload nvelox`) and
+## nvelox applies the current contents of this file to the running
+## process. No socket churn, no in-flight connection drops.
+##
+## What reload covers:
+##   * Backends — added / removed / server-list changes. Existing
+##     balancer state (LeastConn counts), sticky session stores, and
+##     circuit breakers are preserved for backends kept across reload.
+##   * Routes / ACL / headers / error pages / compression / cache /
+##     body size limits — per-listener config swapped atomically.
+##     In-flight requests finish against the old config; new requests
+##     see the new one.
+##   * TLS certs — re-read from disk for every HTTPS listener.
+##     Operators can rotate Let's Encrypt certs without restart:
+##       certbot renew && systemctl reload nvelox
+##   * Bind addresses — new `bind:` addrs start fresh listeners;
+##     removed addrs gracefully drain (10s timeout) in the background.
+##     server_names / default_server lookups update with the bind group.
+##
+## All-or-nothing:
+##   * Config validation runs first. Bad YAML → reload aborts, current
+##     config stays. Look for "[CONFIG] reload failed (validation)" in
+##     the log.
+##   * Every NEW bind addr is probed for availability before any
+##     mutation. Port conflict → reload aborts, current config stays.
+##     Look for "[RELOAD] cannot bind new addr ..." in the log.
+##   * Concurrent SIGHUPs serialize via the engine's reload mutex.
+##
+## Metrics (Prometheus `/metrics` endpoint when metrics: enabled):
+##   nvelox_reload_total{result="ok"}    — successful reloads
+##   nvelox_reload_total{result="fail"}  — aborted reloads
+##   nvelox_reload_duration_seconds      — wall-clock per reload
+
+version: "2"
+logging:
+  level: "info"
+  access_log: "/var/log/nvelox/access.log"
+  error_log:  "/var/log/nvelox/error.log"
+
+metrics:
+  enabled: true
+  bind:    "127.0.0.1:9100"
+  path:    "/metrics"
+
+listeners:
+  - name: "web"
+    bind: ":80"
+    protocol: "http"
+    backend: "web-pool"
+    headers:
+      response_add:
+        X-Served-By: "nvelox"
+
+  - name: "secure"
+    bind: ":443"
+    protocol: "https"
+    tls:
+      cert: "/etc/nvelox/ssl/site.pem"
+      key:  "/etc/nvelox/ssl/site.key"
+      min_version: "1.2"
+    server_names:
+      - "example.com"
+      - "www.example.com"
+    backend: "web-pool"
+
+backends:
+  - name: "web-pool"
+    balance: "leastconn"
+    servers:
+      - "10.0.0.10:8080"
+      - "10.0.0.11:8080"
+
+# ─── Try the hot-reload flow ─────────────────────────────────────────
+#
+# 1. Start nvelox with this config:
+#       sudo ./nvelox -config examples/32-hot-reload.yaml
+#
+# 2. In another terminal: hit a backend, watch which one answers:
+#       while true; do curl -s -o /dev/null -w "%{http_code} " http://localhost/; sleep 0.2; done
+#
+# 3. Edit this file. Try:
+#    a) Remove the second server from web-pool. Save. Reload:
+#         sudo kill -HUP $(pidof nvelox)
+#       The live traffic in step 2 keeps flowing; only the dropped
+#       server stops getting hits.
+#    b) Add a new listener (e.g. `:8443` HTTPS site_b). Save. Reload.
+#       nvelox grows a new BindGroup; the old :80 / :443 stay live.
+#    c) Replace the cert files on disk (LE renewal style). Reload.
+#       nvelox picks up the new chain; in-flight connections keep
+#       using the old cert until they close.
+#
+# 4. Watch the reload happen:
+#       tail -F /var/log/nvelox/error.log | grep RELOAD
+#
+# 5. Check the reload metrics:
+#       curl -s 127.0.0.1:9100/metrics | grep nvelox_reload

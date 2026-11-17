@@ -1,0 +1,58 @@
+# This image compiles nvelox from source, which needs access to the private
+# module github.com/nvelox/ngx (the ngx engine). The released images are
+# built from the release binaries with Dockerfile.goreleaser.
+
+# Build Stage
+FROM golang:1.27-alpine AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apk add --no-cache git
+
+# Copy Go modules
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy Source
+COPY . .
+
+# Build Static Binary
+# CGO_ENABLED=0 for static binary
+RUN CGO_ENABLED=0 GOOS=linux go build -o nvelox main.go
+
+# Final Stage
+FROM alpine:latest
+
+WORKDIR /app
+
+# Install runtime dependencies (e.g. ca-certificates for TLS). mailcap
+# provides /etc/mime.types: the static file handler takes Content-Type from
+# the file extension (Go's built-in table plus this file) and falls back to
+# application/octet-stream, so without it .woff/.woff2/.ttf/.md/... would be
+# sent as octet-stream.
+RUN apk add --no-cache ca-certificates tzdata mailcap
+
+# Create nvelox user/group
+RUN addgroup -S nvelox && adduser -S nvelox -G nvelox
+
+# Copy Binary
+COPY --from=builder /app/nvelox /usr/local/bin/nvelox
+
+# Copy Example Config as Default
+COPY nvelox.example.yaml /etc/nvelox/nvelox.conf
+
+# The license texts travel with the image
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /usr/share/licenses/nvelox/
+
+# Create Config and Log Directories
+RUN mkdir -p /etc/nvelox/config.d && \
+    mkdir -p /var/log/nvelox && \
+    chown -R nvelox:nvelox /etc/nvelox /var/log/nvelox
+
+# Use nvelox user (Security Best Practice)
+USER nvelox
+
+# Entrypoint
+ENTRYPOINT ["/usr/local/bin/nvelox"]
+CMD ["-config", "/etc/nvelox/nvelox.conf"]
