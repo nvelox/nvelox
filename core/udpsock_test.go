@@ -285,3 +285,50 @@ func TestUDPSock_LateCloseOfAnOldSessionLeavesTheNewOne(t *testing.T) {
 		t.Fatalf("%d session slots held, want 1", total)
 	}
 }
+
+// A session that ended before its backend socket was connected (a denylist
+// add closes the sessions of the clients it blocks, at any moment) gets no
+// backend: nothing is linked to it, nothing stays in the pool, and the
+// handler goes on.
+func TestUDPSock_SessionEndedBeforeItsBackendConnects(t *testing.T) {
+	stSocketsOnly(t)
+	be, got := stUDPBackend(t, stEchoReply)
+	addr := stFreeUDPAddr(t)
+	e := stStart(t, &config.Config{
+		Listeners: []config.Listener{{Name: "u", Bind: addr, Protocol: "udp", Backend: "be"}},
+		Backends:  []config.Backend{{Name: "be", Servers: []string{be}}},
+	}, nil)
+	h := stHandler(e)
+	sock := e.udpSocks[0]
+	l := h.findListenerForAddr(sock.laddr)
+	if l == nil {
+		t.Fatal("no listener for the socket")
+	}
+
+	// A session as OnOpen leaves it just before it connects the backend,
+	// already closed and out of the table.
+	from := netip.MustParseAddrPort("127.0.0.9:40009")
+	c := &udpConn{sock: sock, remote: from, raddr: net.UDPAddrFromAddrPort(from)}
+	ctx := &ConnContext{StartTime: time.Now(), Proto: "udp", RealClientIP: "127.0.0.9", listener: l, closed: true}
+	ctx.Buffer = []byte("must not reach the backend")
+
+	h.connectBackend(c, ctx, l)
+
+	if d, ok := stWaitGot(got, 400*time.Millisecond); ok {
+		t.Fatalf("the ended session's datagram reached the backend: %q", d)
+	}
+	ctx.Mu.Lock()
+	linked := ctx.PeerConn != nil
+	ctx.Mu.Unlock()
+	if linked {
+		t.Fatal("a backend socket was linked to the ended session")
+	}
+	key := "127.0.0.9:40009|" + strconv.Itoa(portOf(sock.laddr)) + "|false|" + be
+	if s := e.UDPPool.Get(key); s != nil {
+		t.Fatal("the ended session's backend socket is in the pool")
+	}
+	// The listener serves the next client.
+	if d, err := stUDPExchange("127.0.0.1", addr, []byte("next"), 2*time.Second); err != nil || string(d) != "next" {
+		t.Fatalf("exchange after it: %q, %v", d, err)
+	}
+}

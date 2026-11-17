@@ -288,7 +288,7 @@ func (h *ProxyEventHandler) onOpen(c *udpConn, viaListedInterface bool) {
 		return
 	}
 
-	h.connectBackend(c, l)
+	h.connectBackend(c, clientCtx, l)
 }
 
 // closeOnOpen closes a UDP session being REJECTED from OnOpen (or failing
@@ -497,7 +497,7 @@ func (h *ProxyEventHandler) OnData(c *udpConn, data []byte) {
 		if admitted {
 			// This datagram is buffered below until the backend connects
 			// (or written at once to a pooled backend connection).
-			h.connectBackend(c, l)
+			h.connectBackend(c, ctx, l)
 		}
 	}
 
@@ -542,9 +542,12 @@ func listenerName(l *ListenerConfig) string {
 	return l.Name
 }
 
-func (h *ProxyEventHandler) connectBackend(clientConn *udpConn, l *ListenerConfig) {
+func (h *ProxyEventHandler) connectBackend(clientConn *udpConn, clientCtx *ConnContext, l *ListenerConfig) {
 	// Runs inside OnOpen (a direct client) or inside a relayed session's
-	// first OnData: every failure closes through closeOnOpen.
+	// first OnData: every failure closes through closeOnOpen. The session
+	// is the caller's: it may have been closed in the meantime (a denylist
+	// add closes the sessions of the clients it blocks), and is then no
+	// longer in the table.
 	bv := h.engine.backends() // one consistent view for this session (H6)
 	balancer, ok := bv.Balancers[l.Backend]
 	if !ok {
@@ -573,7 +576,6 @@ func (h *ProxyEventHandler) connectBackend(clientConn *udpConn, l *ListenerConfi
 	}
 
 	// Store original balancer key before target normalization (must match conns map key)
-	clientCtx := h.getCtx(clientConn)
 	clientCtx.Mu.Lock()
 	clientCtx.BackendServer = target
 	clientCtx.BalancerRef = balancer
@@ -587,12 +589,10 @@ func (h *ProxyEventHandler) connectBackend(clientConn *udpConn, l *ListenerConfi
 	}
 
 	// These sessions are UDP only; plain TCP runs serveTCP (l4tcp.go).
-	h.connectBackendUDP(clientConn, dialTarget, backend, l)
+	h.connectBackendUDP(clientConn, clientCtx, dialTarget, backend, l)
 }
 
-func (h *ProxyEventHandler) connectBackendUDP(clientConn *udpConn, target string, backend *config.Backend, l *ListenerConfig) {
-	clientCtx := h.getCtx(clientConn)
-
+func (h *ProxyEventHandler) connectBackendUDP(clientConn *udpConn, clientCtx *ConnContext, target string, backend *config.Backend, l *ListenerConfig) {
 	sendProxyV2 := backend != nil && backend.SendProxyV2
 	// acceptInbound: this listener trusts an inbound PROXY-v2 header from the
 	// immediate peer (a relay in accept_proxy_from). When set, the
@@ -645,8 +645,13 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *udpConn, target string
 	// socket (one could write into, or close, the other's flow).
 	poolKey := fmt.Sprintf("%s|%d|%t|%s", clientConn.RemoteAddr().String(), portOf(clientConn.LocalAddr()), clientCtx.viaInterface, clientCtx.BackendServer)
 	if session := h.engine.UDPPool.Get(poolKey); session != nil {
-		// Reuse existing backend connection
+		// Reuse existing backend connection, unless the session ended
+		// meanwhile: it is not linked then, and not counted by the balancer.
 		clientCtx.Mu.Lock()
+		if clientCtx.closed {
+			clientCtx.Mu.Unlock()
+			return
+		}
 		clientCtx.PeerConn = session.BackendConn
 		if !acceptInbound {
 			clientCtx.ProxyHeader = proxyHdr // else OnData builds it from the real client
