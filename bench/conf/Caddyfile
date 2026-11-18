@@ -1,0 +1,67 @@
+# Caddy under test. Admin API off, no automatic HTTPS. Not Caddy's default: the idle pool to the
+# origin raised from 32 to 256 connections per host, as for the other proxies. HTTP/3 is enabled
+# on its own listener only. Caddy's stock image has no TCP or UDP proxy.
+{
+	admin off
+	auto_https off
+	persist_config off
+	default_bind 127.0.0.1
+	servers 127.0.0.1:27155 {
+		protocols h1 h2 h3
+	}
+	servers {
+		protocols h1 h2
+	}
+}
+
+(origin) {
+	reverse_proxy 127.0.0.1:27000 {
+		transport http {
+			keepalive 600s
+			keepalive_idle_conns 1024
+			keepalive_idle_conns_per_host 256
+		}
+	}
+}
+
+# HTTP
+http://:27150 {
+	import origin
+}
+
+# Large uploads, to the sink (the large downloads use :27150)
+http://:27157 {
+	reverse_proxy 127.0.0.1:27600 {
+		transport http {
+			keepalive 600s
+			keepalive_idle_conns 1024
+			keepalive_idle_conns_per_host 256
+		}
+	}
+}
+
+# HTTPS
+https://:27151 {
+	tls /certs/cert.pem /certs/key.pem
+	import origin
+}
+
+# HTTP with one access-log line per request, discarded
+http://:27153 {
+	log {
+		output discard
+	}
+	import origin
+}
+
+# HTTP/2
+https://:27154 {
+	tls /certs/cert.pem /certs/key.pem
+	import origin
+}
+
+# HTTP/3
+https://:27155 {
+	tls /certs/cert.pem /certs/key.pem
+	import origin
+}

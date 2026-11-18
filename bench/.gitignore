@@ -1,0 +1,4 @@
+.work/
+__pycache__/
+# the raw output of the load tools is part of a published run (the repository ignores *.log)
+!results/*/tools.log

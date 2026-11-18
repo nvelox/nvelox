@@ -1,0 +1,12 @@
+# The same TLS on the client side for every proxy: TLS 1.3 with AES-128-GCM.
+openssl_conf = openssl_init
+
+[openssl_init]
+ssl_conf = ssl_sect
+
+[ssl_sect]
+system_default = system_default_sect
+
+[system_default_sect]
+MinProtocol = TLSv1.3
+Ciphersuites = TLS_AES_128_GCM_SHA256

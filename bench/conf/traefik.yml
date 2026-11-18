@@ -1,0 +1,30 @@
+# Traefik under test. No dashboard or API, no version check, no usage reporting. Not Traefik's
+# default: maxIdleConnsPerHost raised from 200 to 256, as for the other proxies. Traefik's access
+# log is a global switch, so the access-log test runs a second Traefik (traefik-log.yml).
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+log:
+  level: ERROR
+entryPoints:
+  web:
+    address: "127.0.0.1:27140"
+  websecure:
+    address: "127.0.0.1:27141"
+  tcp:
+    address: "127.0.0.1:27142"
+  h2:
+    address: "127.0.0.1:27144"
+  h3:
+    address: "127.0.0.1:27145"
+    http3: {}
+  udp:
+    address: "127.0.0.1:27146/udp"
+  upload:
+    address: "127.0.0.1:27147"
+serversTransport:
+  maxIdleConnsPerHost: 256
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: false

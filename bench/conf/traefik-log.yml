@@ -1,0 +1,18 @@
+# The second Traefik, for the access-log test: one HTTP entry point and one access-log line per
+# request, discarded.
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+log:
+  level: ERROR
+accessLog:
+  filePath: /dev/null
+entryPoints:
+  weblog:
+    address: "127.0.0.1:27143"
+serversTransport:
+  maxIdleConnsPerHost: 256
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: false

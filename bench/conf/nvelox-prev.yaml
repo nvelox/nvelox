@@ -1,0 +1,46 @@
+# The earlier nvelox release, as a reference.
+# nvelox writes its access log in every HTTP test (here to /dev/null), so the "http" listener also
+# serves the test with the access log on. HTTPS, HTTP/2 and HTTP/3 share the "https" listener.
+version: "2"
+logging:
+  level: "error"
+  access_log: "/dev/null"
+listeners:
+  - name: "http"
+    bind: "127.0.0.1:27160"
+    protocol: "http"
+    backend: "origin"
+  - name: "https"
+    bind: "127.0.0.1:27161"
+    protocol: "https"
+    http3: true
+    backend: "origin"
+    tls:
+      cert: "/certs/cert.pem"
+      key: "/certs/key.pem"
+  - name: "tcp"
+    bind: "127.0.0.1:27162"
+    protocol: "tcp"
+    backend: "origin"
+  - name: "udp"
+    bind: "127.0.0.1:27166"
+    protocol: "udp"
+    backend: "origin_udp"
+  # the large uploads go to the sink; the large downloads use the "http" listener
+  - name: "upload"
+    bind: "127.0.0.1:27167"
+    protocol: "http"
+    backend: "sink"
+backends:
+  - name: "origin"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:27000"
+  - name: "origin_udp"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:27500"
+  - name: "sink"
+    balance: "roundrobin"
+    servers:
+      - "127.0.0.1:27600"
