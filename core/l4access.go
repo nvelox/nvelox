@@ -136,6 +136,9 @@ func (l *ListenerConfig) prepare() error {
 		}
 		l.access = a
 	}
+	if l.Protocol == "udp" {
+		l.udpRefusals = &udpRefusals{}
+	}
 	if l.TLS != nil {
 		ca, err := tlsutil.LoadClientAuth(*l.TLS)
 		if err != nil {

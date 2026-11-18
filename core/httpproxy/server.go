@@ -2,6 +2,7 @@ package httpproxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -19,6 +20,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/nvelox/ngx/web"
 
 	"nvelox/config"
 	"nvelox/core/acl"
@@ -125,9 +128,9 @@ type HTTPServer struct {
 	tunnels   *tunnelSet
 	tunnelGen uint64
 
-	// fastCfg is the site's configuration as the event-loop fast path
-	// applies it (fast.go), built on first use.
-	fastCfg atomic.Pointer[fastSiteConfig]
+	// fastCfg is the site as the event loops serve it (fasthost.go), built
+	// on first use.
+	fastCfg atomic.Pointer[web.Site]
 }
 
 // ListenerConfig mirrors core.ListenerConfig to avoid circular imports.
@@ -169,6 +172,10 @@ type ListenerConfig struct {
 	// TLS.ClientAuth / ClientCA), nil when off. The engine parses it once;
 	// a BindGroup loads it from TLS itself when a caller left it nil.
 	ClientAuth *tlsutil.ClientAuth
+	// AccessLogOff: the site's requests have no access-log lines, on
+	// net/http and on the event loops (the site's access_log, or
+	// logging.access).
+	AccessLogOff bool
 }
 
 // NewHTTPServer creates an HTTP server for the given listener.
@@ -608,11 +615,13 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// upstream is the backend server of the last proxy attempt ("" when the
 	// request was answered without one).
 	var upstream string
-	defer func() {
-		duration := float64(time.Since(start).Microseconds()) / 1000.0
-		logging.AccessHTTP(clientIP, r.Host, r.Method, logPath, r.Proto, rec.statusForLog(), rec.bytesForLog(), duration, upstream, userAgent,
-			fetchSite, fetchDest, r.TLS != nil, reqID, s.Listener.Name)
-	}()
+	if !s.Listener.AccessLogOff {
+		defer func() {
+			duration := float64(time.Since(start).Microseconds()) / 1000.0
+			logging.AccessHTTP(clientIP, r.Host, r.Method, logPath, r.Proto, rec.statusForLog(), rec.bytesForLog(), duration, upstream, userAgent,
+				fetchSite, fetchDest, r.TLS != nil, reqID, s.Listener.Name)
+		}()
+	}
 
 	// ip_denylist, the dynamic denylist, ip_allowlist.
 	if status := s.clientStatus(clientIP); status != 0 {
@@ -1109,10 +1118,47 @@ func (s *HTTPServer) setForwardedHeaders(r *http.Request) {
 	s.applyForwardedHeaders(r.Header, r)
 }
 
+// A forwarding header spelled with an underscore (X_Forwarded_For,
+// X-Real_IP) is another header to nvelox and to HTTP. To a backend that
+// hands headers to its application as variables (CGI, WSGI, Rack: both
+// spellings become HTTP_X_FORWARDED_FOR) it is the same one, and which of
+// the two the application then sees is the backend's affair. Such a header
+// is no claim of a proxy in front of nvelox, whoever sent it: it is
+// removed, from trusted peers too.
+
+// forwardingAlias reports whether name has an underscore and names, with a
+// hyphen for every underscore, a forwarding header.
+func forwardingAlias(name []byte) bool {
+	if bytes.IndexByte(name, '_') < 0 || len(name) > 32 {
+		return false
+	}
+	return forwardingHeaders[http.CanonicalHeaderKey(strings.ReplaceAll(string(name), "_", "-"))]
+}
+
+// forwardingHeaders are the forwarding headers by their canonical names:
+// those of applyForwardedHeaders and untrustedForwardingHeaders.
+var forwardingHeaders = func() map[string]bool {
+	m := map[string]bool{"X-Forwarded-For": true, "X-Forwarded-Proto": true, "X-Real-Ip": true}
+	for _, h := range untrustedForwardingHeaders {
+		m[http.CanonicalHeaderKey(h)] = true
+	}
+	return m
+}()
+
+// dropForwardingAliases removes them from h.
+func dropForwardingAliases(h http.Header) {
+	for name := range h {
+		if strings.IndexByte(name, '_') >= 0 && forwardingAlias([]byte(name)) {
+			delete(h, name)
+		}
+	}
+}
+
 // applyForwardedHeaders sets the forwarding headers for the inbound request
 // in on dst (in.Header itself, or the upstream request's headers). Every
 // X-Forwarded-For line the trusted peer sent is kept, joined in order.
 func (s *HTTPServer) applyForwardedHeaders(dst http.Header, in *http.Request) {
+	dropForwardingAliases(dst)
 	peer := peerHost(in.RemoteAddr)
 	proto := "http"
 	if in.TLS != nil {

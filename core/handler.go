@@ -99,14 +99,10 @@ type ConnContext struct {
 	limiter      *ConnLimiter
 	resolvedSrc  net.Addr
 	refused      string
+	refusedQuiet bool // refused, and its source has had its line in the access log lately
 	closed       bool
-	// pendingHeld: the session holds a place among the relay sessions
-	// waiting for a header (udpSessionLimiter.acquirePending), and
-	// pendingTimer ends it if no header comes. viaInterface: the session
-	// arrived on a socket bound to one of the listener's
-	// accept_proxy_interfaces (part of its backend-socket key).
-	pendingHeld  bool
-	pendingTimer *time.Timer
+	// viaInterface: the session arrived on a socket bound to one of the
+	// listener's accept_proxy_interfaces (part of its backend-socket key).
 	viaInterface bool
 }
 
@@ -170,17 +166,41 @@ func (h *ProxyEventHandler) onOpen(c *udpConn, viaListedInterface bool) {
 	peerTrusted := l.proxyTrust.trusts(c.RemoteAddr()) &&
 		(len(l.proxyInterfaces) == 0 || viaListedInterface)
 
+	// refuse counts a new session that is refused for reason, and writes
+	// the refusal to the access log (status) unless its source has had
+	// its line lately.
+	refuse := func(reason, status string) {
+		if h.udpRefused(l.udpRefusals, reason, l.Name, c.remote.Addr()) && l.logsAccess() {
+			logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, status, 0, 0, 0)
+		}
+		closeOnOpen(c)
+	}
+
+	// Access policy (ip_denylist, the dynamic admin-API denylist,
+	// ip_allowlist, acl) on the immediate peer when it IS the client,
+	// before the rate limit: a source the policy refuses takes nothing
+	// from the listener's rate. (A relay's client is checked when its
+	// header names it.)
+	ip := ipOf(c.RemoteAddr())
+	if !peerTrusted {
+		if ok, status := h.l4Admit(l, ip); !ok {
+			refuse(udpDropOfStatus(status), status)
+			return
+		}
+	}
+
 	// Check rate limit
 	if rl, ok := h.engine.RateLimiters[l.Name]; ok {
 		if !rl.Allow() {
-			logging.Warn("[RATE] Connection from %s rejected (rate limit on %s)", c.RemoteAddr(), l.Name)
 			// Attribute the rejection only when the peer IS the client (untrusted/direct).
 			// For a trusted relay the real client is unknowable here (no header parsed
 			// yet), so emitting would misattribute the relay — suppress it.
-			if !peerTrusted {
-				logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, l4StatusRateLimited, 0, 0, 0)
+			if peerTrusted {
+				h.udpDrops.note(udpDropRateLimit, l.Name, c.RemoteAddr())
+				closeOnOpen(c)
+			} else {
+				refuse(udpDropRateLimit, l4StatusRateLimited)
 			}
-			closeOnOpen(c)
 			return
 		}
 	}
@@ -189,17 +209,10 @@ func (h *ProxyEventHandler) onOpen(c *udpConn, viaListedInterface bool) {
 	// datagram, which OnData checks. Until a valid header names a client the
 	// policy admits, the session holds no session slot, no backend slot and
 	// no backend connection (H5): a datagram without one ends it at once, so
-	// a source forged to look like a relay cannot hold capacity. The timer
-	// ends a session whose first datagram never reaches OnData.
+	// a source forged to look like a relay cannot hold capacity. Nor does
+	// such a session wait: the datagram that begins it (never an empty one)
+	// goes to OnData next.
 	if peerTrusted {
-		// Such sessions hold no session slot, so they have a cap of their
-		// own; a session no header reaches (an empty datagram) ends after
-		// udpRelayPendingTimeout.
-		if reason := h.udpSessions.acquirePending(); reason != "" {
-			h.udpDrops.note(reason, l.Name, c.RemoteAddr())
-			closeOnOpen(c)
-			return
-		}
 		h.engine.ActiveConns.Add(1)
 		relayCtx := &ConnContext{
 			IsBackend:    false,
@@ -212,40 +225,22 @@ func (h *ProxyEventHandler) onOpen(c *udpConn, viaListedInterface bool) {
 			LocalAddr:    c.LocalAddr(),
 			listener:     l,
 			relayPending: true,
-			pendingHeld:  true,
 			viaInterface: viaListedInterface,
 		}
 		h.setCtx(c, relayCtx)
-		relayCtx.Mu.Lock()
-		relayCtx.pendingTimer = time.AfterFunc(h.engine.udpRelayPendingTimeout, func() {
-			relayCtx.Mu.Lock()
-			pending := relayCtx.relayPending && !relayCtx.closed
-			relayCtx.Mu.Unlock()
-			if pending {
-				_ = c.Close()
-			}
-		})
-		relayCtx.Mu.Unlock()
 		return
 	}
 
-	// Access policy (ip_denylist, the dynamic admin-API denylist,
-	// ip_allowlist, acl) on the immediate peer, which IS the client.
-	ip := ipOf(c.RemoteAddr())
-	if ok, status := h.l4Admit(l, ip); !ok {
-		logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, status, 0, 0, 0)
-		closeOnOpen(c)
-		return
-	}
 	sessionIP := addrKey(ip)
 
 	// Session limits: a global cap and a per-client-IP cap.
 	if reason := h.udpSessions.acquire(sessionIP); reason != "" {
-		h.udpDrops.note(reason, l.Name, c.RemoteAddr())
 		if reason == udpDropSourceLimit {
-			logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, l4StatusRateLimited, 0, 0, 0)
+			refuse(reason, l4StatusRateLimited)
+		} else {
+			h.udpDrops.note(reason, l.Name, c.RemoteAddr())
+			closeOnOpen(c)
 		}
-		closeOnOpen(c)
 		return
 	}
 	// Backend max_connections: one slot per UDP session, released in OnClose.
@@ -253,9 +248,7 @@ func (h *ProxyEventHandler) onOpen(c *udpConn, viaListedInterface bool) {
 	if cl, ok := h.engine.backends().ConnLimiters[l.Backend]; ok {
 		if !cl.Acquire() {
 			h.udpSessions.release(sessionIP)
-			logging.Warn("[CONN] listener %s: backend %s at max_connections — refusing %s", l.Name, l.Backend, c.RemoteAddr())
-			logging.AccessL4(ipStrOf(c.RemoteAddr()), l.Protocol, dstPort, l4StatusRateLimited, 0, 0, 0)
-			closeOnOpen(c)
+			refuse(udpDropBackendLimit, l4StatusRateLimited)
 			return
 		}
 		limiter = cl
@@ -315,13 +308,9 @@ func (h *ProxyEventHandler) OnClose(c *udpConn, err error) {
 	realClientIP := ctx.RealClientIP
 	peerTrusted := ctx.PeerTrusted
 	clientResolved := ctx.ClientResolved
-	refused := ctx.refused
+	refused, refusedQuiet := ctx.refused, ctx.refusedQuiet
 	slotHeld, sessionIP, limiter := ctx.slotHeld, ctx.sessionIP, ctx.limiter
-	pendingHeld := ctx.pendingHeld
-	ctx.pendingHeld = false
-	if ctx.pendingTimer != nil {
-		ctx.pendingTimer.Stop()
-	}
+	listener := ctx.listener
 	ctx.PeerConn = nil // prevent double-close
 	ctx.closed = true  // a late OnData must not charge the released session
 	ctx.limiter = nil
@@ -340,9 +329,6 @@ func (h *ProxyEventHandler) OnClose(c *udpConn, err error) {
 		if slotHeld {
 			h.udpSessions.release(sessionIP)
 		}
-		if pendingHeld {
-			h.udpSessions.releasePending()
-		}
 		if limiter != nil {
 			limiter.Release()
 		}
@@ -356,7 +342,7 @@ func (h *ProxyEventHandler) OnClose(c *udpConn, err error) {
 		// (connection died before its inbound PROXY-v2 header was read): attributing the
 		// record to the relay could get the relay itself blocked. A direct
 		// (untrusted) peer IS the client, so it always emits.
-		if !peerTrusted || clientResolved {
+		if (!peerTrusted || clientResolved) && !refusedQuiet {
 			status := "no_route"
 			switch {
 			case refused != "":
@@ -364,8 +350,10 @@ func (h *ProxyEventHandler) OnClose(c *udpConn, err error) {
 			case peer != nil:
 				status = "ok"
 			}
-			durMs := float64(time.Since(ctx.StartTime).Nanoseconds()) / 1e6
-			logging.AccessL4(realClientIP, proto, dstPort, status, 0, 0, durMs)
+			if listener.logsAccess() {
+				durMs := float64(time.Since(ctx.StartTime).Nanoseconds()) / 1e6
+				logging.AccessL4(realClientIP, proto, dstPort, status, 0, 0, durMs)
+			}
 		}
 		h.engine.ActiveConns.Done()
 	}
@@ -439,12 +427,12 @@ func (h *ProxyEventHandler) OnData(c *udpConn, data []byte) {
 			ctx.ClientResolved = true
 			ctx.resolvedSrc = src
 			ip := ipOf(src)
+			key := addrKey(ip)
 			ok, status := h.l4Admit(l, ip)
+			reason := udpDropOfStatus(status)
 			if ok {
-				key := addrKey(ip)
-				if reason := h.udpSessions.acquire(key); reason != "" {
+				if reason = h.udpSessions.acquire(key); reason != "" {
 					ok, status = false, l4StatusRateLimited
-					h.udpDrops.note(reason, listenerName(l), src)
 				} else {
 					ctx.slotHeld, ctx.sessionIP = true, key
 				}
@@ -455,35 +443,36 @@ func (h *ProxyEventHandler) OnData(c *udpConn, data []byte) {
 					if cl.Acquire() {
 						ctx.limiter = cl
 					} else {
-						ok, status = false, l4StatusRateLimited
-						logging.Warn("[CONN] listener %s: backend %s at max_connections — refusing %s", l.Name, l.Backend, src)
+						ok, status, reason = false, l4StatusRateLimited, udpDropBackendLimit
 					}
 				}
 			}
 			if !ok {
+				// A refused client's relay sends on as the client does:
+				// the refusal is counted, and has its line in the access
+				// log (written when the session closes) once in a while.
 				ctx.refused = status
+				ctx.refusedQuiet = !h.udpRefused(l.udpRefusals, reason, listenerName(l), key)
 				ctx.Mu.Unlock()
 				c.Close()
 				return
 			}
 			ctx.relayPending = false
-			if ctx.pendingHeld {
-				ctx.pendingHeld = false
-				h.udpSessions.releasePending()
-			}
-			if ctx.pendingTimer != nil {
-				ctx.pendingTimer.Stop()
-			}
 			admitted = true
 			// The outbound header names the client the relay named; the
 			// backend connection (dialed below) sends it with every datagram.
 			if be := bv.Backends[l.Backend]; be != nil && be.SendProxyV2 {
 				var buf bytes.Buffer
-				if err := proxy.WriteProxyHeaderV2(&buf, src, localAddr); err == nil {
-					ctx.ProxyHeader = buf.Bytes()
-				} else {
-					logging.Warn("[UDP] inbound PROXY v2 rebuild failed: %v", err)
+				if err := proxy.WriteProxyHeaderV2(&buf, src, localAddr); err != nil {
+					// A session whose header cannot be built gets no
+					// backend: its datagrams never go out without the
+					// header the backend expects.
+					ctx.Mu.Unlock()
+					h.udpDrops.note(udpDropNoBackendHeader, listenerName(l), src)
+					c.Close()
+					return
 				}
+				ctx.ProxyHeader = buf.Bytes()
 			}
 		} else if !sameUDPClient(ctx.resolvedSrc, src) {
 			// The session was admitted (and is attributed) for the client
@@ -506,7 +495,17 @@ func (h *ProxyEventHandler) OnData(c *udpConn, data []byte) {
 		peer := ctx.PeerConn
 		hdr, sl := ctx.ProxyHeader, ctx.listener
 		ctx.Mu.Unlock()
-		_, err := writeWithProxy(peer, hdr, h.sendKey(sl), data)
+		// The session has the header exactly when its backend wants it
+		// now. A reload that changed send_proxy_v2 ends the session: the
+		// client's next datagram opens one as the backend wants it, and
+		// nothing goes out in the other form.
+		key, wanted := h.sendOpts(sl)
+		if wanted != (len(hdr) > 0) {
+			h.udpDrops.note(udpDropHeaderChanged, listenerName(sl), c.RemoteAddr())
+			c.Close()
+			return
+		}
+		_, err := writeWithProxy(peer, hdr, key, data)
 		if err != nil {
 			logging.Error("[DATA] Write failed: %v", err)
 		}
@@ -624,11 +623,13 @@ func (h *ProxyEventHandler) connectBackendUDP(clientConn *udpConn, clientCtx *Co
 	var proxyHdr []byte
 	if sendProxyV2 && !acceptInbound {
 		var buf bytes.Buffer
-		if err := proxy.WriteProxyHeaderV2(&buf, clientConn.RemoteAddr(), clientConn.LocalAddr()); err == nil {
-			proxyHdr = buf.Bytes()
-		} else {
-			logging.Warn("[UDP] PROXY v2 header build failed: %v", err)
+		if err := proxy.WriteProxyHeaderV2(&buf, clientConn.RemoteAddr(), clientConn.LocalAddr()); err != nil {
+			// No header, no backend: see the relay's session in OnData.
+			h.udpDrops.note(udpDropNoBackendHeader, listenerName(l), clientConn.RemoteAddr())
+			closeOnOpen(clientConn)
+			return
 		}
+		proxyHdr = buf.Bytes()
 	}
 
 	// Check UDP pool for existing session (session affinity).
@@ -821,17 +822,24 @@ func ipStrOf(addr net.Addr) string {
 	return ""
 }
 
-// sendKey is the key a datagram of a session of listener l is signed with
-// now: its backend's current send_proxy_key_file (a reload may have rotated
-// it since the session began), nil for none.
-func (h *ProxyEventHandler) sendKey(l *ListenerConfig) []byte {
+// sendOpts is what the backend of listener l asks of a session's datagrams
+// now: whether it wants the PROXY v2 header (send_proxy_v2), and the key
+// the header is signed with (send_proxy_key_file, nil for none). A reload
+// may have changed either since the session began.
+func (h *ProxyEventHandler) sendOpts(l *ListenerConfig) (key []byte, header bool) {
 	if l == nil {
-		return nil
+		return nil, false
 	}
 	if be := h.engine.backends().Backends[l.Backend]; be != nil {
-		return be.SendProxyKey
+		return be.SendProxyKey, be.SendProxyV2
 	}
-	return nil
+	return nil, false
+}
+
+// sendKey is sendOpts' key alone.
+func (h *ProxyEventHandler) sendKey(l *ListenerConfig) []byte {
+	key, _ := h.sendOpts(l)
+	return key
 }
 
 // writeWithProxy writes data to peer, optionally prepending a PROXY v2

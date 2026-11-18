@@ -20,9 +20,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nvelox/ngx"
-	"golang.org/x/sys/unix"
-
 	"nvelox/config"
 	"nvelox/core/logging"
 )
@@ -75,63 +72,6 @@ func startFastGroup(t *testing.T, s *HTTPServer) *BindGroup {
 	return g
 }
 
-type fastConnStats struct {
-	conns, pending int
-}
-
-// connStats reads, on the loops, the live connections of g's fast server.
-func connStats(g *BindGroup) fastConnStats {
-	fs := g.fast
-	var mu sync.Mutex
-	var st fastConnStats
-	var wg sync.WaitGroup
-	for _, l := range fs.group.Loops() {
-		wg.Add(1)
-		l.Post(func() {
-			defer wg.Done()
-			mu.Lock()
-			defer mu.Unlock()
-			for c := fs.lists[l.ID()].head; c != nil; c = c.lnext {
-				st.conns++
-				st.pending += len(c.pending)
-			}
-		})
-	}
-	wg.Wait()
-	return st
-}
-
-// A client pipelines requests the fast path answers itself (an ACL deny)
-// and reads nothing. Like net/http, the next request waits until the last
-// response is out: what is held stays one response, and the write limit
-// closes the connection.
-func TestFastPath_PipelinedAnswersWaitForTheClient(t *testing.T) {
-	be := newRawBackend(t)
-	l := &ListenerConfig{Name: "site", Addr: "127.0.0.1:0", Protocol: "http",
-		Timeouts: config.TimeoutConfig{Write: "300ms", Read: "300ms"},
-		ACL:      []config.ACLRule{{Action: "deny", Match: config.ACLMatch{PathPrefix: "/deny"}}}}
-	s := fastTestSite(l, &config.Backend{Servers: []string{be.addr()}})
-	page := bytes.Repeat([]byte("x"), 64<<10)
-	s.ErrorPages = map[int][]byte{403: page}
-	quietLog(t)
-	g := startFastGroup(t, s)
-	c := smallRcvDial(t, g.BoundAddr().String())
-	payload := strings.Repeat("GET /deny HTTP/1.1\r\nHost: x\r\n\r\n", 1000)
-	c.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	go io.WriteString(c, payload)
-	time.Sleep(200 * time.Millisecond)
-	if st := connStats(g); st.pending > 2*len(page) {
-		t.Fatalf("%d bytes of responses held for a client that reads nothing (one response is %d)", st.pending, len(page))
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for connStats(g).conns > 0 {
-		if time.Now().After(deadline) {
-			t.Fatalf("connection still open long after the 300ms write limit: %+v", connStats(g))
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-}
-
 // A client that pipelines and then reads gets every answer, in order.
 func TestFastPath_PipelinedAnswersAllServed(t *testing.T) {
 	be := newRawBackend(t)
@@ -173,28 +113,6 @@ func TestFastPath_PipelinedAnswersAllServed(t *testing.T) {
 	}
 }
 
-// appendBuf grows geometrically past the largest pool class: appending in
-// small pieces is linear, not quadratic.
-func TestAppendBufGrowsGeometrically(t *testing.T) {
-	var b []byte
-	piece := bytes.Repeat([]byte("y"), 1500)
-	grows := 0
-	for i := 0; i < (4<<20)/len(piece); i++ {
-		c := cap(b)
-		appendBuf(&b, piece)
-		if cap(b) != c {
-			grows++
-		}
-	}
-	if len(b) != (4<<20)/len(piece)*len(piece) {
-		t.Fatalf("len %d", len(b))
-	}
-	if grows > 12 {
-		t.Fatalf("%d reallocations for 4 MiB in 1500-byte pieces", grows)
-	}
-	releaseBuf(&b)
-}
-
 // informationalBackend answers one request with hints 1xx responses of
 // hintSize bytes each (split into the given write sizes), then a 200.
 func informationalBackend(t *testing.T, hints, hintSize int, split int) string {
@@ -232,22 +150,6 @@ func informationalBackend(t *testing.T, hints, hintSize int, split int) string {
 		time.Sleep(10 * time.Second)
 	}()
 	return ln.Addr().String()
-}
-
-// A backend floods informational responses while the client reads
-// nothing: they wait in the backend's socket, not in the proxy.
-func TestFastPath_InformationalBackpressure(t *testing.T) {
-	addr := informationalBackend(t, 5000, 4000, 64<<10)
-	l := &ListenerConfig{Name: "site", Addr: "127.0.0.1:0", Protocol: "http"}
-	s := fastTestSite(l, &config.Backend{Servers: []string{addr}})
-	quietLog(t)
-	g := startFastGroup(t, s)
-	c := smallRcvDial(t, g.BoundAddr().String())
-	io.WriteString(c, "GET /x HTTP/1.1\r\nHost: x\r\n\r\n")
-	time.Sleep(2 * time.Second)
-	if st := connStats(g); st.pending > 256<<10 {
-		t.Fatalf("%d bytes of 1xx responses held for a client that reads nothing", st.pending)
-	}
 }
 
 // Every informational response reaches the client exactly once, whatever
@@ -394,52 +296,6 @@ func TestFastPath_EarlyResponseAfterHead(t *testing.T) {
 	}
 }
 
-// Idle backend connections are kept per site and backend: a site never
-// gets another site's connection, even to the same address, and the
-// sweep drops pools that emptied.
-func TestFastPath_IdlePoolsPerSiteAndBackend(t *testing.T) {
-	g, err := ngx.NewGroup(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	l := g.Loops()[0]
-	done := make(chan string, 1)
-	l.Post(func() {
-		fl := &fastLoop{l: l, pools: make(map[poolKey]*upPool), addrs: make(map[string]unix.Sockaddr)}
-		fl.sweep.fl = fl
-		fl.sweep.F = &fl.sweep
-		a, b := &HTTPServer{}, &HTTPServer{}
-		ka := poolKey{site: a, backend: "be", target: "127.0.0.1:9"}
-		u := &uconn{fl: fl, fd: -1, key: ka.target, pool: ka}
-		u.timer.F = u
-		fl.putIdle(u)
-		switch {
-		case fl.takeIdle(poolKey{site: b, backend: "be", target: ka.target}) != nil:
-			done <- "another site took the idle connection"
-		case fl.takeIdle(poolKey{site: a, backend: "other", target: ka.target}) != nil:
-			done <- "another backend took the idle connection"
-		case fl.takeIdle(ka) != u:
-			done <- "its own site did not get the idle connection back"
-		default:
-			fl.sweep.OnTimer()
-			fl.l.Stop(&fl.sweep.Timer)
-			if len(fl.pools) != 0 {
-				done <- fmt.Sprintf("%d empty pools left after the sweep", len(fl.pools))
-				return
-			}
-			done <- ""
-		}
-	})
-	select {
-	case msg := <-done:
-		if msg != "" {
-			t.Fatal(msg)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("loop did not run the check")
-	}
-}
-
 // Forwarding headers from a trusted peer reach the backend exactly as on
 // the net/http path, including an empty first X-Real-IP or
 // X-Forwarded-Proto and forwarding headers its Connection header names.
@@ -468,92 +324,6 @@ func TestFastPath_TrustedForwardingEdgeCases(t *testing.T) {
 			}
 		}
 	}
-}
-
-// writeLimitCloses waits until g has no connection left, or fails.
-func writeLimitCloses(t *testing.T, g *BindGroup, within time.Duration, what string) {
-	t.Helper()
-	deadline := time.Now().Add(within)
-	for {
-		st := connStats(g)
-		if st.conns == 0 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: connection still open after %v: %+v", what, within, st)
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-}
-
-// Output waiting for a client that reads nothing is cut by the write limit,
-// also while the request body is still coming (or stalled, or complete):
-// the body's own read limit does not replace it.
-func TestFastPath_WriteLimitWhileBodyInFlight(t *testing.T) {
-	for _, tc := range []struct {
-		name, read string
-		rest       int // body bytes sent once the output backed up
-	}{
-		{"body stalls", "300ms", 0},
-		{"body completes", "5s", 990},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			addr := informationalBackend(t, 5000, 4000, 64<<10)
-			l := &ListenerConfig{Name: "site", Addr: "127.0.0.1:0", Protocol: "http",
-				Timeouts: config.TimeoutConfig{Write: "300ms", Read: tc.read}}
-			s := fastTestSite(l, &config.Backend{Servers: []string{addr}})
-			quietLog(t)
-			g := startFastGroup(t, s)
-			c := smallRcvDial(t, g.BoundAddr().String())
-			io.WriteString(c, "POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n"+strings.Repeat("b", 10))
-			until := time.Now().Add(3 * time.Second)
-			for {
-				st := connStats(g)
-				if st.conns == 0 {
-					return // already cut (a slow run can miss the backed-up moment)
-				}
-				if st.pending > 0 {
-					break
-				}
-				if time.Now().After(until) {
-					t.Fatalf("1xx output never backed up: %+v", st)
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
-			if tc.rest > 0 {
-				io.WriteString(c, strings.Repeat("b", tc.rest))
-			}
-			writeLimitCloses(t, g, 4*time.Second, tc.name)
-		})
-	}
-}
-
-// A client that trickles its body and reads nothing is cut by the write
-// limit once its output backs up, although body bytes keep coming.
-func TestFastPath_WriteLimitBeatsTricklingBody(t *testing.T) {
-	addr := informationalBackend(t, 5000, 4000, 64<<10)
-	l := &ListenerConfig{Name: "site", Addr: "127.0.0.1:0", Protocol: "http",
-		Timeouts: config.TimeoutConfig{Write: "300ms", Read: "5s"}}
-	s := fastTestSite(l, &config.Backend{Servers: []string{addr}})
-	quietLog(t)
-	g := startFastGroup(t, s)
-	c := smallRcvDial(t, g.BoundAddr().String())
-	io.WriteString(c, "POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n")
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			case <-time.After(50 * time.Millisecond):
-				if _, err := c.Write([]byte("b")); err != nil {
-					return
-				}
-			}
-		}
-	}()
-	writeLimitCloses(t, g, 4*time.Second, "trickling body")
 }
 
 // slowBodyBackend reads a request body slowly (512 KiB every 10 ms through
@@ -704,51 +474,6 @@ func TestFastPath_EarlyResponseOutlivesReadLimit(t *testing.T) {
 				t.Fatalf("got %d bytes, err %v", len(b), err)
 			}
 		})
-	}
-}
-
-// Clients that reset in the middle of their upload: each request is logged
-// once, the server's count of live connections goes back to zero, and a
-// graceful stop is not held up.
-func TestFastPath_ResetMidUploadAccounting(t *testing.T) {
-	be := newRawBackend(t)
-	dir := t.TempDir()
-	if err := logging.Init("info", filepath.Join(dir, "access.log"), filepath.Join(dir, "error.log")); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = logging.Init("warning", "", "") })
-	l := &ListenerConfig{Name: "site", Addr: "127.0.0.1:0", Protocol: "http"}
-	s := fastTestSite(l, &config.Backend{Servers: []string{be.addr()}})
-	g := NewBindGroup("127.0.0.1:0", "http")
-	g.AddSite(s)
-	if err := g.Start(); err != nil {
-		t.Fatal(err)
-	}
-	if g.fast == nil {
-		t.Fatal("fast path not enabled")
-	}
-	const rounds = 5
-	for i := 0; i < rounds; i++ {
-		c, err := net.Dial("tcp", g.BoundAddr().String())
-		if err != nil {
-			t.Fatal(err)
-		}
-		io.WriteString(c, "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 1000000\r\n\r\n"+strings.Repeat("b", 1000))
-		time.Sleep(200 * time.Millisecond) // the request is at the backend, more body awaited
-		c.(*net.TCPConn).SetLinger(0)
-		c.Close()
-	}
-	time.Sleep(500 * time.Millisecond)
-	active := g.fast.active.Load()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	start := time.Now()
-	err := g.Stop(ctx)
-	took := time.Since(start)
-	logging.Init("warning", "", "")
-	al, _ := os.ReadFile(filepath.Join(dir, "access.log"))
-	if lines := strings.Count(string(al), "POST /up"); active != 0 || lines != rounds || err != nil || took > 2*time.Second {
-		t.Fatalf("live connections %d (want 0), %d log lines (want %d), Stop: %v after %v\n%s", active, lines, rounds, err, took, al)
 	}
 }
 

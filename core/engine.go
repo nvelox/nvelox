@@ -61,8 +61,8 @@ type Engine struct {
 	tlsListeners    []net.Listener              // TLS listeners to close on shutdown
 	proxyRefusals   proxyRefusals               // refused relay connections (proxytrust.go)
 	tcpListeners    []tcpListener               // plain L4 TCP listeners (std accept loop + relayL4)
-	l4Fast          []*l4FastServer             // plain L4 TCP listeners served by the event loops (l4fast_linux.go)
-	udpFast         *udpFast                    // the udp listeners on the event loops (udpfast_linux.go); nil where udpSocks serve them
+	l4Fast          []*l4FastServer             // plain L4 TCP listeners served by the event loops (l4fast.go)
+	udpFast         *udpFast                    // the udp listeners on the event loops (udpfast.go); nil where udpSocks serve them
 	acceptWG        sync.WaitGroup              // L4 TCP/TLS accept loops; waited on before closing live conns
 	l4Conns         sync.Map                    // live L4 TCP/TLS client conns (net.Conn or loop session -> *l4Client), closed on shutdown
 	runCtx          context.Context             // Start's ctx: cancels in-flight L4 backend dials on shutdown
@@ -81,9 +81,6 @@ type Engine struct {
 	udpMaxSessions      int
 	udpMaxSessionsPerIP int
 	udpNoReplyTimeout   time.Duration
-	// udpRelayPendingTimeout ends a trusted relay's session no header has
-	// reached (udpsession.go).
-	udpRelayPendingTimeout time.Duration
 	// udpClientReadTimeout ends a session of a listener socket whose client
 	// has sent nothing for this long (udpsock.go).
 	udpClientReadTimeout time.Duration
@@ -121,6 +118,11 @@ type ListenerConfig struct {
 	Cache           config.CacheConfig
 	RequestID       config.RequestIDConfig
 
+	// accessLogOff: the listener writes no access-log lines. Shared by the
+	// listeners one config entry expands to; a reload sets it again under
+	// running TCP and UDP listeners (Reload).
+	accessLogOff *atomic.Bool
+
 	// Derived by prepare(): the parsed L4 access policy (tcp/udp) and the
 	// client-certificate policy (tls). prepared marks them built.
 	// rangeSize is how many ports the listener's bind covers (1 for a single
@@ -131,6 +133,9 @@ type ListenerConfig struct {
 	access     *l4Access
 	clientAuth *tlsutil.ClientAuth
 	prepared   bool
+	// udpRefusals: the sources whose UDP sessions the listener refused
+	// lately (udpsession.go), shared by its sockets.
+	udpRefusals *udpRefusals
 }
 
 // l4Key identifies an L4 listener across a reload.
@@ -174,11 +179,10 @@ func NewEngine(cfg *config.Config) *Engine {
 		DNSResolvers:    make(map[string]*discovery.DNSResolver),
 		Metrics:         metrics.Default,
 
-		udpMaxSessions:         maxUDPSessions,
-		udpMaxSessionsPerIP:    maxUDPSessionsPerIP,
-		udpNoReplyTimeout:      udpNoReplyTimeout,
-		udpRelayPendingTimeout: udpRelayPendingTimeout,
-		udpClientReadTimeout:   udpClientReadTimeout,
+		udpMaxSessions:       maxUDPSessions,
+		udpMaxSessionsPerIP:  maxUDPSessionsPerIP,
+		udpNoReplyTimeout:    udpNoReplyTimeout,
+		udpClientReadTimeout: udpClientReadTimeout,
 	}
 	if cfg != nil {
 		e.shutdownTimeout.Store(int64(cfg.Server.ResolveShutdownTimeout()))
@@ -421,7 +425,7 @@ func (e *Engine) Start(ctx context.Context) error {
 		return err
 	}
 	if udpFastEnabled() {
-		// On the event loops (udpfast_linux.go).
+		// On the event loops (udpfast.go).
 		if err := e.startUDPFast(plan, handler); err != nil {
 			return fmt.Errorf("UDP Engine start failed: %v", err)
 		}
@@ -634,21 +638,37 @@ func (e *Engine) Reload(cfg *config.Config) error {
 
 	// Pre-flight passed — apply mutations.
 	// L4 listeners keep running as configured at start, except for their
-	// PROXY signing keys, which take the re-read key files (rotation) — but
+	// access-log switch and their PROXY signing keys, which take the re-read key files (rotation) — but
 	// only while accept_proxy_from and accept_proxy_interfaces are
 	// unchanged: new keys under the old trust would mix two configs (old
 	// relay ranges with no key at all, say). A trust change needs a
 	// restart; until then the listener keeps its trust and keys.
 	for _, l := range expanded {
 		running := e.l4Running[l4Key(l)]
-		if running == nil || running.proxyTrust == nil || l.proxyTrust == nil {
+		if running == nil {
+			continue
+		}
+		// The access-log switch is the exception that applies at once.
+		if running.accessLogOff != nil && l.accessLogOff != nil {
+			running.accessLogOff.Store(l.accessLogOff.Load())
+		}
+		if running.proxyTrust == nil || l.proxyTrust == nil {
 			continue
 		}
 		if !slices.Equal(running.AcceptProxyFrom, l.AcceptProxyFrom) || !slices.Equal(running.proxyInterfaces, l.proxyInterfaces) {
 			logging.Warn("[RELOAD] listener %s: accept_proxy_from or accept_proxy_interfaces changed; restart nvelox to apply that (until then it keeps its current PROXY trust and keys)", l.Name)
 			continue
 		}
-		running.proxyTrust.setKeys(l.proxyTrust.shared().Keys())
+		keys := l.proxyTrust.shared().Keys()
+		if len(keys) == 0 && len(running.proxyTrust.shared().Keys()) > 0 {
+			// The key file is gone from the configuration: without keys the
+			// listener would take its relays' headers on their source
+			// address alone. That is a change of what it trusts, like the
+			// two above: not made under a running listener.
+			logging.Warn("[RELOAD] listener %s: accept_proxy_key_file was removed; restart nvelox to apply that (until then PROXY headers must be signed with its current keys)", l.Name)
+			continue
+		}
+		running.proxyTrust.setKeys(keys)
 	}
 	warnInsecureBackendTLS(cfg.Backends)
 	e.Config = cfg
@@ -661,16 +681,29 @@ func (e *Engine) Reload(cfg *config.Config) error {
 	sitesSwapped, bgAdded, bgRemoved := e.reloadL7Sites(expanded)
 
 	totalRotated := 0
+	var withoutCert []error
 	for _, bg := range e.BindGroups {
-		rotated, err := bg.ReloadCerts()
-		if err != nil {
-			logging.Debug("[RELOAD] bind group cert reload skipped: %v", err)
+		if !bg.ServesTLS() {
 			continue
 		}
+		rotated, err := bg.ReloadCerts()
 		totalRotated += rotated
+		if err != nil {
+			withoutCert = append(withoutCert, err)
+		}
 	}
 	logging.Info("Reload complete: backends +%d/-%d/~%d, bind groups +%d/-%d, %d sites swapped, %d TLS certs rotated",
 		beAdded, beRemoved, beUpdated, bgAdded, bgRemoved, sitesSwapped, totalRotated)
+	if len(withoutCert) > 0 {
+		// The configuration is applied, and a site of it cannot be served
+		// over TLS: that is said, and the reload is not counted as one
+		// that did what it was asked.
+		for _, err := range withoutCert {
+			logging.Error("[RELOAD] no certificate: %v", err)
+		}
+		e.recordReload("fail", start)
+		return nil
+	}
 	e.recordReload("ok", start)
 	return nil
 }
@@ -830,6 +863,13 @@ func (e *Engine) initBackends() {
 	}
 }
 
+// logsAccess reports whether the listener writes access-log lines now: a
+// reload can turn them off or on under a running TCP or UDP listener.
+// A session that has no listener (nil) logs as before.
+func (l *ListenerConfig) logsAccess() bool {
+	return l == nil || l.accessLogOff == nil || !l.accessLogOff.Load()
+}
+
 // ExpandListeners takes the raw []config.Listener (as loaded from YAML)
 // and produces the engine-side []*ListenerConfig with port ranges
 // expanded into individual single-port entries.
@@ -872,6 +912,7 @@ func ExpandListeners(listeners []config.Listener) ([]*ListenerConfig, error) {
 			AcceptProxyFrom: l.AcceptProxyFrom,
 			proxyTrust:      newProxyTrust(l.AcceptProxyFrom, l.AcceptProxyKeys),
 			proxyInterfaces: l.AcceptProxyInterfaces,
+			accessLogOff:    new(atomic.Bool),
 			ServerNames:     l.ServerNames,
 			DefaultServer:   l.DefaultServer,
 			Compression:     l.Compression,
@@ -880,6 +921,7 @@ func ExpandListeners(listeners []config.Listener) ([]*ListenerConfig, error) {
 			Cache:           l.Cache,
 			RequestID:       l.RequestID,
 		}
+		base.accessLogOff.Store(!l.AccessLogOn())
 		if err := base.prepare(); err != nil {
 			return nil, err
 		}
@@ -953,6 +995,7 @@ func (e *Engine) buildL7Site(l *ListenerConfig) *httpproxy.HTTPServer {
 		RequestID:      l.RequestID,
 		Timeouts:       l.Timeouts,
 		ClientAuth:     l.clientAuth,
+		AccessLogOff:   !l.logsAccess(),
 	}
 	connLimiters := make(map[string]httpproxy.ConnLimiterI)
 	for k, v := range e.ConnLimiters {
@@ -1259,11 +1302,24 @@ func (e *Engine) handleTLSConn(rawConn net.Conn, tlsConfig *tls.Config, l *Liste
 	dstPort := portOf(rawConn.LocalAddr())
 	peerTrusted := l.proxyTrust.trusts(peer)
 
+	// The access policy on a direct client, before the listener's rate: a
+	// client the policy refuses takes nothing from it. (Checked again
+	// below, where the client is recorded for the denylist first; a
+	// relay's client is checked there, once its header named it.)
+	if !peerTrusted {
+		if ok, status := handler.l4Admit(l, ipOf(peer)); !ok {
+			if l.logsAccess() {
+				logging.AccessL4(ipStrOf(peer), l.Protocol, dstPort, status, 0, 0, 0)
+			}
+			return
+		}
+	}
+
 	// Check rate limit
 	if rl, ok := e.RateLimiters[l.Name]; ok {
 		if !rl.Allow() {
 			logging.Warn("[RATE] TLS connection from %s rejected (rate limit on %s)", peer, l.Name)
-			if !peerTrusted {
+			if !peerTrusted && l.logsAccess() {
 				logging.AccessL4(ipStrOf(peer), l.Protocol, dstPort, l4StatusRateLimited, 0, 0, 0)
 			}
 			return
@@ -1289,8 +1345,10 @@ func (e *Engine) handleTLSConn(rawConn net.Conn, tlsConfig *tls.Config, l *Liste
 	status := "no_route"
 	defer func() {
 		// One L4 access record per connection, as on the plain TCP path.
-		durMs := float64(time.Since(start).Nanoseconds()) / 1e6
-		logging.AccessL4(ipStrOf(client), l.Protocol, dstPort, status, 0, 0, durMs)
+		if l.logsAccess() {
+			durMs := float64(time.Since(start).Nanoseconds()) / 1e6
+			logging.AccessL4(ipStrOf(client), l.Protocol, dstPort, status, 0, 0, durMs)
+		}
 	}()
 
 	// Access policy (static lists, ACL, dynamic denylist) on the resolved

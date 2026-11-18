@@ -10,11 +10,25 @@ builds:
     goarch:
       - amd64
       - arm64
+    flags:
+      # No path of the machine that built it is in the binary.
+      - -trimpath
+    # Files in the archives carry the commit's time: the same commit gives
+    # the same archive.
+    mod_timestamp: "{{ .CommitTimestamp }}"
     ldflags:
       # {{.Tag}} is "v1.0.0" (with the "v"); {{.Version}} is "1.0.0".
       # The source default is "dev", so a release binary reports
       # "nvelox v1.0.0" while a `go build` reports "nvelox dev".
       - -s -w -X main.Version={{.Tag}}
+    hooks:
+      post:
+        # A release binary names the commit it was built from
+        # (`go version -m nvelox`: vcs.revision), and says that the tree
+        # was that commit and nothing else. One built from a tree with
+        # anything changed or added stops the release here, before
+        # anything is published.
+        - cmd: sh -c 'go version -m "{{ .Path }}" | grep -q "vcs.modified=false"'
 
 dockers:
   - image_templates:
@@ -30,7 +44,7 @@ dockers:
       - --label=org.opencontainers.image.licenses=LicenseRef-PolyForm-Internal-Use-1.0.0
     extra_files:
       - nvelox.example.yaml
-      - LICENSE
+      - LICENSE-BINARY
       - NOTICE
       - THIRD_PARTY_NOTICES.md
   - image_templates:
@@ -46,7 +60,7 @@ dockers:
       - --label=org.opencontainers.image.licenses=LicenseRef-PolyForm-Internal-Use-1.0.0
     extra_files:
       - nvelox.example.yaml
-      - LICENSE
+      - LICENSE-BINARY
       - NOTICE
       - THIRD_PARTY_NOTICES.md
     goarch: arm64
@@ -77,15 +91,19 @@ archives:
       {{- .Os }}_
       {{- .Arch }}
       {{- if .Arm }}v{{ .Arm }}{{ end }}
-    # The license texts travel with every archive.
+    # The license texts travel with every archive (the binary's: LICENSE-BINARY).
     files:
-      - LICENSE
+      - LICENSE-BINARY
       - NOTICE
       - THIRD_PARTY_NOTICES.md
       - README.md
 
 checksum:
   name_template: 'checksums.txt'
+
+# A list of what is in each archive (SPDX, made by syft), published with it.
+sboms:
+  - artifacts: archive
 
 snapshot:
   version_template: "{{ .Tag }}-next"

@@ -2,8 +2,11 @@ package core
 
 import (
 	"net"
+	"sync"
 	"syscall"
 	"testing"
+
+	"github.com/nvelox/ngx/relay"
 )
 
 // The UDP listeners are served by the event loops where they are supported
@@ -73,4 +76,37 @@ func stUDPSessions(e *Engine) []stUDPSession {
 		return true
 	})
 	return append(out, stFastUDPSessions(e)...)
+}
+
+// stFastUDPSessions lists the sessions of the event loops' relay.
+func stFastUDPSessions(e *Engine) []stUDPSession {
+	e.reloadMu.Lock()
+	u := e.udpFast
+	e.reloadMu.Unlock()
+	if u == nil || u.relay == nil {
+		return nil
+	}
+	var mu sync.Mutex
+	var out []stUDPSession
+	u.relay.Each(func(s *relay.UDPSession) {
+		d := s.Data.(*udpFastSess)
+		info := stUDPSession{RealClientIP: d.realClientIP, PeerTrusted: d.peerTrusted, ClientResolved: d.clientResolved,
+			RelayPending: d.relayPending, HasBackend: s.Linked()}
+		info.BackendSockopt = func(level, opt int) (v int, err error) {
+			s.Do(func() { v, err = s.ServerSockopt(level, opt) })
+			return v, err
+		}
+		info.Close = func() { s.Do(func() { s.End(nil) }) }
+		mu.Lock()
+		out = append(out, info)
+		mu.Unlock()
+	})
+	return out
+}
+
+// stL4Goroutines has the TCP listeners that start during the test served
+// by goroutines and not by the event loops.
+func stL4Goroutines(t *testing.T) {
+	l4FastOff.Store(true)
+	t.Cleanup(func() { l4FastOff.Store(false) })
 }

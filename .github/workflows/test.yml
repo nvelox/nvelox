@@ -1,5 +1,8 @@
 name: Test
 
+# main only. A pull request gets no run here: the tests need the private
+# engine, and its read key goes to no branch but main (see the job's
+# environment). Changes are tested in full before they are merged.
 on:
   push:
     branches: [ main ]
@@ -7,16 +10,18 @@ on:
       - '**.go'
       - 'go.mod'
       - 'go.sum'
-  pull_request:
-    branches: [ main ]
-    paths:
-      - '**.go'
-      - 'go.mod'
-      - 'go.sum'
+
+# The tests read the repository and nothing else.
+permissions:
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    # The engine's read key is a secret of the environment ngx-engine, which
+    # only main and release tags (v*) may use: whoever can push a branch
+    # cannot read the engine through a workflow of that branch.
+    environment: ngx-engine
 
     steps:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -31,8 +36,8 @@ jobs:
     # read-only deploy key of that repository is in the secret
     # NGX_DEPLOY_KEY; git reaches the module over SSH with it, and Go is
     # told not to ask the public proxy or checksum database for it. The
-    # host key is GitHub's published one, pinned. A run without the secret
-    # (a pull request from a fork) stops at the build.
+    # host key is GitHub's published one, pinned. The secret is the
+    # environment's (above).
     - name: Access to the ngx module
       env:
         NGX_DEPLOY_KEY: ${{ secrets.NGX_DEPLOY_KEY }}

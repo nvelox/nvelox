@@ -331,53 +331,43 @@ func udpTestUDP_ForgedRelaySourcesHoldNothing(t *testing.T) {
 	}
 }
 
-// TestUDPRelayPendingSessionsCapped: sessions from a trusted relay address
-// that no PROXY header has reached yet hold no session slot, so they have a
-// cap of their own; an empty datagram (which never reaches OnData) opens one
-// that ends after the pending timeout.
-func TestUDPRelayPendingSessionsCapped(t *testing.T) {
-	stUDPEngines(t, udpTestUDPRelayPendingSessionsCapped)
+// TestUDPRelayEmptyDatagramsBeginNothing: an empty datagram from a trusted
+// relay's address names no client and carries nothing. It used to open a
+// session that waited for a header, and held a place among such sessions
+// until a timeout: enough of them, from a source forged to look like the
+// relay, kept the relay's real clients out. It begins nothing now, and a
+// relay's session is never left waiting (so there is no limit on those
+// that wait any more, and no time for it): its first datagram admits it
+// or ends it.
+func TestUDPRelayEmptyDatagramsBeginNothing(t *testing.T) {
+	stUDPEngines(t, udpTestUDPRelayEmptyDatagramsBeginNothing)
 }
 
-func udpTestUDPRelayPendingSessionsCapped(t *testing.T) {
-	be, _ := stUDPBackend(t, nil)
+func udpTestUDPRelayEmptyDatagramsBeginNothing(t *testing.T) {
+	be, got := stUDPBackend(t, nil)
 	addr := stFreeUDPAddr(t)
 	const limit = 20
 	e := stStart(t, &config.Config{
 		Listeners: []config.Listener{{Name: "relay-udp", Bind: addr, Protocol: "udp", Backend: "be",
 			AcceptProxyFrom: []string{"127.0.0.0/8"}}},
 		Backends: []config.Backend{{Name: "be", Servers: []string{be}}},
-	}, func(e *Engine) {
-		e.udpMaxSessions = limit
-		e.udpRelayPendingTimeout = 300 * time.Millisecond
-	})
-	pending := func() int {
-		n := 0
-		for _, s := range stUDPSessions(e) {
-			if s.RelayPending {
-				n++
-			}
-		}
-		return n
-	}
+	}, func(e *Engine) { e.udpMaxSessions = limit })
 	raddr, _ := net.ResolveUDPAddr("udp", addr)
 	for i := 0; i < 5*limit; i++ {
 		c, err := net.DialUDP("udp", nil, raddr)
 		if err != nil {
 			t.Fatal(err)
 		}
-		c.Write(nil) // empty: opens a session, never reaches OnData
+		c.Write(nil)
 		c.Close()
 	}
-	time.Sleep(100 * time.Millisecond)
-	if n := pending(); n > limit {
-		t.Fatalf("%d sessions waiting for a header, cap %d", n, limit)
+	time.Sleep(150 * time.Millisecond)
+	if n := len(stUDPSessions(e)); n != 0 {
+		t.Fatalf("%d sessions after %d empty datagrams from the relay's address, want none", n, 5*limit)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for pending() > 0 {
-		if time.Now().After(deadline) {
-			t.Fatalf("%d sessions still waiting after the pending timeout", pending())
-		}
-		time.Sleep(20 * time.Millisecond)
+	// The relay's clients are served as before.
+	stUDPExchange("127.0.0.1", addr, stUDPDatagramWithProxy(t, "198.51.100.10:7000", addr, []byte("after them")), 50*time.Millisecond)
+	if d, ok := stWaitGot(got, 2*time.Second); !ok || string(d) != "after them" {
+		t.Fatalf("a relayed client after the empty datagrams: the backend got %q (ok=%v)", d, ok)
 	}
 }

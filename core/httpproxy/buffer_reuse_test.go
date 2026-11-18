@@ -1,11 +1,5 @@
 package httpproxy
 
-// A proxied response body is copied through a pooled buffer (buffer.go).
-// These tests run on the net/http path, where that copy is made: responses
-// served side by side never show each other's bytes, a response does not
-// allocate its copy buffer, and buffering.response_buffer still selects its
-// own buffer size.
-
 import (
 	"bufio"
 	"bytes"

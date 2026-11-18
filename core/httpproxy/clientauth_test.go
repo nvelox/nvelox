@@ -1,8 +1,5 @@
 package httpproxy
 
-// C1: client_auth / client_ca on HTTPS (and HTTP/3) listeners, per site on a
-// shared bind. M5: backend_tls fails closed on the HTTP and WebSocket paths.
-
 import (
 	"context"
 	"crypto/ecdsa"

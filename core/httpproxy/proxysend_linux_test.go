@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -53,6 +54,7 @@ type proxyBackendConn struct {
 	local    bool   // a LOCAL header
 	src, dst string // what a PROXY header named
 	stream   bool   // it named a stream (TCP) client
+	signed   uint64 // the time its signature carries (unix seconds); 0: not signed
 	requests int
 	closed   bool
 }
@@ -114,6 +116,13 @@ func (b *proxyBackend) serve(c net.Conn) {
 			if err := proxy.Verify(hdr, [][]byte{b.key}, nil, time.Now()); err != nil {
 				b.refuse(c, "signature: "+err.Error())
 				return
+			}
+		}
+		if tlvs, err := hdr.TLVs(); err == nil {
+			for _, tlv := range tlvs {
+				if tlv.Type == proxy.SignatureTLV && len(tlv.Value) >= 9 {
+					rec.signed = binary.BigEndian.Uint64(tlv.Value[1:9])
+				}
 			}
 		}
 	}
@@ -427,6 +436,55 @@ func TestSendProxy_Signed(t *testing.T) {
 	}
 }
 
+// A TLS connection the loops hand over to net/http (its site compresses)
+// brings its client with it: a send_proxy_v2 backend is told that client,
+// on the connection's own backend connections, closed with it.
+func TestSendProxy_HandedOverTLS(t *testing.T) {
+	be := newProxyBackend(t, nil, nil)
+	cert, key := genCertWithCN(t, t.TempDir(), "example.test")
+	l := &ListenerConfig{Name: "tls-site", Addr: "127.0.0.1:0", Protocol: "https", TLS: &config.TLSConfig{Cert: cert, Key: key}}
+	l.Compression.Enabled = true
+	addr := startTLSGroup(t, fastTestSite(l, &config.Backend{Servers: []string{be.addr()}, SendProxyV2: true}), true)
+	c := dialKA(t, addr, &tls.Config{InsecureSkipVerify: true, ServerName: "example.test", NextProtos: []string{"http/1.1"}})
+	for i := 0; i < 2; i++ {
+		if got := c.answer("/"); got.conn != 0 || got.src != c.local() || got.dst != addr {
+			t.Fatalf("request %d: %+v, want connection 0 naming %s -> %s", i, got, c.local(), addr)
+		}
+	}
+	c.c.Close()
+	be.waitOpen("after the client left", 0)
+	be.noneRefused()
+}
+
+// A signed header carries the time it was signed at, and is only good for
+// some seconds: every connection gets one signed when it is opened, not the
+// one of the client's earlier connection.
+func TestSendProxy_EveryConnectionIsSignedWhenItOpens(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	for _, fast := range []bool{true, false} {
+		t.Run(paths(fast), func(t *testing.T) {
+			first, second := newProxyBackend(t, nil, key), newProxyBackend(t, nil, key)
+			l := &ListenerConfig{Name: "site", Addr: "127.0.0.1:0", Protocol: "http"}
+			be := &config.Backend{Servers: []string{first.addr(), second.addr()}, SendProxyV2: true, SendProxyKey: key}
+			c := dialKA(t, startTestGroup(t, fastTestSite(l, be), fast), nil)
+			c.answer("/")
+			time.Sleep(1100 * time.Millisecond)
+			c.answer("/")
+			var at []uint64
+			for _, b := range []*proxyBackend{first, second} {
+				b.mu.Lock()
+				for _, rec := range b.conns {
+					at = append(at, rec.signed)
+				}
+				b.mu.Unlock()
+			}
+			if len(at) != 2 || at[0] == 0 || at[1] == 0 || at[0] == at[1] {
+				t.Errorf("the headers of the client's two backend connections, opened more than a second apart, were signed at %v: want two times", at)
+			}
+		})
+	}
+}
+
 // A backend_tls backend gets the header before the TLS handshake.
 func TestSendProxy_BackendTLS(t *testing.T) {
 	certFile, keyFile := genCertWithCN(t, t.TempDir(), tlsBackendName)
@@ -503,15 +561,12 @@ func TestSendProxy_IdleFloor(t *testing.T) {
 // How many idle backend connections a client connection keeps follows what
 // it uses. Twelve requests at once on an HTTP/2 connection need twelve
 // backend connections. Served by the loops, all twelve are kept: the same
-// twelve requests again open none. Once the last seconds hold no such load
-// the ones above the few a client always keeps are closed, though the
-// client's connection stays, and its next request goes out on a kept one.
-// Handed to net/http's handlers, the client keeps the fixed few: the second
-// twelve open the rest again.
+// twelve requests again open none. (Once the last seconds hold no such
+// load the ones above the few a client always keeps are closed: the loops'
+// own test, TestEng_OwnConnectionsFollowUse.) Handed to net/http's
+// handlers, the client keeps the fixed few: the second twelve open the
+// rest again.
 func TestSendProxy_IdleFollowsUse(t *testing.T) {
-	old := poolPeakPeriod
-	poolPeakPeriod = int64(time.Second)
-	t.Cleanup(func() { poolPeakPeriod = old })
 	const burst = 12
 	for _, handlers := range []bool{false, true} {
 		name := "served by the loops"
@@ -565,13 +620,6 @@ func TestSendProxy_IdleFollowsUse(t *testing.T) {
 				atOnce()
 				if n := be.count(); n != burst {
 					t.Errorf("the second twelve: %d backend connections opened in all, want the first %d used again", n, burst)
-				}
-				be.waitOpen("once the last seconds hold no such load", ownConnsMin)
-				if r := hc.do(h2Fields("GET", "/one"), nil); r.status != 200 {
-					t.Fatalf("a request after that: status %d", r.status)
-				}
-				if n := be.count(); n != burst {
-					t.Errorf("a request after that opened a backend connection (%d in all, want %d)", n, burst)
 				}
 			}
 			hc.c.Close()
@@ -679,13 +727,19 @@ func TestSendProxy_WebSocket(t *testing.T) {
 }
 
 // HTTP/3: the header names the client's UDP address, as a stream client.
-func TestSendProxy_HTTP3(t *testing.T) { onBothH3Servers(t, sendProxyOverHTTP3) }
+// On the loops, for requests they serve and for requests they hand to
+// net/http's handlers (a site with compression).
+func TestSendProxy_HTTP3(t *testing.T) {
+	onBothH3Servers(t, func(t *testing.T) { sendProxyOverHTTP3(t, false) })
+	t.Run("the loops' handlers", func(t *testing.T) { h3ServedBy(t, true); sendProxyOverHTTP3(t, true) })
+}
 
-func sendProxyOverHTTP3(t *testing.T) {
+func sendProxyOverHTTP3(t *testing.T, handlers bool) {
 	pki := newCAPKI(t, "h3-proxy-ca")
 	be := newProxyBackend(t, nil, nil)
 	l := &ListenerConfig{Name: "h3", Addr: ":0", Protocol: "https", HTTP3: true,
 		TLS: &config.TLSConfig{Cert: pki.srvCert, Key: pki.srvKey}}
+	l.Compression.Enabled = handlers
 	site := fastTestSite(l, &config.Backend{Servers: []string{be.addr()}, SendProxyV2: true})
 	addr := freeAddr(t)
 	startGroup(t, addr, site)

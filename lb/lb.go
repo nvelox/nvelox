@@ -35,24 +35,44 @@ type Balancer interface {
 	// check or the admin API marked down, and UpdateStatus(server, true)
 	// ends an ejection early.
 	Eject(server string, d time.Duration)
+	// AllOut reports whether passive health has ejected every server that
+	// is up: the balancer then uses them as if they were healthy (Next,
+	// IsHealthy) until one is back.
+	AllOut() bool
 	// Servers returns a copy of the configured server list, healthy or not.
 	Servers() []string
 }
 
 // activeServers returns, in configuration order, the servers that are up
-// (status) and not passively ejected at now.
-func activeServers(all []string, status map[string]bool, ejected map[string]time.Time, now time.Time) []string {
-	active := make([]string, 0, len(all))
+// (status) and not passively ejected at now. When passive ejections would
+// leave none, it returns every server that is up, ejected or not, and
+// allOut is true: a backend whose servers passive health took out sends to
+// them as if they were healthy rather than to nobody. (A client that knows
+// a page the servers answer slowly could otherwise have every server taken
+// out, and the backend would answer 503 to everyone.) A server an active
+// health check or the admin API marked down stays out.
+func activeServers(all []string, status map[string]bool, ejected map[string]time.Time, now time.Time) (active []string, allOut bool) {
+	active = make([]string, 0, len(all))
+	up := 0
 	for _, s := range all {
 		if !status[s] {
 			continue
 		}
+		up++
 		if until, ok := ejected[s]; ok && now.Before(until) {
 			continue
 		}
 		active = append(active, s)
 	}
-	return active
+	if len(active) == 0 && up > 0 {
+		for _, s := range all {
+			if status[s] {
+				active = append(active, s)
+			}
+		}
+		return active, true
+	}
+	return active, false
 }
 
 // ejectedNow reports whether server has an ejection that has not expired.
@@ -108,6 +128,7 @@ type RoundRobin struct {
 
 	mu      sync.RWMutex
 	healthy []string // Derived active list
+	allOut  bool     // every server that is up is ejected: they are in healthy anyway
 	current uint64
 }
 
@@ -156,7 +177,7 @@ func (b *RoundRobin) UpdateStatus(server string, healthy bool) {
 
 // rebuildLocked recomputes the healthy list, preserving order. b.mu held.
 func (b *RoundRobin) rebuildLocked() {
-	b.healthy = activeServers(b.allServers, b.status, b.ejected, time.Now())
+	b.healthy, b.allOut = activeServers(b.allServers, b.status, b.ejected, time.Now())
 }
 
 func (b *RoundRobin) Eject(server string, d time.Duration) {
@@ -181,10 +202,16 @@ func (b *RoundRobin) MarkDraining(server string) {
 	b.UpdateStatus(server, false)
 }
 
+func (b *RoundRobin) AllOut() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.allOut
+}
+
 func (b *RoundRobin) IsHealthy(server string) bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	return b.status[server] && !ejectedNow(b.ejected, server)
+	return b.status[server] && (b.allOut || !ejectedNow(b.ejected, server))
 }
 
 func (b *RoundRobin) UpdateServers(servers []string) {
@@ -228,6 +255,7 @@ type Random struct {
 
 	mu      sync.RWMutex
 	healthy []string
+	allOut  bool // every server that is up is ejected: they are in healthy anyway
 }
 
 func NewRandom(servers []string) *Random {
@@ -270,7 +298,7 @@ func (b *Random) UpdateStatus(server string, healthy bool) {
 
 // rebuildLocked recomputes the healthy list. b.mu held.
 func (b *Random) rebuildLocked() {
-	b.healthy = activeServers(b.allServers, b.status, b.ejected, time.Now())
+	b.healthy, b.allOut = activeServers(b.allServers, b.status, b.ejected, time.Now())
 }
 
 func (b *Random) Eject(server string, d time.Duration) {
@@ -295,10 +323,16 @@ func (r *Random) MarkDraining(server string) {
 	r.UpdateStatus(server, false)
 }
 
+func (r *Random) AllOut() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.allOut
+}
+
 func (r *Random) IsHealthy(server string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.status[server] && !ejectedNow(r.ejected, server)
+	return r.status[server] && (r.allOut || !ejectedNow(r.ejected, server))
 }
 
 func (r *Random) UpdateServers(servers []string) {
@@ -341,6 +375,7 @@ type LeastConn struct {
 
 	mu      sync.RWMutex
 	healthy []string
+	allOut  bool // every server that is up is ejected: they are in healthy anyway
 
 	conns map[string]int64 // map[server_addr]count
 }
@@ -405,7 +440,7 @@ func (b *LeastConn) UpdateStatus(server string, healthy bool) {
 
 // rebuildLocked recomputes the healthy list. b.mu held.
 func (b *LeastConn) rebuildLocked() {
-	b.healthy = activeServers(b.allServers, b.status, b.ejected, time.Now())
+	b.healthy, b.allOut = activeServers(b.allServers, b.status, b.ejected, time.Now())
 }
 
 func (b *LeastConn) Eject(server string, d time.Duration) {
@@ -445,10 +480,16 @@ func (b *LeastConn) MarkDraining(server string) {
 	b.UpdateStatus(server, false)
 }
 
+func (b *LeastConn) AllOut() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.allOut
+}
+
 func (b *LeastConn) IsHealthy(server string) bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	return b.status[server] && !ejectedNow(b.ejected, server)
+	return b.status[server] && (b.allOut || !ejectedNow(b.ejected, server))
 }
 
 func (b *LeastConn) UpdateServers(servers []string) {

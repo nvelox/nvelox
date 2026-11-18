@@ -72,7 +72,9 @@ func (t target) matches(uid, gid int) bool {
 }
 
 // verify checks the switch took effect for real, effective and saved IDs:
-// a process that could become root again has not given root up.
+// a process that could become root again has not given root up. On Linux
+// the IDs are each thread's own, and every thread of the process is
+// looked at (threads).
 func (t target) verify() error {
 	if t.uid >= 0 && (os.Getuid() != t.uid || os.Geteuid() != t.uid) {
 		return fmt.Errorf("after setuid %d the process runs as uid %d / euid %d", t.uid, os.Getuid(), os.Geteuid())
@@ -83,7 +85,7 @@ func (t target) verify() error {
 	if t.uid > 0 && syscall.Setuid(0) == nil {
 		return errors.New("after the switch the process could become root again")
 	}
-	return nil
+	return t.threads()
 }
 
 // resolve looks the names (or numeric IDs) up. A user brings its primary

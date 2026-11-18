@@ -3,7 +3,6 @@
 package httpproxy
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/tls"
 	"encoding/pem"
@@ -159,7 +158,12 @@ func errorLogTo(t *testing.T) string {
 func lastUpstreamReason(t *testing.T, logPath string) string {
 	t.Helper()
 	data, _ := os.ReadFile(logPath)
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	return upstreamReason(string(data))
+}
+
+// upstreamReason is lastUpstreamReason for the text of a log.
+func upstreamReason(log string) string {
+	lines := strings.Split(strings.TrimSpace(log), "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		if j := strings.Index(lines[i], " failed for "); j >= 0 {
 			if k := strings.Index(lines[i][j:], ": "); k >= 0 {
@@ -407,31 +411,6 @@ func TestBackendTLS_HandshakeFailureRetried(t *testing.T) {
 	}
 }
 
-// A backend that does not answer the handshake is given up after the
-// handshake limit, as on the net/http path.
-func TestBackendTLS_HandshakeTimeout(t *testing.T) {
-	hold, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer hold.Close()
-	old := backendTLSHandshakeTimeout
-	backendTLSHandshakeTimeout = 400 * time.Millisecond
-	defer func() { backendTLSHandshakeTimeout = old }()
-	logPath := errorLogTo(t)
-	addr := startTestGroup(t, tlsBackendSite([]string{hold.Addr().String()}, config.BackendTLSConfig{Insecure: true}, config.Backend{}), true)
-	start := time.Now()
-	if st := exchange(t, addr, bhGet("/ok"), "GET")[0].StatusCode; st != 502 {
-		t.Fatalf("status %d, want 502", st)
-	}
-	if d := time.Since(start); d < 350*time.Millisecond || d > 8*time.Second {
-		t.Fatalf("answered after %v, want about 400ms", d)
-	}
-	if r := lastUpstreamReason(t, logPath); r != "net/http: TLS handshake timeout" {
-		t.Fatalf("logged reason %q", r)
-	}
-}
-
 // gRPC needs HTTP/2 to the backend: such a request stays on the net/http
 // path, which speaks it; everything else goes over the loop's HTTP/1.1.
 func TestBackendTLS_GRPCStaysOnNetHTTP(t *testing.T) {
@@ -484,36 +463,6 @@ func TestBackendTLS_PoolAndIdleClose(t *testing.T) {
 	}
 	if n := be.connCount(); n != 2 {
 		t.Fatalf("backend connections: %d, want 2 (one reused for the first six requests, one for the rest)", n)
-	}
-}
-
-// With a TLS backend, a response head parked off the loop and a client that
-// leaves meanwhile end cleanly.
-func TestBackendTLS_ParkedHeadClientGone(t *testing.T) {
-	quietLog(t)
-	be := newTLSBackend(t, bigHeadScript(), nil)
-	g := startFastGroup(t, tlsBackendSite([]string{be.addr()}, goodBackendTLS(be), config.Backend{}))
-	addr := g.BoundAddr().String()
-	release := holdBigHeads(t)
-	c, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	io.WriteString(c, bhGet("/many"))
-	bhWait(t, "the head to be parked", 10*time.Second, func() bool { return parkedHeads(g) == 1 })
-	c.Close()
-	bhWait(t, "the client's connection to end", 10*time.Second, func() bool { return connStats(g).conns == 0 })
-	release()
-	c2, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-	c2.SetDeadline(time.Now().Add(10 * time.Second))
-	io.WriteString(c2, bhGet("/many"))
-	resp, err := http.ReadResponse(bufio.NewReader(c2), nil)
-	if err != nil || resp.StatusCode != 200 || resp.Header.Get("X-F-150") != "v150" {
-		t.Fatalf("after the client left: %v, %v", err, resp)
 	}
 }
 

@@ -298,6 +298,74 @@ func udpTestSignedProxy_ReloadChangingTrustKeepsIt(t *testing.T) {
 	}
 }
 
+// TestSignedProxy_ReloadDroppingTheKeysKeepsThem: a reload that takes the
+// key file away and leaves accept_proxy_from as it is must not leave the
+// relay range trusted on its source address alone. The listener keeps its
+// keys (taking them away needs a restart): an unsigned header is still
+// dropped, and a signed one still names its client.
+func TestSignedProxy_ReloadDroppingTheKeysKeepsThem(t *testing.T) {
+	stUDPEngines(t, udpTestSignedProxy_ReloadDroppingTheKeysKeepsThem)
+}
+
+func udpTestSignedProxy_ReloadDroppingTheKeysKeepsThem(t *testing.T) {
+	udpBE, got := stUDPBackend(t, nil)
+	echo, _ := stTCPEchoBackend(t)
+	udpAddr, tcpAddr := stFreeUDPAddr(t), stFreeTCPAddr(t)
+	mk := func(keys ...[]byte) *config.Config {
+		return &config.Config{Version: "2",
+			Listeners: []config.Listener{
+				{Name: "relay-udp", Bind: udpAddr, Protocol: "udp", Backend: "udp-be",
+					AcceptProxyFrom: []string{"127.0.0.0/8"}, AcceptProxyKeys: keys},
+				{Name: "relay-tcp", Bind: tcpAddr, Protocol: "tcp", Backend: "tcp-be",
+					AcceptProxyFrom: []string{"127.0.0.0/8"}, AcceptProxyKeys: keys},
+			},
+			Backends: []config.Backend{{Name: "udp-be", Servers: []string{udpBE}}, {Name: "tcp-be", Servers: []string{echo}}},
+		}
+	}
+	e := stStart(t, mk(sigKeyA), nil)
+	unsigned := stDropped(e, udpDropBadSignature)
+	if err := e.Reload(mk()); err != nil {
+		t.Fatal(err)
+	}
+
+	// UDP: an unsigned header from the relay's address names nobody.
+	stUDPExchange("127.0.0.1", udpAddr, stUDPDatagramWithProxy(t, "198.51.100.93:4000", udpAddr, []byte("unsigned")), 300*time.Millisecond)
+	if d, ok := stWaitGot(got, 300*time.Millisecond); ok {
+		t.Fatalf("after the reload an unsigned header was trusted: the backend got %q", d)
+	}
+	if n := unsigned(); n != 1 {
+		t.Errorf("%d datagrams counted as unsigned, want the one", n)
+	}
+	stUDPExchange("127.0.0.1", udpAddr, signedUDPDatagram(t, sigKeyA, "198.51.100.93:4000", udpAddr, []byte("signed")), 50*time.Millisecond)
+	if d, ok := stWaitGot(got, 2*time.Second); !ok || string(d) != "signed" {
+		t.Fatalf("a header signed with the listener's key after the reload: the backend got %q (ok=%v)", d, ok)
+	}
+
+	// TCP: the same.
+	try := func(sign bool) error {
+		c, err := net.Dial("tcp", tcpAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		if sign {
+			signedTCPHeader(t, c, sigKeyA, "198.51.100.94:4000")
+		} else {
+			h := proxyproto.HeaderProxyFromAddrs(2, &net.TCPAddr{IP: net.ParseIP("198.51.100.94"), Port: 4000}, c.RemoteAddr())
+			if _, err := h.WriteTo(c); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return stEcho(c, "hello")
+	}
+	if err := try(false); err == nil {
+		t.Error("after the reload an unsigned TCP header was trusted")
+	}
+	if err := try(true); err != nil {
+		t.Errorf("a TCP header signed with the listener's key after the reload: %v", err)
+	}
+}
+
 // TestSignedProxy_TransportMustMatch: a signed header names the transport
 // it was made for. A signed stream (TCP) header replayed as a datagram —
 // with an empty payload its signature would otherwise verify — admits no

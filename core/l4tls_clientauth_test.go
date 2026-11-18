@@ -6,10 +6,12 @@ package core
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -224,5 +226,81 @@ func TestHTTPS_ClientAuthBadCAFailsReload(t *testing.T) {
 	}
 	if err := get(); err != nil {
 		t.Fatalf("after the refused reload the running site must still serve: %v", err)
+	}
+}
+
+// A reload that takes a client CA away from a site applies that, also when
+// a site that the same reload adds to the address has a certificate that
+// does not load: the added site is left without one, which is said, and
+// the reload is counted as failed. (The reload stopped at the added site,
+// before the address got its new TLS state: certificates of the CA that
+// was taken away went on being accepted, and the reload counted as done.)
+func TestHTTPS_ReloadAppliesAClientCABesideASiteWithoutACertificate(t *testing.T) {
+	before, after := newSTPKI(t, "ca-before"), newSTPKI(t, "ca-after")
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "backend-200")
+	}))
+	defer backend.Close()
+	addr := stFreeTCPAddr(t)
+	web := config.Listener{Name: "web", Bind: addr, Protocol: "https", Backend: "be", DefaultServer: true,
+		TLS: config.TLSConfig{Cert: before.srvCert, Key: before.srvKey, ClientAuth: "require", ClientCA: before.caPath}}
+	// (An address without TLS beside it: it has no certificates to read,
+	// which is no failure of a reload.)
+	plain := config.Listener{Name: "plain", Bind: stFreeTCPAddr(t), Protocol: "http", Backend: "be"}
+	backends := []config.Backend{{Name: "be", Servers: []string{strings.TrimPrefix(backend.URL, "http://")}}}
+	e := stStart(t, &config.Config{Listeners: []config.Listener{web, plain}, Backends: backends}, nil)
+	waitTCP(t, addr)
+
+	get := func(cert tls.Certificate) (string, error) {
+		cfg := &tls.Config{RootCAs: before.caPool, ServerName: "localhost", Certificates: []tls.Certificate{cert}}
+		tr := &http.Transport{TLSClientConfig: cfg, DisableKeepAlives: true}
+		defer tr.CloseIdleConnections()
+		resp, err := (&http.Client{Transport: tr, Timeout: 5 * time.Second}).Get("https://" + addr + "/")
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Sprintf("%d %s", resp.StatusCode, b), nil
+	}
+	alice, bob := before.clientCert(t, "alice"), after.clientCert(t, "bob")
+	if got, err := get(alice); err != nil || got != "200 backend-200" {
+		t.Fatalf("before the reload, a certificate of the site's client CA: %q %v", got, err)
+	}
+	if got, err := get(bob); err == nil {
+		t.Fatalf("before the reload, a certificate of another CA was served: %q", got)
+	}
+
+	// The reload: web trusts the other CA only, and a site is added whose
+	// certificate file holds no certificate.
+	web.TLS.ClientCA = after.caPath
+	broken := filepath.Join(t.TempDir(), "added.pem")
+	if err := os.WriteFile(broken, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	added := config.Listener{Name: "added", Bind: addr, Protocol: "https", Backend: "be", ServerNames: []string{"added.test"},
+		TLS: config.TLSConfig{Cert: broken, Key: broken}}
+	counted := func(result string) int64 {
+		return int64(e.Metrics.GetCounter("nvelox_reload_total", map[string]string{"result": result}).Get())
+	}
+	okBefore, failBefore := counted("ok"), counted("fail")
+	if err := e.Reload(&config.Config{Version: "2", Listeners: []config.Listener{web, plain, added}, Backends: backends}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if got, err := get(alice); err == nil {
+		t.Errorf("after the reload, a certificate of the CA it took away was served: %q", got)
+	}
+	if got, err := get(bob); err != nil || got != "200 backend-200" {
+		t.Errorf("after the reload, a certificate of the site's new client CA: %q %v", got, err)
+	}
+	if ok, fail := counted("ok")-okBefore, counted("fail")-failBefore; ok != 0 || fail != 1 {
+		t.Errorf("the reload that left a site without a certificate was counted %d times as done and %d times as failed, want 0 and 1", ok, fail)
+	}
+	// One that leaves no site without is counted as done.
+	if err := e.Reload(&config.Config{Version: "2", Listeners: []config.Listener{web, plain}, Backends: backends}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if ok, fail := counted("ok")-okBefore, counted("fail")-failBefore; ok != 1 || fail != 1 {
+		t.Errorf("after a reload without the added site: %d counted as done and %d as failed, want 1 and 1", ok, fail)
 	}
 }

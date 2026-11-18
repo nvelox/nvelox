@@ -484,10 +484,12 @@ func TestH3Loops_RelayedClientForTheHandlers(t *testing.T) {
 	}
 }
 
-// A relay's socket stands for one client. When its pin has run out it may
-// stand for another, but a connection that began as the first client's
-// stays that client's: the datagrams that name the other one are dropped
-// and counted, not taken for the connection.
+// A relay's socket stands for one client: while its pin lasts, the
+// datagrams of it that name another client are dropped and counted, and the
+// first client's connection serves nothing for the other. (When the pin has
+// run out the socket may stand for another client, but a connection that
+// began as the first client's stays that client's: the loops' own test,
+// TestEng_RelayThatNamesAnotherClient, and the count of it below.)
 func TestH3Loops_RelaySocketChangesItsClient(t *testing.T) {
 	onLoops(t)
 	quietLog(t)
@@ -503,24 +505,9 @@ func TestH3Loops_RelaySocketChangesItsClient(t *testing.T) {
 		t.Fatalf("through the relay: %q, %v", body, err)
 	}
 	defer conn.CloseWithError(0, "")
-	// The socket names another client from here on; then its pin runs out
-	// (as after a minute without a datagram that was taken), so that the
-	// table lets the new name through.
+	// The socket names another client from here on.
 	other := "198.51.100.77:9"
 	sock.client.Store(&other)
-	done := make(chan struct{}, len(g.h3loops.socks))
-	for _, s := range g.h3loops.socks {
-		s.l.Post(func() {
-			for k, p := range s.relays.pins {
-				p.seen -= int64(h3RelayPinTTL) + 1
-				s.relays.pins[k] = p
-			}
-			done <- struct{}{}
-		})
-	}
-	for range g.h3loops.socks {
-		<-done
-	}
 	before := h3Refusals(name, h3RelayClientChanged)
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
@@ -532,6 +519,89 @@ func TestH3Loops_RelaySocketChangesItsClient(t *testing.T) {
 	}
 	if h3Refusals(name, h3RelayClientChanged) == before {
 		t.Errorf("no datagram was counted as naming another client")
+	}
+	// Nor can it open a connection for the other client while it stands
+	// for the first: what it sends is dropped and counted.
+	before = h3Refusals(name, h3RelayClientChanged)
+	if body, conn2, err := h3Get(t, sock, addr, h3ClientTLS(pki), 1500*time.Millisecond); err == nil {
+		conn2.CloseWithError(0, "")
+		t.Errorf("a relay socket that stands for 203.0.113.9 opened a connection for another client: %q", body)
+	}
+	if h3Refusals(name, h3RelayClientChanged) == before {
+		t.Errorf("the datagrams of a new connection for another client were not counted")
+	}
+	// What the loops tell of a connection whose relay socket came to stand
+	// for another client is counted the same way.
+	before = h3Refusals(name, h3RelayClientChanged)
+	fastHost{g}.ClientChanged(netip.MustParseAddrPort("127.0.0.1:4433"))
+	if got := h3Refusals(name, h3RelayClientChanged); got != before+1 {
+		t.Errorf("a connection's changed client was counted %d times, want once", got-before)
+	}
+}
+
+// The hook the loops call for every datagram (web.Relays.Datagram) keeps
+// the pins of the socket in the state the loops hold for it: a relay socket
+// stands for the client its first datagram named, also once the loops have
+// let go of that client's connection (while a connection is open, the
+// loops' own check of its client applies too: the test above). What the
+// hook refuses goes no further: no payload, no client.
+func TestH3Loops_RelayDatagramHook(t *testing.T) {
+	pki := newCAPKI(t, "h3-relay-ca")
+	site := h3RelaySite(t, pki, "127.0.0.0/8", nil)
+	name := site.Listener.Name
+	h := fastHost{startGroup(t, freeAddr(t), site)}
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443}
+	datagram := func(client string, key []byte) []byte {
+		src, err := net.ResolveUDPAddr("udp", client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var b bytes.Buffer
+		if err := proxy.WriteProxyHeaderV2(&b, src, dst); err != nil {
+			t.Fatal(err)
+		}
+		payload := []byte("a QUIC packet")
+		hdr := b.Bytes()
+		if key != nil {
+			if hdr, err = proxy.SignedHeaderBytes(hdr, key, payload, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return append(hdr, payload...)
+	}
+	relay := netip.MustParseAddrPort("127.0.0.1:7000")
+	var state any
+	now := time.Now().UnixNano()
+	at := func(d time.Duration) int64 { return now + int64(d) }
+	refused := func(what string, d []byte, when int64, reason string) {
+		t.Helper()
+		before := h3Refusals(name, reason)
+		if payload, client, ok := h.Datagram(&state, relay, d, when); ok || payload != nil || client.IsValid() {
+			t.Errorf("%s: passed on (%q from %v, %v); want it dropped", what, payload, client, ok)
+		}
+		if got := h3Refusals(name, reason); got != before+1 {
+			t.Errorf("%s: counted %d times as %q, want once", what, got-before, reason)
+		}
+	}
+
+	if payload, client, ok := h.Datagram(&state, relay, datagram("203.0.113.9:4321", h3RelayKey), at(0)); !ok || string(payload) != "a QUIC packet" || client.String() != "203.0.113.9:4321" {
+		t.Fatalf("the first datagram: %q from %v, %v", payload, client, ok)
+	}
+	refused("another client on the pinned relay socket", datagram("198.51.100.1:5", h3RelayKey), at(time.Second), h3RelayClientChanged)
+	if _, client, ok := h.Datagram(&state, relay, datagram("203.0.113.9:4321", h3RelayKey), at(2*time.Second)); !ok || client.String() != "203.0.113.9:4321" {
+		t.Errorf("the pinned client again: %v, %v", client, ok)
+	}
+	refused("a datagram without a header", []byte("a QUIC packet"), at(3*time.Second), proxy.RefusedMissing)
+	refused("an unsigned header", datagram("203.0.113.9:4321", nil), at(3*time.Second), proxy.RefusedSignature)
+	refused("a header signed with another key", datagram("203.0.113.9:4321", []byte("0123456789abcdef0123456789abcdef-another")), at(3*time.Second), proxy.RefusedSignature)
+	// Once the pin has run out, the socket may stand for another client.
+	if _, client, ok := h.Datagram(&state, relay, datagram("198.51.100.1:5", h3RelayKey), at(h3RelayPinTTL+3*time.Second)); !ok || client.String() != "198.51.100.1:5" {
+		t.Errorf("another client after the pin ran out: %v, %v", client, ok)
+	}
+	// An address the listener does not trust is a client: its datagram
+	// passes as it is, without a client named.
+	if payload, client, ok := h.Datagram(&state, netip.MustParseAddrPort("192.0.2.1:9"), []byte("a QUIC packet"), at(0)); !ok || string(payload) != "a QUIC packet" || client.IsValid() {
+		t.Errorf("a direct client's datagram: %q from %v, %v", payload, client, ok)
 	}
 }
 
@@ -640,8 +710,14 @@ func TestH3Loops_RelayedClientMoves(t *testing.T) {
 		t.Fatalf("before the move: %q", body)
 	}
 	sock.moved.Store(true)
-	get("the request that brings the news")
-	waitCount(t, "moves of the connection", g.h3loops.moves.Load, 1)
+	// The server follows the client once it has proven that it receives
+	// there: from then on the requests that begin name the new client.
+	for start := time.Now(); get("after the move") != "client=198.51.100.77"; time.Sleep(10 * time.Millisecond) {
+		if time.Since(start) > 10*time.Second {
+			t.Fatalf("ten seconds after the move the requests still name %q, want client=198.51.100.77", get("after the move"))
+		}
+	}
+	// And the requests of the client keep doing so.
 	if body := get("after the move"); body != "client=198.51.100.77" {
 		t.Errorf("after the move: %q, want client=198.51.100.77", body)
 	}

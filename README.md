@@ -1,4 +1,4 @@
-![License](https://img.shields.io/badge/license-PolyForm%20Internal%20Use%201.0.0-blue)
+![Source license](https://img.shields.io/badge/source-MIT-blue) ![Binary license](https://img.shields.io/badge/binaries%20and%20images-PolyForm%20Internal%20Use%201.0.0-blue)
 ![Go Version](https://img.shields.io/github/go-mod/go-version/nvelox/nvelox)
 ![Latest Release](https://img.shields.io/github/v/release/nvelox/nvelox?include_prereleases&label=latest%20release&color=blue)
 ![Build Status](https://github.com/nvelox/nvelox/actions/workflows/release.yml/badge.svg)
@@ -247,6 +247,7 @@ admin:
   api_key: "<output of: openssl rand -hex 32>"   # required
 logging:
   level: "info"
+  access: on        # off: no access-log lines; a listener's access_log: on|off wins
   access_log: "/var/log/nvelox/access.log"
   error_log: "/var/log/nvelox/error.log"
 
@@ -422,13 +423,12 @@ core/
   handler.go         — L4 accept gating + UDP sessions
   udpsock.go         — UDP listener sockets where event loops are not supported
   l4tcp.go           — L4 TCP accept loop + per-connection proxying
-  l4fast_linux.go    — L4 TCP relay on the event loops (Linux)
+  l4fast.go          — L4 TCP on the event loops (Linux): admission, backend choice and access record for the relay of the ngx module
   relay.go           — L4 TCP relay (half-close semantics, idle timeout)
   httpproxy/
     server.go        — L7 HTTP reverse proxy
-    fastparse.go     — Strict zero-allocation HTTP/1.1 parser
-    fast_linux.go    — HTTP/1.1 on the event loops, hand-over to net/http
-    fasttls_linux.go — HTTPS (HTTP/1.1) on the event loops
+    bindgroup.go     — One socket per bind address: sites by SNI and Host
+    fasthost.go      — On Linux: the sites, relays and hooks given to the HTTP server of the ngx module (event loops)
     router.go        — Route matching (host/path/regex)
     static.go        — Static files, try_files, expires
     fastcgi.go       — FastCGI client (PHP-FPM)
@@ -454,11 +454,16 @@ proxy/               — PROXY Protocol v2
 
 ## License
 
-nvelox is source-available: the code is public, and it is licensed under the
-[PolyForm Internal Use License 1.0.0](LICENSE). In short (the license text is what counts):
+The source code in this repository is licensed under the [MIT License](LICENSE).
 
-- You may use nvelox, and change it, for the internal business operations of you and your company, free of charge.
-- You may not distribute it, changed or unchanged.
+The nvelox binaries and container images are licensed under the
+[PolyForm Internal Use License 1.0.0](LICENSE-BINARY). They contain the ngx engine, which is not
+part of this repository. In short (the license text is what counts):
+
+- You may use the binaries and images for the internal business operations of you and your company, free of charge.
+- You may not distribute them, changed or unchanged.
+
+The source code in this repository does not build without the engine module.
 
 The licenses of the third-party software in the binaries and images are in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

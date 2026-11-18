@@ -302,14 +302,31 @@ func TestH3Loops_EarlyHintsArriveBeforeTheAnswer(t *testing.T) {
 	}
 }
 
-// A request head may have 500 fields, the number net/http takes over
-// HTTP/1.1 and HTTP/2: the loops answer one more with 431, also when the
-// head is small, and go on with the connection's next request. The
-// quic-go server counts a head's bytes alone and passes it on. (The
-// backend here takes any number of fields: Go's own server, which the
-// other tests have behind nvelox, refuses the 501st by itself.)
-func TestH3Loops_FieldCount(t *testing.T) {
+// The quic-go server, which serves HTTP/3 where there are no event loops,
+// counts a head's bytes alone: 501 fields are passed on.
+func TestHTTP3_QuicGoFieldCount(t *testing.T) {
 	quietLog(t)
+	h3ServedBy(t, false)
+	pki := newCAPKI(t, "h3-loops-ca")
+	l := &ListenerConfig{Name: "h3", Addr: ":0", Protocol: "https", HTTP3: true,
+		TLS: &config.TLSConfig{Cert: pki.srvCert, Key: pki.srvKey}}
+	addr := freeAddr(t)
+	if g := startGroup(t, addr, fastTestSite(l, &config.Backend{Servers: []string{linesBackend(t)}})); g.h3loops != nil {
+		t.Fatal("HTTP/3 is on the loops")
+	}
+	conn := rawH3(t, addr, pki)
+	for _, n := range []int{500, 501} {
+		status, body, err := rawExchange(t, conn, fieldsHead(n))
+		if err != nil || status != "200" || !strings.HasPrefix(string(body), "a request of ") {
+			t.Errorf("a head of %d fields: status %q, body %q, err %v; want 200", n, status, trunc(string(body)), err)
+		}
+	}
+}
+
+// linesBackend is a backend that takes any number of header lines (Go's
+// own server refuses the 501st by itself) and answers with their count.
+func linesBackend(t *testing.T) string {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -342,39 +359,14 @@ func TestH3Loops_FieldCount(t *testing.T) {
 			}()
 		}
 	}()
-	head := func(n int) []byte {
-		fields := append([]string{}, h3GetFields...)
-		for i := len(fields) / 2; i < n; i++ {
-			fields = append(fields, fmt.Sprintf("x-f-%03d", i), "v")
-		}
-		return h3HeadersFrame(fields...)
+	return ln.Addr().String()
+}
+
+// fieldsHead is the HEADERS frame of a GET with n fields in all.
+func fieldsHead(n int) []byte {
+	fields := append([]string{}, h3GetFields...)
+	for i := len(fields) / 2; i < n; i++ {
+		fields = append(fields, fmt.Sprintf("x-f-%03d", i), "v")
 	}
-	pki := newCAPKI(t, "h3-loops-ca")
-	for _, tc := range []struct {
-		loops bool
-		past  string // what a head of one field more is answered
-	}{
-		{false, "200"},
-		{true, "431"},
-	} {
-		t.Run(map[bool]string{false: "the quic-go server", true: "the loops"}[tc.loops], func(t *testing.T) {
-			h3ServedBy(t, tc.loops)
-			l := &ListenerConfig{Name: "h3", Addr: ":0", Protocol: "https", HTTP3: true,
-				TLS: &config.TLSConfig{Cert: pki.srvCert, Key: pki.srvKey}}
-			addr := freeAddr(t)
-			if g := startGroup(t, addr, fastTestSite(l, &config.Backend{Servers: []string{ln.Addr().String()}})); (g.h3loops != nil) != tc.loops {
-				t.Fatalf("HTTP/3 on the loops: %v, want %v", g.h3loops != nil, tc.loops)
-			}
-			conn := rawH3(t, addr, pki)
-			for _, c := range []struct {
-				n    int
-				want string
-			}{{h2MaxFields, "200"}, {h2MaxFields + 1, tc.past}, {h2MaxFields, "200"}} {
-				status, body, err := rawExchange(t, conn, head(c.n))
-				if err != nil || status != c.want || (c.want == "200" && !strings.HasPrefix(string(body), "a request of ")) {
-					t.Errorf("a head of %d fields: status %q, body %q, err %v; want %s", c.n, status, trunc(string(body)), err, c.want)
-				}
-			}
-		})
-	}
+	return h3HeadersFrame(fields...)
 }

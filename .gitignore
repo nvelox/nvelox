@@ -1,6 +1,11 @@
 # Binaries
 nvelox
 proxy-server
+
+# Release builds (goreleaser's output). Untracked files in the tree make a
+# build count as made from a modified tree (vcs.modified=true): the release
+# binaries are checked for that.
+dist/
 # mock_backend
 
 # Logs

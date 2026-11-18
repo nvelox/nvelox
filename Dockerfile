@@ -22,7 +22,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o nvelox main.go
 
 # Final Stage
-FROM alpine:latest
+FROM alpine:3.24
 
 WORKDIR /app
 
@@ -43,12 +43,14 @@ COPY --from=builder /app/nvelox /usr/local/bin/nvelox
 COPY nvelox.example.yaml /etc/nvelox/nvelox.conf
 
 # The license texts travel with the image
-COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /usr/share/licenses/nvelox/
+COPY LICENSE-BINARY NOTICE THIRD_PARTY_NOTICES.md /usr/share/licenses/nvelox/
 
-# Create Config and Log Directories
+# Create Config and Log Directories. The configuration is root's and
+# read-only to the process: nvelox writes its logs and nothing else.
 RUN mkdir -p /etc/nvelox/config.d && \
     mkdir -p /var/log/nvelox && \
-    chown -R nvelox:nvelox /etc/nvelox /var/log/nvelox
+    chmod -R u=rwX,go=rX /etc/nvelox && \
+    chown -R nvelox:nvelox /var/log/nvelox
 
 # Use nvelox user (Security Best Practice)
 USER nvelox

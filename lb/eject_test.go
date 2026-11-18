@@ -62,6 +62,68 @@ func TestEject_DoesNotOverrideStatus(t *testing.T) {
 	})
 }
 
+// TestEject_AllOutUsesThemAnyway: when passive health has ejected every
+// server that is up, the balancer uses them as if they were healthy instead
+// of none; once one is back, that one alone. A server an active check or the
+// admin API marked down stays out even then, and with every server marked
+// down there is none, as before.
+func TestEject_AllOutUsesThemAnyway(t *testing.T) {
+	eachBalancer(t, func(t *testing.T, b Balancer) {
+		b.Eject("s1", time.Hour)
+		if b.AllOut() {
+			t.Fatal("one of two servers ejected: all out")
+		}
+		b.Eject("s2", 80*time.Millisecond)
+		if !b.AllOut() {
+			t.Fatal("both servers ejected: not all out")
+		}
+		if _, err := b.Next(); err != nil {
+			t.Fatalf("Next() with every server ejected: %v", err)
+		}
+		// Both are in use (leastconn takes the first of equals, so each is
+		// asked for by leaving out the other).
+		for _, s := range []string{"s1", "s2"} {
+			other := map[string]string{"s1": "s2", "s2": "s1"}[s]
+			if got, err := b.NextExcluding([]string{other}); err != nil || got != s {
+				t.Fatalf("NextExcluding(%s) with every server ejected: %q, %v; want %s", other, got, err, s)
+			}
+		}
+		if !b.IsHealthy("s1") || !b.IsHealthy("s2") {
+			t.Fatal("with every server ejected, IsHealthy does not take them as healthy")
+		}
+		time.Sleep(150 * time.Millisecond) // s2's ejection ends
+		if b.AllOut() {
+			t.Fatal("s2 is back: still all out")
+		}
+		for i := 0; i < 16; i++ {
+			if s, err := b.Next(); err != nil || s != "s2" {
+				t.Fatalf("s2 back, s1 ejected: Next() = %q, %v", s, err)
+			}
+		}
+		if b.IsHealthy("s1") {
+			t.Fatal("s2 back, s1 ejected: s1 healthy")
+		}
+		// s1 marked down, s2 ejected: s2 alone, as if healthy.
+		b.UpdateStatus("s1", false)
+		b.Eject("s2", time.Hour)
+		for i := 0; i < 16; i++ {
+			if s, err := b.Next(); err != nil || s != "s2" {
+				t.Fatalf("s1 marked down, s2 ejected: Next() = %q, %v", s, err)
+			}
+		}
+		if b.IsHealthy("s1") {
+			t.Fatal("a server marked down is healthy while the other is ejected")
+		}
+		b.UpdateStatus("s2", false)
+		if s, err := b.Next(); err == nil {
+			t.Fatalf("every server marked down: Next() = %q", s)
+		}
+		if b.AllOut() {
+			t.Fatal("every server marked down: all out")
+		}
+	})
+}
+
 func TestServers_ReturnsCopy(t *testing.T) {
 	eachBalancer(t, func(t *testing.T, b Balancer) {
 		s := b.Servers()

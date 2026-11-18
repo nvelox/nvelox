@@ -2,28 +2,20 @@
 
 package httpproxy
 
-// server.http3: the limits of HTTP/3 connections as settings.
-
 import (
+	"github.com/nvelox/ngx/web"
+
 	"bytes"
-	"errors"
 	"io"
-	"net"
-	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
-	"sync"
 	"testing"
 
-	nvquic "github.com/nvelox/ngx/quic"
 	"nvelox/config"
-	"nvelox/core/logging"
+
+	nvquic "github.com/nvelox/ngx/quic"
 
 	"github.com/nvelox/ngx/h3"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/quicvarint"
-	"golang.org/x/sys/unix"
 )
 
 // useHTTP3Limits gives the process the limits of cfg, as the engine does
@@ -33,38 +25,9 @@ func useHTTP3Limits(t *testing.T, cfg config.HTTP3Config) {
 	t.Helper()
 	SetHTTP3Limits(cfg.Resolve())
 	t.Cleanup(func() {
+		SetHTTP3Limits(h3DefaultLimits.cfg) // the totals of the defaults, at once
 		h3Limits.Store(nil)
-		setQUICMemory(&h3DefaultLimits)
 	})
-}
-
-// h3ConnLimit is what one HTTP/3 connection on the loops was opened with.
-type h3ConnLimit struct {
-	maxHead                uint32
-	sendBuffer             int64
-	streamWindow, connWind uint64
-}
-
-// h3ConnLimits returns the limits of every HTTP/3 connection the group has
-// open, by the port of its client.
-func h3ConnLimits(g *BindGroup) map[uint16]h3ConnLimit {
-	out := map[uint16]h3ConnLimit{}
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	for _, l := range g.fast.group.Loops() {
-		wg.Add(1)
-		l.Post(func() {
-			defer wg.Done()
-			for c := g.fast.h3lists[l.ID()]; c != nil; c = c.lnext {
-				cfg := c.q.Config()
-				mu.Lock()
-				out[c.qc.peer.Port()] = h3ConnLimit{c.maxHead, cfg.MaxSendBuffer, cfg.MaxStreamWindow, cfg.MaxConnWindow}
-				mu.Unlock()
-			}
-		})
-	}
-	wg.Wait()
-	return out
 }
 
 // serverSettings returns the settings the server sent on its control
@@ -103,11 +66,6 @@ func serverSettings(t *testing.T, conn *quic.Conn) map[uint64]uint64 {
 	}
 	t.Fatal("the server opened no control stream")
 	return nil
-}
-
-func clientPort(t *testing.T, conn *quic.Conn) uint16 {
-	t.Helper()
-	return uint16(conn.LocalAddr().(*net.UDPAddr).Port)
 }
 
 // server.http3.max_header_size is the largest head a request may have, on
@@ -169,100 +127,6 @@ func TestHTTP3Limits_HeaderSize(t *testing.T) {
 	})
 }
 
-// A connection has the limits server.http3 had when it was opened, and
-// keeps them: after a reload that changes them, the connections opened
-// before it go on as they were, and the ones opened after it have the new
-// limits. The two totals of the process change at once.
-func TestHTTP3Limits_FollowAReload(t *testing.T) {
-	addr, g, pki := startH3Loops(t, h3RawBackend)
-	get := func(conn *quic.Conn, size int) string {
-		t.Helper()
-		status, _, err := rawExchange(t, conn, h3HeadersFrame(h3SizedFields(size, 4<<10)...))
-		if err != nil {
-			t.Fatalf("a request with a head of %d bytes: %v", size, err)
-		}
-		return status
-	}
-	before := rawH3(t, addr, pki)
-	if got := get(before, 32<<10); got != "200" {
-		t.Fatalf("a head of 32 KiB under the defaults: status %s", got)
-	}
-	defaults := h3ConnLimit{64 << 10, 16 << 20, 6 << 20, 15 << 20}
-	if got := h3ConnLimits(g)[clientPort(t, before)]; got != defaults {
-		t.Errorf("a connection opened with nothing set: %+v, want the defaults %+v", got, defaults)
-	}
-	if send, receive := nvquic.SendMemoryLimit(), nvquic.ReceiveMemoryLimit(); send != quicSendMemory() || receive != quicSendMemory() {
-		t.Errorf("with nothing set the totals are %d to send and %d to receive, want %d each (an eighth of the memory)", send, receive, quicSendMemory())
-	}
-
-	// The reload.
-	useHTTP3Limits(t, config.HTTP3Config{MaxHeaderSize: "8KB", MaxSendBuffer: "1MB", MaxStreamReceiveWindow: "2MB",
-		MaxConnectionReceiveWindow: "3MB", MaxSendMemory: "128MB", MaxReceiveMemory: "256MB"})
-	if send, receive := nvquic.SendMemoryLimit(), nvquic.ReceiveMemoryLimit(); send != 128<<20 || receive != 256<<20 {
-		t.Errorf("after the reload the totals are %d to send and %d to receive, want 128 MiB and 256 MiB at once", send, receive)
-	}
-	after := rawH3(t, addr, pki)
-	if got := get(after, 32<<10); got != "431" {
-		t.Errorf("a head of 32 KiB on a connection opened after max_header_size became 8KB: status %s, want 431", got)
-	}
-	if got := get(before, 32<<10); got != "200" {
-		t.Errorf("a head of 32 KiB on the connection opened before the reload: status %s; it was told 64 KiB and keeps that", got)
-	}
-	limits := h3ConnLimits(g)
-	if got := limits[clientPort(t, before)]; got != defaults {
-		t.Errorf("the connection opened before the reload now has %+v, want what it was opened with, %+v", got, defaults)
-	}
-	if got, want := limits[clientPort(t, after)], (h3ConnLimit{8 << 10, 1 << 20, 2 << 20, 3 << 20}); got != want {
-		t.Errorf("the connection opened after the reload has %+v, want %+v", got, want)
-	}
-
-	// A reload that names no totals has them at their default again.
-	useHTTP3Limits(t, config.HTTP3Config{MaxSendBuffer: "4MB"})
-	if send, receive := nvquic.SendMemoryLimit(), nvquic.ReceiveMemoryLimit(); send != quicSendMemory() || receive != quicSendMemory() {
-		t.Errorf("after a reload without totals they are %d and %d, want %d each", send, receive, quicSendMemory())
-	}
-	third := rawH3(t, addr, pki)
-	if got := get(third, 32<<10); got != "200" {
-		t.Errorf("a head of 32 KiB after max_header_size was unset again: status %s", got)
-	}
-	if got, want := h3ConnLimits(g)[clientPort(t, third)], (h3ConnLimit{64 << 10, 4 << 20, 6 << 20, 15 << 20}); got != want {
-		t.Errorf("a connection opened after the second reload has %+v, want %+v", got, want)
-	}
-}
-
-// The totals the engine gave stand when a server binds afterwards: only a
-// process whose engine gave none gets them from its first bind.
-func TestHTTP3Limits_TotalsAndTheFirstBind(t *testing.T) {
-	share := quicSendMemory()
-	t.Cleanup(func() {
-		h3Limits.Store(nil)
-		quicMemoryOnce = sync.Once{}
-		quicMemoryOnce.Do(func() {})
-		setQUICMemory(&h3DefaultLimits)
-	})
-	// The engine first, then the bind.
-	quicMemoryOnce = sync.Once{}
-	SetHTTP3Limits(config.HTTP3Config{MaxSendMemory: "128MB", MaxReceiveMemory: "256MB"}.Resolve())
-	startH3Loops(t, h3RawBackend)
-	if send, receive := nvquic.SendMemoryLimit(), nvquic.ReceiveMemoryLimit(); send != 128<<20 || receive != 256<<20 {
-		t.Errorf("a bind after the engine set the totals: %d to send and %d to receive, want the 128 MiB and 256 MiB it set", send, receive)
-	}
-	// One total set: the other is the share.
-	SetHTTP3Limits(config.HTTP3Config{MaxReceiveMemory: "256MB"}.Resolve())
-	if send, receive := nvquic.SendMemoryLimit(), nvquic.ReceiveMemoryLimit(); send != share || receive != 256<<20 {
-		t.Errorf("with max_receive_memory alone: %d to send and %d to receive, want %d and 256 MiB", send, receive, share)
-	}
-	// No engine: the first bind gives the transport its totals.
-	quicMemoryOnce = sync.Once{}
-	h3Limits.Store(nil)
-	nvquic.SetSendMemory(1)
-	nvquic.SetReceiveMemory(1)
-	startH3Loops(t, h3RawBackend)
-	if send, receive := nvquic.SendMemoryLimit(), nvquic.ReceiveMemoryLimit(); send != share || receive != share || share < 64<<20 {
-		t.Errorf("a first bind with nothing set: %d to send and %d to receive, want %d each (64 MiB at the least)", send, receive, share)
-	}
-}
-
 // The quic-go server, which serves HTTP/3 where there are no event loops,
 // takes the three limits it has: the largest head, and how far its receive
 // windows grow. 0-RTT stays off.
@@ -293,243 +157,49 @@ func TestHTTP3Limits_QuicGoServer(t *testing.T) {
 	}
 }
 
-// The loops start every request and every connection with a window of
-// 1 MiB, which is what the smallest max_stream_receive_window and
-// max_connection_receive_window a config may name stand for (config,
-// http3.go): at 1MB nothing grows.
-func TestHTTP3Limits_FirstWindows(t *testing.T) {
-	if h3StreamWindow != 1<<20 || h3ConnWindow != 1<<20 {
-		t.Errorf("the first windows are %d and %d; the config takes 1MB as the smallest limit for both", h3StreamWindow, h3ConnWindow)
+// server.http3 reaches the loops as it is configured: each of its sizes, in
+// the form they take them; the two totals apply at once; and they are told
+// by the pointer that the limits changed, never when they did not.
+func TestHTTP3Limits_ReachTheLoops(t *testing.T) {
+	defaults := web.H3Limits{MaxHeaderSize: 64 << 10, MaxSendBuffer: 16 << 20, MaxStreamReceiveWindow: 6 << 20, MaxConnectionReceiveWindow: 15 << 20, SocketBuffer: 4 << 20}
+	if got := *fastH3Limits(); got != defaults {
+		t.Errorf("with nothing configured the loops are given %+v, want %+v", got, defaults)
 	}
+	first := fastH3Limits()
+	if fastH3Limits() != first {
+		t.Error("limits that did not change are another pointer the second time: every connection would take them for new ones")
+	}
+	useHTTP3Limits(t, config.HTTP3Config{MaxHeaderSize: "8KB", MaxSendBuffer: "1MB", MaxStreamReceiveWindow: "2MB",
+		MaxConnectionReceiveWindow: "3MB", MaxSendMemory: "128MB", MaxReceiveMemory: "256MB", SocketBuffer: "128KB"})
+	want := web.H3Limits{MaxHeaderSize: 8 << 10, MaxSendBuffer: 1 << 20, MaxStreamReceiveWindow: 2 << 20,
+		MaxConnectionReceiveWindow: 3 << 20, MaxSendMemory: 128 << 20, MaxReceiveMemory: 256 << 20, SocketBuffer: 128 << 10}
+	if got := *fastH3Limits(); got != want {
+		t.Errorf("the loops are given %+v, want %+v", got, want)
+	}
+	if fastH3Limits() == first {
+		t.Error("the limits changed and the loops are given the pointer they had")
+	}
+	if send, receive := nvquic.SendMemoryLimit(), nvquic.ReceiveMemoryLimit(); send != 128<<20 || receive != 256<<20 {
+		t.Errorf("the totals are %d to send and %d to receive, want 128 MiB and 256 MiB at once", send, receive)
+	}
+	// A configuration that names no totals has them at their default
+	// again: a share of the memory, the same for both, 64 MiB at the least.
+	useHTTP3Limits(t, config.HTTP3Config{MaxSendBuffer: "4MB"})
+	if send, receive := nvquic.SendMemoryLimit(), nvquic.ReceiveMemoryLimit(); send != receive || send < 64<<20 || send == 128<<20 {
+		t.Errorf("after a configuration without totals they are %d and %d, want the default share for both", send, receive)
+	}
+	if got := fastH3Limits().MaxSendBuffer; got != 4<<20 {
+		t.Errorf("max_send_buffer 4MB reaches the loops as %d", got)
+	}
+}
+
+// The smallest max_stream_receive_window and max_connection_receive_window
+// a configuration may name (1MB, config/http3.go) are the windows every
+// request and connection on the loops starts with (1 MiB, the loops' own
+// TestHTTP3Limits_FirstWindows): at 1MB nothing grows.
+func TestHTTP3Limits_SmallestWindowsAreTheFirst(t *testing.T) {
 	l := config.HTTP3Config{MaxStreamReceiveWindow: "1MB", MaxConnectionReceiveWindow: "1MB"}.Resolve()
-	if l.MaxStreamReceiveWindow != h3StreamWindow || l.MaxConnectionReceiveWindow != h3ConnWindow {
-		t.Errorf("1MB resolves to %d and %d", l.MaxStreamReceiveWindow, l.MaxConnectionReceiveWindow)
-	}
-	_, g, _ := startH3Loops(t, h3RawBackend)
-	p := g.h3loops.cfg.Params
-	if p.InitialMaxStreamDataBidiRemote != 1<<20 || p.InitialMaxData != 1<<20 {
-		t.Errorf("the first windows a client is told: %d per request and %d per connection, want 1 MiB each", p.InitialMaxStreamDataBidiRemote, p.InitialMaxData)
-	}
-}
-
-// kernelLimit reads a size limit of the kernel (net.core.rmem_max, wmem_max).
-func kernelLimit(t *testing.T, name string) int {
-	t.Helper()
-	b, err := os.ReadFile("/proc/sys/net/core/" + name)
-	if err != nil {
-		t.Skipf("no /proc/sys/net/core/%s: %v", name, err)
-	}
-	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return n
-}
-
-// server.http3.socket_buffer is what each loop's UDP socket asks the kernel
-// for, to receive and to send. A size within the kernel's limits is what
-// every socket has; the default is 4 MiB, cut to the kernel's limit unless
-// the process may ask past it.
-func TestHTTP3Limits_SocketBuffer(t *testing.T) {
-	buffers := func(g *BindGroup) (rcv, snd []int) {
-		for _, s := range g.h3loops.socks {
-			r, err := unix.GetsockoptInt(s.fd, unix.SOL_SOCKET, unix.SO_RCVBUF)
-			if err != nil {
-				t.Fatal(err)
-			}
-			w, err := unix.GetsockoptInt(s.fd, unix.SOL_SOCKET, unix.SO_SNDBUF)
-			if err != nil {
-				t.Fatal(err)
-			}
-			rcv, snd = append(rcv, r), append(snd, w)
-		}
-		return rcv, snd
-	}
-	// 128 KiB is within the limits of any kernel (their default is 208 KiB):
-	// every socket has it. The kernel reports twice what it granted.
-	useHTTP3Limits(t, config.HTTP3Config{SocketBuffer: "128KB"})
-	_, g, _ := startH3Loops(t, h3RawBackend)
-	rcv, snd := buffers(g)
-	if len(rcv) == 0 {
-		t.Fatal("the listener has no sockets")
-	}
-	for i := range rcv {
-		if rcv[i] != 2*128<<10 || snd[i] != 2*128<<10 {
-			t.Errorf("socket %d with socket_buffer 128KB: %d to receive and %d to send, want %d each", i, rcv[i], snd[i], 2*128<<10)
-		}
-	}
-	// A listener bound later has the size in force then.
-	SetHTTP3Limits(config.HTTP3Config{SocketBuffer: "64KB"}.Resolve())
-	_, g2, _ := startH3Loops(t, h3RawBackend)
-	rcv2, snd2 := buffers(g2)
-	for i := range rcv2 {
-		if rcv2[i] != 2*64<<10 || snd2[i] != 2*64<<10 {
-			t.Errorf("socket %d bound with socket_buffer 64KB: %d to receive and %d to send, want %d each", i, rcv2[i], snd2[i], 2*64<<10)
-		}
-	}
-	if again, _ := buffers(g); again[0] != 2*128<<10 {
-		t.Errorf("the listener bound before has %d now, want the %d it was bound with", again[0], 2*128<<10)
-	}
-	// Nothing set: 4 MiB is asked for. The kernel grants up to its limit;
-	// a process that may ask past it (root with CAP_NET_ADMIN) has all of it.
-	h3Limits.Store(nil)
-	_, g3, _ := startH3Loops(t, h3RawBackend)
-	rcv3, snd3 := buffers(g3)
-	wantR, wantS := 2*min(4<<20, kernelLimit(t, "rmem_max")), 2*min(4<<20, kernelLimit(t, "wmem_max"))
-	for i := range rcv3 {
-		okR := rcv3[i] == wantR || (os.Geteuid() == 0 && rcv3[i] == 2*4<<20)
-		okS := snd3[i] == wantS || (os.Geteuid() == 0 && snd3[i] == 2*4<<20)
-		if !okR || !okS {
-			t.Errorf("socket %d with nothing set: %d to receive and %d to send, want %d and %d (4 MiB asked for, the kernel's limits applied)", i, rcv3[i], snd3[i], wantR, wantS)
-		}
-	}
-	// Limits that were not resolved from a config name no size: the default
-	// is asked for, never a buffer of nothing.
-	SetHTTP3Limits(config.HTTP3Limits{MaxHeaderSize: 64 << 10, MaxSendBuffer: 16 << 20, MaxStreamReceiveWindow: 6 << 20, MaxConnectionReceiveWindow: 15 << 20})
-	_, g4, _ := startH3Loops(t, h3RawBackend)
-	if rcv4, snd4 := buffers(g4); rcv4[0] != rcv3[0] || snd4[0] != snd3[0] {
-		t.Errorf("limits that name no socket buffer: %d to receive and %d to send, want the default's %d and %d", rcv4[0], snd4[0], rcv3[0], snd3[0])
-	}
-}
-
-// The order a buffer is asked for in: the plain request; the forced one
-// only when the plain one left the socket with less than was asked for;
-// and what the socket has in the end is what is reported.
-func TestHTTP3Limits_AskBuffer(t *testing.T) {
-	const size = 4 << 20
-	for _, tc := range []struct {
-		name      string
-		plain     int   // what the kernel grants to the plain request
-		forceErr  error // what the forced request returns
-		want      int
-		wantCalls string
-	}{
-		{"the limit allows it", size, nil, 2 * size, "plain get"},
-		{"the socket has more than was asked for", 2 * size, errors.New("not to be called"), 4 * size, "plain get"},
-		{"cut by the limit, the forced request granted", 212992, nil, 2 * size, "plain get forced get"},
-		{"cut by the limit, the forced request refused", 212992, unix.EPERM, 2 * 212992, "plain get forced"},
-		{"one byte short of what was asked", size - 1, unix.EPERM, 2 * (size - 1), "plain get forced"},
-	} {
-		has, calls := 0, []string{}
-		got := askBuffer(size,
-			func(forced bool) error {
-				if forced {
-					calls = append(calls, "forced")
-					if tc.forceErr == nil {
-						has = 2 * size
-					}
-					return tc.forceErr
-				}
-				calls = append(calls, "plain")
-				has = 2 * tc.plain
-				return nil
-			},
-			func() int { calls = append(calls, "get"); return has })
-		if got != tc.want || strings.Join(calls, " ") != tc.wantCalls {
-			t.Errorf("%s: the socket is reported to have %d after %q, want %d after %q", tc.name, got, strings.Join(calls, " "), tc.want, tc.wantCalls)
-		}
-	}
-	// Against the kernel: a request within its limits is granted by the
-	// plain form, and reported doubled.
-	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer unix.Close(fd)
-	if got := socketBuffer(fd, unix.SO_RCVBUF, unix.SO_RCVBUFFORCE, 96<<10); got != 2*96<<10 {
-		t.Errorf("a receive buffer of 96 KiB: the socket has %d, want %d", got, 2*96<<10)
-	}
-	if got := socketBuffer(fd, unix.SO_SNDBUF, unix.SO_SNDBUFFORCE, 80<<10); got != 2*80<<10 {
-		t.Errorf("a send buffer of 80 KiB: the socket has %d, want %d", got, 2*80<<10)
-	}
-	if r, _ := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF); r != 2*96<<10 {
-		t.Errorf("asking for the send buffer changed the receive buffer to %d", r)
-	}
-}
-
-// A process that may ask past the kernel's limit (CAP_NET_ADMIN) is
-// granted what it asks for. Skipped where the process may not.
-func TestHTTP3Limits_SocketBufferPastTheLimit(t *testing.T) {
-	limit := kernelLimit(t, "rmem_max")
-	probe, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer unix.Close(probe)
-	if err := unix.SetsockoptInt(probe, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, limit+4096); err != nil {
-		t.Skipf("this process may not ask past the kernel's limit: %v", err)
-	}
-	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer unix.Close(fd)
-	size := limit + 64<<10
-	if got := socketBuffer(fd, unix.SO_RCVBUF, unix.SO_RCVBUFFORCE, size); got != 2*size {
-		t.Errorf("a receive buffer of %d bytes, past the kernel's limit of %d: the socket has %d, want %d", size, limit, got, 2*size)
-	}
-}
-
-// A listener whose sockets got less than was asked for says so once, in a
-// startup warning that names the listener, both sizes and what to do; one
-// whose sockets have what was asked for says nothing.
-func TestHTTP3Limits_SocketBufferWarning(t *testing.T) {
-	if w := quicBufferWarning("127.0.0.1:443", 4<<20, 2*4<<20); w != "" {
-		t.Errorf("sockets that have what was asked for: warning %q", w)
-	}
-	if w := quicBufferWarning("127.0.0.1:443", 4<<20, 2*8<<20); w != "" {
-		t.Errorf("sockets that have more than was asked for: warning %q", w)
-	}
-	w := quicBufferWarning("127.0.0.1:443", 4<<20, 2*212992)
-	for _, part := range []string{"127.0.0.1:443", "208 KiB", "4096 KiB", "server.http3.socket_buffer", "net.core.rmem_max", "CAP_NET_ADMIN"} {
-		if !strings.Contains(w, part) {
-			t.Errorf("the warning %q does not name %q", w, part)
-		}
-	}
-	if w := quicBufferWarning("[::]:8443", 4<<20, 2*4<<20-1); w == "" {
-		t.Error("a socket one byte short of what was asked for: no warning")
-	}
-
-	// At a bind: the kernel, stood in for, grants each socket less than the
-	// one before; the warning names the smallest, once for the listener.
-	errLog := filepath.Join(t.TempDir(), "error.log")
-	if err := logging.Init("warning", "", errLog); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = logging.Init("warning", "", "") })
-	grants := 0
-	quicSocketBuffer = func(fd, opt, force, size int) int {
-		if opt != unix.SO_RCVBUF {
-			return 2 * size
-		}
-		grants++
-		return 2 * (300<<10 - grants<<10) // 299 KiB, then 298 KiB, ...
-	}
-	t.Cleanup(func() { quicSocketBuffer = socketBuffer })
-	useHTTP3Limits(t, config.HTTP3Config{SocketBuffer: "2MB"})
-	addr, g, _ := startH3Loops(t, h3RawBackend)
-	logged := func() string {
-		b, err := os.ReadFile(errLog)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return string(b)
-	}
-	n := len(g.h3loops.socks)
-	out := logged()
-	if strings.Count(out, "server.http3.socket_buffer") != 1 {
-		t.Fatalf("a listener whose %d sockets got less than asked: the log has %q, want one warning", n, out)
-	}
-	_, port, _ := net.SplitHostPort(addr)
-	for _, part := range []string{"[WARN]", ":" + port, strconv.Itoa(300-n) + " KiB", "2048 KiB"} {
-		if !strings.Contains(out, part) {
-			t.Errorf("the warning %q does not name %q (the smallest of the %d sockets, and what was asked for)", out, part, n)
-		}
-	}
-	// Sockets that have what was asked for: nothing more is logged.
-	quicSocketBuffer = func(fd, opt, force, size int) int { return 2 * size }
-	startH3Loops(t, h3RawBackend)
-	if again := logged(); strings.Count(again, "server.http3.socket_buffer") != 1 {
-		t.Errorf("a listener whose sockets have what was asked for logged a warning too: %q", strings.TrimPrefix(again, out))
+	if l.MaxStreamReceiveWindow != 1<<20 || l.MaxConnectionReceiveWindow != 1<<20 {
+		t.Errorf("1MB resolves to %d and %d; the loops' first windows are 1 MiB each", l.MaxStreamReceiveWindow, l.MaxConnectionReceiveWindow)
 	}
 }

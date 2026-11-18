@@ -367,6 +367,10 @@ func TestProxyHeader_RefusalsCounted(t *testing.T) {
 		{"half a header to the limit", hdr[:20], false, proxyRejectTimeout},
 		{"a header that does not parse", broken, false, proxyRejectMalformed},
 		{"an unsigned header", hdr, false, proxyRejectSignature},
+		// The signature and a length past what any header may have, then
+		// more than that length (the loops look at the length once they
+		// hold 256 KiB).
+		{"a header longer than any may be", append(append(append([]byte{}, proxy.V2Signature...), 0x21, 0x11, 0xff, 0xff), make([]byte, 300<<10)...), false, proxyRejectMalformed},
 	}
 	for _, useTLS := range []bool{false, true} {
 		for _, fast := range []bool{true, false} {
