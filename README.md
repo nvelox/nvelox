@@ -20,6 +20,19 @@ Nvelox is a lightweight, high-performance load balancer and reverse proxy writte
 * **nginx-compatible features** — try_files, expires, FastCGI, regex routes, URL rewrite
 * **Simple YAML config** — No complex directive syntax
 
+## Performance
+
+nvelox 2.0.0-rc.3 against nginx 1.31.8, HAProxy 3.4.7, Envoy 1.40.2, Traefik 3.7.18, Caddy 2.11.9 and nvelox 1.3.0, each as a reverse proxy on the same 4 CPU cores (2026-11-18):
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="bench/results/v2.0.0-rc.3/charts/lead-dark.svg"><img alt="nvelox and the fastest other proxy, per test" src="bench/results/v2.0.0-rc.3/charts/lead.svg"></picture>
+
+- **Against nginx:** faster in all 11 tests (nvelox / nginx: 1.05x to 1.85x) and in 130 of the 132 rounds; 5% to 46% less CPU per request.
+- **Against every proxy:** the most requests per second in all 11 tests, and the least CPU per request in all 11 tests.
+- **Memory:** 4 MiB idle and at most 64 MiB under load.
+- **Large files:** 1 GiB downloads at 5.70 GB/s and uploads at 3.53 GB/s; a client that reads slowly makes nvelox hold 6 MiB, not the file.
+
+Every table and chart, latency, CPU and memory of each proxy, the setup and how to run it yourself: [docs/PERFORMANCE.md](docs/PERFORMANCE.md). The scripts and the raw results: [bench/](bench/).
+
 ## Features
 
 ### Core Proxy
