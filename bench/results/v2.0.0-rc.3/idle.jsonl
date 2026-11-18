@@ -1,0 +1,8 @@
+{"container": "nvbench-nvelox", "idle_cpu_pct": 0.029277293618749166, "anon_mib": 4.24609375, "current_mib": 5.0390625, "threads": 15}
+{"container": "nvbench-nginx", "idle_cpu_pct": 0.0, "anon_mib": 37.08984375, "current_mib": 38.359375, "threads": 5}
+{"container": "nvbench-haproxy", "idle_cpu_pct": 0.004879548936458194, "anon_mib": 19.4296875, "current_mib": 25.15234375, "threads": 5}
+{"container": "nvbench-envoy", "idle_cpu_pct": 0.3250899488158377, "anon_mib": 16.7265625, "current_mib": 17.8125, "threads": 14}
+{"container": "nvbench-traefik", "idle_cpu_pct": 0.0, "anon_mib": 15.76171875, "current_mib": 16.796875, "threads": 9}
+{"container": "nvbench-traefik-log", "idle_cpu_pct": 0.0, "anon_mib": 13.8671875, "current_mib": 14.94921875, "threads": 9}
+{"container": "nvbench-caddy", "idle_cpu_pct": 0.008039256854328663, "anon_mib": 10.20703125, "current_mib": 10.8984375, "threads": 9}
+{"container": "nvbench-nvelox-prev", "idle_cpu_pct": 0.003989631200095941, "anon_mib": 3.8828125, "current_mib": 4.52734375, "threads": 11}
