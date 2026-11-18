@@ -1,0 +1,64 @@
+http:
+  routers:
+    web:
+      entryPoints: [web]
+      rule: "PathPrefix(`/`)"
+      service: origin
+    websecure:
+      entryPoints: [websecure]
+      rule: "PathPrefix(`/`)"
+      service: origin
+      tls: {}
+    h2:
+      entryPoints: [h2]
+      rule: "PathPrefix(`/`)"
+      service: origin
+      tls: {}
+    h3:
+      entryPoints: [h3]
+      rule: "PathPrefix(`/`)"
+      service: origin
+      tls: {}
+    upload:
+      entryPoints: [upload]
+      rule: "PathPrefix(`/`)"
+      service: sink
+  services:
+    origin:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:27000"
+    sink:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:27600"
+tcp:
+  routers:
+    tcp:
+      entryPoints: [tcp]
+      rule: "HostSNI(`*`)"
+      service: origin-tcp
+  services:
+    origin-tcp:
+      loadBalancer:
+        servers:
+          - address: "127.0.0.1:27000"
+udp:
+  routers:
+    udp:
+      entryPoints: [udp]
+      service: origin-udp
+  services:
+    origin-udp:
+      loadBalancer:
+        servers:
+          - address: "127.0.0.1:27500"
+tls:
+  certificates:
+    - certFile: /certs/cert.pem
+      keyFile: /certs/key.pem
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/cert.pem
+        keyFile: /certs/key.pem

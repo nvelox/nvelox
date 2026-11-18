@@ -1,0 +1,11 @@
+http:
+  routers:
+    weblog:
+      entryPoints: [weblog]
+      rule: "PathPrefix(`/`)"
+      service: origin
+  services:
+    origin:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:27000"

@@ -61,6 +61,14 @@ jobs:
       # and that text appears on the GitHub release page.
       - name: Extract tag annotation as release notes
         run: |
+          # Checkout fetches the tag a second time as the commit it names, which
+          # leaves a plain tag without its message (the notes would be the
+          # commit's message): fetch the tag itself, and stop if it has none.
+          git fetch --force --no-tags origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          if [ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" != tag ]; then
+            echo "::error::${GITHUB_REF_NAME} is not an annotated tag: its message is the release notes"
+            exit 1
+          fi
           git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > /tmp/release-notes.md
           echo "--- release-notes.md preview ---"
           cat /tmp/release-notes.md

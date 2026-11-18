@@ -1,0 +1,688 @@
+16:12:18 results in results/v2.0.0-rc.3
+16:12:34 every listener answers
+16:12:51 180s of load that is not measured
+16:15:51 start: 12 rounds (nvelox nginx), the first 5 also with haproxy envoy traefik caddy nvelox-prev; 10s measured, 3s warm-up
+16:16:04 round 1  origin      http_1k         199857/s  p50 0.58 p99 0.99 ms      
+16:16:18 round 1  haproxy     http_1k         104809/s  p50 1.14 p99 2.00 ms     cpu 397% (origin 212%, load 164%)   21.6 MiB 
+16:16:32 round 1  envoy       http_1k          37071/s  p50 3.35 p99 6.99 ms     cpu 397% (origin  95%, load  71%)   23.4 MiB 
+16:16:45 round 1  traefik     http_1k          27353/s  p50 4.29 p99 17.14 ms    cpu 379% (origin 105%, load  59%)   58.0 MiB 
+16:16:59 round 1  caddy       http_1k          21662/s  p50 5.40 p99 20.13 ms    cpu 361% (origin  60%, load  49%)   32.8 MiB 
+16:17:13 round 1  nvelox-prev http_1k          16858/s  p50 7.33 p99 26.66 ms    cpu 343% (origin  59%, load  40%)   18.0 MiB 
+16:17:27 round 1  nginx       http_1k         125778/s  p50 0.97 p99 1.62 ms     cpu 397% (origin 288%, load 201%)   38.1 MiB 
+16:17:40 round 1  nvelox      http_1k         141752/s  p50 0.83 p99 1.53 ms     cpu 396% (origin 255%, load 218%)    5.6 MiB 
+16:17:54 round 1  envoy       http_64k         20846/s  p50 5.49 p99 16.25 ms    cpu 397% (origin 106%, load  95%)   32.0 MiB 
+16:18:08 round 1  traefik     http_64k         19196/s  p50 6.08 p99 33.74 ms    cpu 375% (origin  74%, load 109%)   63.1 MiB 
+16:18:21 round 1  caddy       http_64k         14859/s  p50 7.92 p99 34.67 ms    cpu 354% (origin  68%, load  82%)   34.7 MiB 
+16:18:35 round 1  nvelox-prev http_64k         10979/s  p50 11.18 p99 44.78 ms   cpu 329% (origin  58%, load  69%)   21.2 MiB 
+16:18:49 round 1  nvelox      http_64k         61724/s  p50 1.84 p99 38.07 ms    cpu 397% (origin 229%, load 251%)    5.9 MiB 
+16:19:02 round 1  nginx       http_64k         37706/s  p50 3.54 p99 35.38 ms    cpu 397% (origin 136%, load 221%)   38.5 MiB 
+16:19:16 round 1  haproxy     http_64k         36872/s  p50 2.98 p99 23.81 ms    cpu 397% (origin 170%, load 155%)   24.3 MiB 
+16:19:30 round 1  traefik     https_1k         29507/s  p50 3.99 p99 15.73 ms    cpu 374% (origin  77%, load  89%)   65.4 MiB 
+16:19:43 round 1  caddy       https_1k         19750/s  p50 5.85 p99 22.68 ms    cpu 365% (origin  66%, load  69%)   40.4 MiB 
+16:19:57 round 1  nvelox-prev https_1k         15575/s  p50 8.19 p99 29.30 ms    cpu 356% (origin  67%, load  54%)   24.8 MiB 
+16:20:11 round 1  nginx       https_1k        101255/s  p50 1.22 p99 3.77 ms     cpu 396% (origin 202%, load 218%)   43.2 MiB 
+16:20:24 round 1  nvelox      https_1k        126912/s  p50 0.90 p99 2.49 ms     cpu 394% (origin 284%, load 276%)   20.9 MiB 
+16:20:38 round 1  haproxy     https_1k         83740/s  p50 1.44 p99 2.64 ms     cpu 397% (origin 169%, load 186%)   28.0 MiB 
+16:20:52 round 1  envoy       https_1k         34674/s  p50 3.64 p99 6.89 ms     cpu 397% (origin  88%, load  98%)   32.6 MiB 
+16:21:05 round 1  nvelox-prev tcp_1k          107243/s  p50 1.12 p99 3.82 ms     cpu 385% (origin 268%, load 175%)   23.2 MiB 
+16:21:19 round 1  nvelox      tcp_1k          195003/s  p50 0.63 p99 1.04 ms     cpu 396% (origin 337%, load 283%)   21.1 MiB 
+16:21:33 round 1  nginx       tcp_1k          171422/s  p50 0.72 p99 1.31 ms     cpu 396% (origin 349%, load 257%)   43.2 MiB 
+16:21:46 round 1  haproxy     tcp_1k          154402/s  p50 0.74 p99 1.54 ms     cpu 397% (origin 334%, load 230%)   27.8 MiB 
+16:22:00 round 1  envoy       tcp_1k          127083/s  p50 0.94 p99 2.00 ms     cpu 397% (origin 274%, load 200%)   32.7 MiB 
+16:22:14 round 1  traefik     tcp_1k          128529/s  p50 0.94 p99 3.18 ms     cpu 384% (origin 248%, load 206%)   46.5 MiB 
+16:22:27 round 1  nvelox-prev http_1k_log      15976/s  p50 7.63 p99 28.95 ms    cpu 339% (origin  63%, load  39%)   19.2 MiB 
+16:22:41 round 1  nginx       http_1k_log     130543/s  p50 0.90 p99 1.85 ms     cpu 397% (origin 252%, load 211%)   43.2 MiB 
+16:22:55 round 1  nvelox      http_1k_log     143913/s  p50 0.82 p99 1.70 ms     cpu 395% (origin 305%, load 221%)   11.3 MiB 
+16:23:08 round 1  haproxy     http_1k_log      86580/s  p50 1.30 p99 4.40 ms     cpu 394% (origin 221%, load 140%)   28.7 MiB 
+16:23:22 round 1  envoy       http_1k_log      35655/s  p50 3.51 p99 5.77 ms     cpu 397% (origin  80%, load  76%)   32.7 MiB 
+16:23:36 round 1  traefik     http_1k_log      20594/s  p50 5.68 p99 22.42 ms    cpu 375% (origin  57%, load  58%)   58.8 MiB 
+16:23:49 round 1  caddy       http_1k_log      20608/s  p50 5.62 p99 21.59 ms    cpu 366% (origin  54%, load  45%)   40.7 MiB 
+16:24:03 round 1  nvelox      h2_m1           134864/s  p50 0.88 p99 1.57 ms     cpu 398% (origin 256%, load 345%)   17.3 MiB 
+16:24:16 round 1  nginx       h2_m1            92353/s  p50 1.47 p99 2.82 ms     cpu 399% (origin 194%, load 271%)   44.2 MiB 
+16:24:30 round 1  haproxy     h2_m1            84735/s  p50 1.46 p99 2.19 ms     cpu 399% (origin 176%, load 254%)   29.2 MiB 
+16:24:43 round 1  envoy       h2_m1            29620/s  p50 4.32 p99 7.66 ms     cpu 400% (origin  77%, load 108%)   33.7 MiB 
+16:24:57 round 1  traefik     h2_m1            22314/s  p50 5.06 p99 18.46 ms    cpu 374% (origin  59%, load 109%)   60.6 MiB 
+16:25:10 round 1  caddy       h2_m1            16572/s  p50 6.43 p99 26.99 ms    cpu 349% (origin  43%, load  88%)   45.9 MiB 
+16:25:24 round 1  nvelox-prev h2_m1            16053/s  p50 7.36 p99 24.47 ms    cpu 355% (origin  37%, load  88%)   22.8 MiB 
+16:25:37 round 1  haproxy     h2_m10           97029/s  p50 12.85 p99 19.15 ms   cpu 399% (origin 185%, load 192%)   40.5 MiB 
+16:25:51 round 1  envoy       h2_m10           34797/s  p50 37.05 p99 48.00 ms   cpu 400% (origin  81%, load  34%)   69.7 MiB 
+16:26:04 round 1  traefik     h2_m10           14065/s  p50 88.58 p99 196.08 ms  cpu 385% (origin  79%, load  78%)  359.8 MiB 
+16:26:18 round 1  caddy       h2_m10           13220/s  p50 96.88 p99 172.39 ms  cpu 384% (origin  71%, load  75%)  151.3 MiB 
+16:26:32 round 1  nvelox-prev h2_m10           11041/s  p50 110.51 p99 254.13 ms cpu 373% (origin  61%, load  64%)  104.1 MiB 
+16:26:45 round 1  nginx       h2_m10          116469/s  p50 9.78 p99 19.32 ms    cpu 400% (origin 245%, load 211%)   52.9 MiB 
+16:26:59 round 1  nvelox      h2_m10          196144/s  p50 6.48 p99 12.10 ms    cpu 398% (origin 367%, load 206%)   18.1 MiB 
+16:27:12 round 1  envoy       h3_m1            14549/s  p50 8.47 p99 16.37 ms    cpu 399% (origin  39%, load 143%)   71.0 MiB 
+16:27:26 round 1  traefik     h3_m1            14961/s  p50 7.82 p99 25.39 ms    cpu 390% (origin  61%, load 120%)  314.2 MiB 
+16:27:39 round 1  caddy       h3_m1            11615/s  p50 9.50 p99 32.12 ms    cpu 382% (origin  47%, load 108%)  139.0 MiB 
+16:27:53 round 1  nvelox-prev h3_m1            11347/s  p50 10.27 p99 27.30 ms   cpu 380% (origin  40%, load  99%)   92.9 MiB 
+16:28:06 round 1  nvelox      h3_m1           103105/s  p50 1.15 p99 2.68 ms     cpu 397% (origin 237%, load 472%)   60.1 MiB 
+16:28:20 round 1  nginx       h3_m1            76756/s  p50 1.49 p99 3.48 ms     cpu 399% (origin 185%, load 343%)   55.9 MiB 
+16:28:33 round 1  haproxy     h3_m1            57508/s  p50 1.94 p99 4.25 ms     cpu 399% (origin 176%, load 336%)   41.8 MiB 
+16:28:47 round 1  traefik     h3_m10           12069/s  p50 100.78 p99 267.12 ms cpu 387% (origin  81%, load  53%)  352.8 MiB 
+16:29:00 round 1  caddy       h3_m10           11994/s  p50 103.73 p99 232.47 ms cpu 384% (origin  63%, load  52%)  175.5 MiB 
+16:29:14 round 1  nvelox-prev h3_m10           10708/s  p50 109.91 p99 300.88 ms cpu 378% (origin  65%, load  52%)  106.3 MiB 
+16:29:27 round 1  nginx       h3_m10          106614/s  p50 7.68 p99 88.29 ms    cpu 400% (origin 222%, load 286%)   92.2 MiB 
+16:29:41 round 1  nvelox      h3_m10          156585/s  p50 7.50 p99 16.88 ms    cpu 397% (origin 294%, load 282%)   48.7 MiB 
+16:29:54 round 1  haproxy     h3_m10           65900/s  p50 15.99 p99 84.96 ms   cpu 399% (origin 195%, load 199%)   64.5 MiB 
+16:30:08 round 1  envoy       h3_m10           14274/s  p50 58.38 p99 93.84 ms   cpu 400% (origin  39%, load 104%)   88.4 MiB 
+16:30:21 round 1  origin      udp_1024        376435/s  p50 0.25 p99 3.24 ms      
+16:30:35 round 1  traefik     udp_1024        102606/s  p50 0.80 p99 2.93 ms     cpu 297% (origin 139%, load 159%)  300.2 MiB lost=0.35%
+16:30:48 round 1  nvelox-prev udp_1024         83323/s  p50 0.76 p99 2.53 ms     cpu 217% (origin 106%, load 150%)   86.9 MiB lost=0.65%
+16:31:02 round 1  nvelox      udp_1024        284556/s  p50 0.33 p99 3.34 ms     cpu 359% (origin 225%, load 369%)   49.7 MiB 
+16:31:15 round 1  nginx       udp_1024        224089/s  p50 0.41 p99 3.84 ms     cpu 361% (origin 220%, load 350%)   71.5 MiB 
+16:31:29 round 1  envoy       udp_1024        197452/s  p50 0.60 p99 1.22 ms     cpu 397% (origin 192%, load 312%)   88.5 MiB 
+16:31:42 round 1  nvelox-prev udp_64           96642/s  p50 1.15 p99 3.58 ms     cpu 224% (origin 109%, load 168%)   25.7 MiB 
+16:31:56 round 1  nginx       udp_64          243584/s  p50 0.40 p99 3.60 ms     cpu 362% (origin 223%, load 361%)   71.5 MiB 
+16:32:10 round 1  nvelox      udp_64          282788/s  p50 0.30 p99 3.55 ms     cpu 349% (origin 228%, load 359%)   43.2 MiB 
+16:32:23 round 1  envoy       udp_64          256672/s  p50 0.47 p99 0.98 ms     cpu 396% (origin 189%, load 333%)   88.5 MiB 
+16:32:37 round 1  traefik     udp_64          168016/s  p50 0.70 p99 2.20 ms     cpu 292% (origin 143%, load 232%)   82.1 MiB 
+16:32:50 round 2  origin      http_1k         291139/s  p50 0.38 p99 0.84 ms      
+16:33:04 round 2  envoy       http_1k          38988/s  p50 3.21 p99 5.03 ms     cpu 397% (origin  85%, load  72%)   88.5 MiB 
+16:33:18 round 2  traefik     http_1k          36623/s  p50 3.17 p99 14.10 ms    cpu 365% (origin  91%, load  66%)   75.1 MiB 
+16:33:31 round 2  caddy       http_1k          25497/s  p50 4.45 p99 20.43 ms    cpu 359% (origin  67%, load  53%)   81.1 MiB 
+16:33:45 round 2  nvelox-prev http_1k          22895/s  p50 5.54 p99 20.16 ms    cpu 343% (origin  62%, load  44%)   30.1 MiB 
+16:33:59 round 2  nvelox      http_1k         191938/s  p50 0.63 p99 1.21 ms     cpu 396% (origin 293%, load 259%)   23.6 MiB 
+16:34:12 round 2  nginx       http_1k         170905/s  p50 0.72 p99 1.27 ms     cpu 397% (origin 266%, load 232%)   71.4 MiB 
+16:34:26 round 2  haproxy     http_1k         133492/s  p50 0.90 p99 1.84 ms     cpu 396% (origin 218%, load 196%)   58.7 MiB 
+16:34:40 round 2  traefik     http_64k         22360/s  p50 5.19 p99 33.11 ms    cpu 370% (origin  82%, load 110%)   77.1 MiB 
+16:34:53 round 2  caddy       http_64k         18701/s  p50 6.11 p99 32.35 ms    cpu 360% (origin  70%, load  86%)   77.0 MiB 
+16:35:07 round 2  nvelox-prev http_64k         13676/s  p50 8.89 p99 38.78 ms    cpu 318% (origin  53%, load  73%)   32.6 MiB 
+16:35:21 round 2  nginx       http_64k         47270/s  p50 2.41 p99 37.31 ms    cpu 397% (origin 143%, load 222%)   70.0 MiB 
+16:35:34 round 2  nvelox      http_64k         81223/s  p50 1.36 p99 38.56 ms    cpu 396% (origin 236%, load 292%)   23.6 MiB 
+16:35:48 round 2  haproxy     http_64k         50673/s  p50 2.39 p99 29.40 ms    cpu 397% (origin 147%, load 183%)   59.0 MiB 
+16:36:02 round 2  envoy       http_64k         23061/s  p50 5.77 p99 21.96 ms    cpu 397% (origin  81%, load  93%)   94.3 MiB 
+16:36:15 round 2  caddy       https_1k         23120/s  p50 4.90 p99 22.45 ms    cpu 361% (origin  66%, load  79%)   79.4 MiB 
+16:36:29 round 2  nvelox-prev https_1k         21911/s  p50 5.74 p99 20.24 ms    cpu 356% (origin  61%, load  70%)   33.5 MiB 
+16:36:43 round 2  nvelox      https_1k        172823/s  p50 0.69 p99 1.31 ms     cpu 396% (origin 274%, load 341%)   31.2 MiB 
+16:36:56 round 2  nginx       https_1k        120975/s  p50 1.03 p99 1.88 ms     cpu 396% (origin 210%, load 252%)   69.2 MiB 
+16:37:10 round 2  haproxy     https_1k        101773/s  p50 1.18 p99 2.19 ms     cpu 397% (origin 183%, load 223%)   59.3 MiB 
+16:37:24 round 2  envoy       https_1k         34904/s  p50 3.59 p99 5.70 ms     cpu 397% (origin  77%, load  96%)   94.3 MiB 
+16:37:37 round 2  traefik     https_1k         35026/s  p50 3.33 p99 14.07 ms    cpu 373% (origin  86%, load 105%)   75.3 MiB 
+16:37:51 round 2  nginx       tcp_1k          254991/s  p50 0.48 p99 1.01 ms     cpu 397% (origin 344%, load 320%)   68.3 MiB 
+16:38:05 round 2  nvelox      tcp_1k          269801/s  p50 0.45 p99 1.12 ms     cpu 395% (origin 367%, load 337%)   31.3 MiB 
+16:38:18 round 2  haproxy     tcp_1k          218592/s  p50 0.55 p99 1.14 ms     cpu 397% (origin 324%, load 282%)   59.3 MiB 
+16:38:32 round 2  envoy       tcp_1k          159070/s  p50 0.76 p99 1.63 ms     cpu 397% (origin 256%, load 216%)   94.3 MiB 
+16:38:46 round 2  traefik     tcp_1k          173880/s  p50 0.69 p99 3.22 ms     cpu 376% (origin 278%, load 244%)   64.8 MiB 
+16:38:59 round 2  nvelox-prev tcp_1k          162967/s  p50 0.73 p99 3.40 ms     cpu 375% (origin 264%, load 219%)   20.6 MiB 
+16:39:13 round 2  nvelox      http_1k_log     191317/s  p50 0.63 p99 1.20 ms     cpu 396% (origin 307%, load 251%)   31.4 MiB 
+16:39:27 round 2  nginx       http_1k_log     132415/s  p50 0.99 p99 1.51 ms     cpu 397% (origin 241%, load 215%)   68.3 MiB 
+16:39:40 round 2  haproxy     http_1k_log      97779/s  p50 1.26 p99 1.96 ms     cpu 397% (origin 184%, load 163%)   59.3 MiB 
+16:39:54 round 2  envoy       http_1k_log      33466/s  p50 3.85 p99 5.61 ms     cpu 398% (origin  75%, load  69%)   94.3 MiB 
+16:40:08 round 2  traefik     http_1k_log      20995/s  p50 5.54 p99 22.99 ms    cpu 358% (origin  55%, load  47%)   57.7 MiB 
+16:40:21 round 2  caddy       http_1k_log      20267/s  p50 5.66 p99 23.34 ms    cpu 357% (origin  48%, load  46%)   55.7 MiB 
+16:40:35 round 2  nvelox-prev http_1k_log      19518/s  p50 6.62 p99 21.77 ms    cpu 356% (origin  44%, load  44%)   27.0 MiB 
+16:40:49 round 2  haproxy     h2_m1            85805/s  p50 1.42 p99 2.30 ms     cpu 399% (origin 172%, load 261%)   54.9 MiB 
+16:41:02 round 2  envoy       h2_m1            29087/s  p50 4.46 p99 6.29 ms     cpu 400% (origin  67%, load 109%)   94.4 MiB 
+16:41:16 round 2  traefik     h2_m1            19812/s  p50 5.80 p99 20.38 ms    cpu 379% (origin  53%, load 100%)   70.9 MiB 
+16:41:29 round 2  caddy       h2_m1            15299/s  p50 7.10 p99 26.67 ms    cpu 363% (origin  43%, load  82%)   55.9 MiB 
+16:41:43 round 2  nvelox-prev h2_m1            13088/s  p50 9.41 p99 28.20 ms    cpu 356% (origin  38%, load  73%)   33.8 MiB 
+16:41:56 round 2  nginx       h2_m1            92621/s  p50 1.28 p99 2.09 ms     cpu 400% (origin 181%, load 294%)   68.3 MiB 
+16:42:10 round 2  nvelox      h2_m1           136183/s  p50 0.87 p99 1.58 ms     cpu 398% (origin 259%, load 369%)   27.2 MiB 
+16:42:23 round 2  envoy       h2_m10           33853/s  p50 36.53 p99 51.17 ms   cpu 400% (origin  82%, load  31%)   95.2 MiB 
+16:42:37 round 2  traefik     h2_m10           15384/s  p50 81.02 p99 153.74 ms  cpu 385% (origin  69%, load  79%)  368.2 MiB 
+16:42:50 round 2  caddy       h2_m10           13743/s  p50 93.21 p99 171.01 ms  cpu 385% (origin  63%, load  73%)  153.0 MiB 
+16:43:04 round 2  nvelox-prev h2_m10           12214/s  p50 99.92 p99 237.78 ms  cpu 373% (origin  49%, load  65%)  119.7 MiB 
+16:43:17 round 2  nvelox      h2_m10          218186/s  p50 5.70 p99 9.39 ms     cpu 399% (origin 371%, load 199%)   30.8 MiB 
+16:43:31 round 2  nginx       h2_m10          112818/s  p50 11.44 p99 17.91 ms   cpu 400% (origin 230%, load 211%)   68.1 MiB 
+16:43:44 round 2  haproxy     h2_m10           79890/s  p50 15.38 p99 23.33 ms   cpu 399% (origin 167%, load 179%)   54.1 MiB 
+16:43:58 round 2  traefik     h3_m1            16618/s  p50 7.05 p99 22.61 ms    cpu 386% (origin  46%, load 129%)  311.0 MiB 
+16:44:11 round 2  caddy       h3_m1            12670/s  p50 8.66 p99 30.32 ms    cpu 377% (origin  36%, load 108%)  134.0 MiB 
+16:44:25 round 2  nvelox-prev h3_m1            11724/s  p50 10.32 p99 26.60 ms   cpu 378% (origin  35%, load  98%)   81.8 MiB 
+16:44:38 round 2  nginx       h3_m1            87652/s  p50 1.34 p99 2.56 ms     cpu 399% (origin 162%, load 373%)   64.1 MiB 
+16:44:52 round 2  nvelox      h3_m1           112277/s  p50 1.08 p99 2.18 ms     cpu 398% (origin 209%, load 501%)   62.1 MiB 
+16:45:05 round 2  haproxy     h3_m1            68015/s  p50 1.78 p99 3.90 ms     cpu 398% (origin 137%, load 386%)   54.3 MiB 
+16:45:19 round 2  envoy       h3_m1            15382/s  p50 8.22 p99 12.77 ms    cpu 400% (origin  31%, load 126%)   95.3 MiB 
+16:45:32 round 2  caddy       h3_m10           12058/s  p50 101.11 p99 248.19 ms cpu 384% (origin  53%, load  56%)  174.0 MiB 
+16:45:46 round 2  nvelox-prev h3_m10           12297/s  p50 95.40 p99 253.60 ms  cpu 384% (origin  47%, load  52%)  104.9 MiB 
+16:45:59 round 2  nvelox      h3_m10          170349/s  p50 7.14 p99 13.68 ms    cpu 399% (origin 295%, load 224%)   54.3 MiB 
+16:46:13 round 2  nginx       h3_m10          114965/s  p50 7.29 p99 60.17 ms    cpu 400% (origin 200%, load 316%)   93.8 MiB 
+16:46:26 round 2  haproxy     h3_m10           74604/s  p50 13.82 p99 81.43 ms   cpu 399% (origin 165%, load 243%)   70.6 MiB 
+16:46:40 round 2  envoy       h3_m10           15081/s  p50 56.52 p99 88.63 ms   cpu 400% (origin  39%, load 116%)   97.5 MiB 
+16:46:53 round 2  traefik     h3_m10           12832/s  p50 94.71 p99 228.58 ms  cpu 384% (origin  65%, load  55%)  395.2 MiB 
+16:47:07 round 2  origin      udp_1024        401650/s  p50 0.23 p99 3.22 ms      
+16:47:20 round 2  nvelox-prev udp_1024         80764/s  p50 0.83 p99 2.53 ms     cpu 219% (origin 113%, load 147%)   92.2 MiB lost=0.67%
+16:47:34 round 2  nginx       udp_1024        223111/s  p50 0.42 p99 3.88 ms     cpu 355% (origin 214%, load 349%)   88.5 MiB 
+16:47:47 round 2  nvelox      udp_1024        276401/s  p50 0.32 p99 3.65 ms     cpu 354% (origin 224%, load 367%)   54.3 MiB 
+16:48:01 round 2  envoy       udp_1024        204967/s  p50 0.60 p99 1.08 ms     cpu 397% (origin 183%, load 316%)   97.6 MiB 
+16:48:14 round 2  traefik     udp_1024        108208/s  p50 0.77 p99 2.68 ms     cpu 294% (origin 122%, load 173%)  328.0 MiB lost=0.33%
+16:48:28 round 2  nvelox      udp_64          309362/s  p50 0.28 p99 3.47 ms     cpu 347% (origin 217%, load 374%)   45.8 MiB 
+16:48:41 round 2  nginx       udp_64          279397/s  p50 0.40 p99 1.90 ms     cpu 375% (origin 224%, load 381%)   88.5 MiB 
+16:48:55 round 2  envoy       udp_64          222129/s  p50 0.60 p99 1.08 ms     cpu 398% (origin 181%, load 323%)   97.6 MiB 
+16:49:08 round 2  traefik     udp_64          120843/s  p50 0.97 p99 3.20 ms     cpu 289% (origin 120%, load 174%)  135.8 MiB 
+16:49:22 round 2  nvelox-prev udp_64           99763/s  p50 1.10 p99 3.47 ms     cpu 224% (origin  96%, load 166%)   25.2 MiB 
+16:49:35 round 3  origin      http_1k         224330/s  p50 0.54 p99 0.88 ms      
+16:49:49 round 3  traefik     http_1k          30647/s  p50 3.85 p99 15.66 ms    cpu 372% (origin  78%, load  66%)   82.2 MiB 
+16:50:03 round 3  caddy       http_1k          21332/s  p50 5.32 p99 24.41 ms    cpu 356% (origin  54%, load  46%)   80.2 MiB 
+16:50:16 round 3  nvelox-prev http_1k          17627/s  p50 7.22 p99 26.88 ms    cpu 342% (origin  44%, load  40%)   32.5 MiB 
+16:50:30 round 3  nginx       http_1k         132871/s  p50 0.94 p99 1.56 ms     cpu 397% (origin 239%, load 212%)   88.5 MiB 
+16:50:44 round 3  nvelox      http_1k         143895/s  p50 0.82 p99 1.52 ms     cpu 397% (origin 250%, load 218%)   26.9 MiB 
+16:50:57 round 3  haproxy     http_1k         108897/s  p50 1.14 p99 1.77 ms     cpu 397% (origin 195%, load 175%)   68.5 MiB 
+16:51:11 round 3  envoy       http_1k          37217/s  p50 3.29 p99 4.94 ms     cpu 398% (origin  85%, load  73%)   97.6 MiB 
+16:51:25 round 3  caddy       http_64k         15513/s  p50 7.46 p99 35.05 ms    cpu 357% (origin  56%, load  90%)   74.6 MiB 
+16:51:38 round 3  nvelox-prev http_64k         13129/s  p50 9.42 p99 36.68 ms    cpu 343% (origin  47%, load  82%)   33.0 MiB 
+16:51:52 round 3  nvelox      http_64k         63779/s  p50 1.86 p99 38.17 ms    cpu 396% (origin 211%, load 266%)   26.9 MiB 
+16:52:06 round 3  nginx       http_64k         38248/s  p50 3.32 p99 36.39 ms    cpu 397% (origin 133%, load 221%)   88.5 MiB 
+16:52:19 round 3  haproxy     http_64k         41695/s  p50 2.93 p99 30.11 ms    cpu 397% (origin 144%, load 176%)   68.6 MiB 
+16:52:33 round 3  envoy       http_64k         23221/s  p50 5.38 p99 17.53 ms    cpu 397% (origin  90%, load 104%)   98.8 MiB 
+16:52:47 round 3  traefik     http_64k         19349/s  p50 6.06 p99 33.69 ms    cpu 376% (origin  71%, load 107%)   93.3 MiB 
+16:53:00 round 3  nvelox-prev https_1k         18139/s  p50 6.91 p99 23.20 ms    cpu 360% (origin  54%, load  67%)   33.7 MiB 
+16:53:14 round 3  nginx       https_1k        105759/s  p50 1.13 p99 1.90 ms     cpu 397% (origin 209%, load 245%)   88.5 MiB 
+16:53:28 round 3  nvelox      https_1k        133417/s  p50 0.89 p99 1.73 ms     cpu 396% (origin 250%, load 307%)   33.1 MiB 
+16:53:41 round 3  haproxy     https_1k         88264/s  p50 1.45 p99 2.24 ms     cpu 397% (origin 174%, load 208%)   68.7 MiB 
+16:53:55 round 3  envoy       https_1k         34136/s  p50 3.69 p99 5.40 ms     cpu 397% (origin  81%, load 101%)   98.8 MiB 
+16:54:09 round 3  traefik     https_1k         28901/s  p50 4.07 p99 16.21 ms    cpu 373% (origin  74%, load  91%)   84.9 MiB 
+16:54:22 round 3  caddy       https_1k         20877/s  p50 5.48 p99 22.23 ms    cpu 367% (origin  53%, load  69%)   66.8 MiB 
+16:54:36 round 3  haproxy     tcp_1k          168009/s  p50 0.73 p99 1.21 ms     cpu 396% (origin 305%, load 270%)   68.7 MiB 
+16:54:50 round 3  envoy       tcp_1k          128969/s  p50 0.97 p99 1.85 ms     cpu 398% (origin 232%, load 210%)   98.8 MiB 
+16:55:03 round 3  traefik     tcp_1k          119042/s  p50 0.99 p99 4.40 ms     cpu 366% (origin 234%, load 205%)   74.1 MiB 
+16:55:17 round 3  nvelox-prev tcp_1k          111831/s  p50 1.07 p99 4.49 ms     cpu 373% (origin 222%, load 180%)   24.9 MiB 
+16:55:31 round 3  nvelox      tcp_1k          197181/s  p50 0.62 p99 1.09 ms     cpu 396% (origin 342%, load 299%)   33.2 MiB 
+16:55:44 round 3  nginx       tcp_1k          187951/s  p50 0.66 p99 1.10 ms     cpu 397% (origin 346%, load 283%)   88.5 MiB 
+16:55:58 round 3  haproxy     http_1k_log      97547/s  p50 1.27 p99 1.91 ms     cpu 397% (origin 181%, load 159%)   68.7 MiB 
+16:56:12 round 3  envoy       http_1k_log      34218/s  p50 3.57 p99 5.92 ms     cpu 398% (origin  81%, load  68%)   98.8 MiB 
+16:56:26 round 3  traefik     http_1k_log      22766/s  p50 5.20 p99 18.37 ms    cpu 380% (origin  61%, load  51%)   59.4 MiB 
+16:56:39 round 3  caddy       http_1k_log      20118/s  p50 5.70 p99 23.08 ms    cpu 363% (origin  58%, load  49%)   56.7 MiB 
+16:56:53 round 3  nvelox-prev http_1k_log      19421/s  p50 6.62 p99 21.96 ms    cpu 357% (origin  56%, load  44%)   27.9 MiB 
+16:57:07 round 3  nginx       http_1k_log     131744/s  p50 0.97 p99 1.82 ms     cpu 397% (origin 248%, load 209%)   88.5 MiB 
+16:57:20 round 3  nvelox      http_1k_log     150602/s  p50 0.81 p99 1.35 ms     cpu 396% (origin 277%, load 232%)   33.2 MiB 
+16:57:34 round 3  envoy       h2_m1            30166/s  p50 3.84 p99 7.41 ms     cpu 400% (origin  76%, load 106%)   98.8 MiB 
+16:57:47 round 3  traefik     h2_m1            19034/s  p50 6.00 p99 21.44 ms    cpu 374% (origin  57%, load 101%)   77.4 MiB 
+16:58:01 round 3  caddy       h2_m1            14830/s  p50 7.35 p99 27.51 ms    cpu 358% (origin  42%, load  81%)   60.0 MiB 
+16:58:14 round 3  nvelox-prev h2_m1            12854/s  p50 9.50 p99 28.51 ms    cpu 356% (origin  40%, load  78%)   34.2 MiB 
+16:58:28 round 3  nvelox      h2_m1           139340/s  p50 0.86 p99 1.47 ms     cpu 398% (origin 259%, load 374%)   29.8 MiB 
+16:58:41 round 3  nginx       h2_m1            99968/s  p50 1.23 p99 1.96 ms     cpu 399% (origin 198%, load 289%)   88.5 MiB 
+16:58:55 round 3  haproxy     h2_m1            86412/s  p50 1.43 p99 2.17 ms     cpu 399% (origin 173%, load 258%)   67.1 MiB 
+16:59:08 round 3  traefik     h2_m10           15064/s  p50 83.00 p99 174.73 ms  cpu 381% (origin  71%, load  76%)  371.6 MiB 
+16:59:22 round 3  caddy       h2_m10           13833/s  p50 93.00 p99 182.80 ms  cpu 386% (origin  65%, load  75%)  151.3 MiB 
+16:59:35 round 3  nvelox-prev h2_m10           12446/s  p50 99.06 p99 235.30 ms  cpu 372% (origin  49%, load  65%)  111.6 MiB 
+16:59:49 round 3  nginx       h2_m10          109185/s  p50 11.41 p99 20.64 ms   cpu 400% (origin 243%, load 210%)   88.5 MiB 
+17:00:02 round 3  nvelox      h2_m10          204969/s  p50 6.09 p99 10.43 ms    cpu 398% (origin 371%, load 214%)   32.9 MiB 
+17:00:16 round 3  haproxy     h2_m10           84330/s  p50 14.69 p99 23.56 ms   cpu 399% (origin 186%, load 183%)   60.0 MiB 
+17:00:29 round 3  envoy       h2_m10           34050/s  p50 37.93 p99 47.38 ms   cpu 400% (origin  83%, load  31%)   99.0 MiB 
+17:00:43 round 3  caddy       h3_m1            12881/s  p50 8.53 p99 28.90 ms    cpu 383% (origin  37%, load 104%)  144.7 MiB 
+17:00:56 round 3  nvelox-prev h3_m1            11569/s  p50 10.28 p99 27.79 ms   cpu 377% (origin  38%, load  93%)   89.6 MiB 
+17:01:10 round 3  nvelox      h3_m1           116137/s  p50 1.05 p99 2.04 ms     cpu 398% (origin 227%, load 507%)   64.5 MiB 
+17:01:23 round 3  nginx       h3_m1            82236/s  p50 1.47 p99 2.48 ms     cpu 399% (origin 165%, load 372%)   83.6 MiB 
+17:01:37 round 3  haproxy     h3_m1            69648/s  p50 1.78 p99 2.79 ms     cpu 399% (origin 130%, load 402%)   60.0 MiB 
+17:01:50 round 3  envoy       h3_m1            14953/s  p50 8.32 p99 13.47 ms    cpu 399% (origin  38%, load 141%)   99.0 MiB 
+17:02:04 round 3  traefik     h3_m1            17203/s  p50 6.86 p99 21.37 ms    cpu 390% (origin  46%, load 131%)  327.2 MiB 
+17:02:17 round 3  nvelox-prev h3_m10           11963/s  p50 97.71 p99 278.87 ms  cpu 375% (origin  50%, load  49%)  107.8 MiB 
+17:02:31 round 3  nginx       h3_m10          115882/s  p50 7.07 p99 63.33 ms    cpu 400% (origin 209%, load 316%)   96.8 MiB 
+17:02:44 round 3  nvelox      h3_m10          184703/s  p50 6.61 p99 11.41 ms    cpu 398% (origin 324%, load 237%)   53.9 MiB 
+17:02:58 round 3  haproxy     h3_m10           77007/s  p50 12.42 p99 101.85 ms  cpu 399% (origin 167%, load 248%)   73.5 MiB 
+17:03:11 round 3  envoy       h3_m10           15675/s  p50 51.15 p99 77.66 ms   cpu 400% (origin  40%, load 106%)   99.1 MiB 
+17:03:25 round 3  traefik     h3_m10           13096/s  p50 92.71 p99 240.77 ms  cpu 385% (origin  64%, load  56%)  371.8 MiB 
+17:03:38 round 3  caddy       h3_m10           12337/s  p50 97.76 p99 250.32 ms  cpu 384% (origin  58%, load  50%)  167.9 MiB 
+17:03:52 round 3  origin      udp_1024        401400/s  p50 0.23 p99 3.24 ms      
+17:04:05 round 3  nvelox      udp_1024        272270/s  p50 0.32 p99 3.64 ms     cpu 341% (origin 202%, load 364%)   54.0 MiB 
+17:04:19 round 3  nginx       udp_1024        259510/s  p50 0.45 p99 2.22 ms     cpu 376% (origin 219%, load 382%)   85.2 MiB 
+17:04:32 round 3  envoy       udp_1024        194544/s  p50 0.64 p99 1.22 ms     cpu 396% (origin 178%, load 310%)   99.2 MiB 
+17:04:46 round 3  traefik     udp_1024        109581/s  p50 0.73 p99 2.60 ms     cpu 292% (origin 123%, load 167%)  298.6 MiB lost=0.35%
+17:04:59 round 3  nvelox-prev udp_1024         91548/s  p50 0.69 p99 2.13 ms     cpu 218% (origin  97%, load 160%)   25.0 MiB lost=0.59%
+17:05:13 round 3  envoy       udp_64          179700/s  p50 0.60 p99 3.88 ms     cpu 343% (origin 151%, load 253%)   99.2 MiB 
+17:05:26 round 3  traefik     udp_64          119996/s  p50 0.98 p99 3.21 ms     cpu 290% (origin 122%, load 175%)  137.2 MiB 
+17:05:40 round 3  nvelox-prev udp_64           99515/s  p50 1.11 p99 3.45 ms     cpu 227% (origin  98%, load 169%)   24.0 MiB 
+17:05:53 round 3  nginx       udp_64          283229/s  p50 0.36 p99 2.33 ms     cpu 370% (origin 220%, load 383%)   85.2 MiB 
+17:06:07 round 3  nvelox      udp_64          329205/s  p50 0.29 p99 3.16 ms     cpu 362% (origin 226%, load 396%)   51.0 MiB 
+17:06:20 round 4  origin      http_1k         225741/s  p50 0.56 p99 0.80 ms      
+17:06:34 round 4  caddy       http_1k          21878/s  p50 5.20 p99 21.95 ms    cpu 364% (origin  57%, load  52%)   74.8 MiB 
+17:06:47 round 4  nvelox-prev http_1k          19588/s  p50 6.54 p99 21.83 ms    cpu 358% (origin  52%, load  45%)   30.5 MiB 
+17:07:01 round 4  nvelox      http_1k         154966/s  p50 0.80 p99 1.23 ms     cpu 396% (origin 278%, load 241%)   27.0 MiB 
+17:07:15 round 4  nginx       http_1k         136608/s  p50 0.90 p99 1.53 ms     cpu 397% (origin 249%, load 225%)   85.2 MiB 
+17:07:29 round 4  haproxy     http_1k         110367/s  p50 1.12 p99 1.76 ms     cpu 397% (origin 197%, load 173%)   72.9 MiB 
+17:07:42 round 4  envoy       http_1k          36472/s  p50 3.44 p99 6.11 ms     cpu 398% (origin  84%, load  77%)   99.2 MiB 
+17:07:56 round 4  traefik     http_1k          31157/s  p50 3.78 p99 15.40 ms    cpu 373% (origin  77%, load  67%)   80.8 MiB 
+17:08:10 round 4  nvelox-prev http_64k         12896/s  p50 9.61 p99 37.47 ms    cpu 341% (origin  50%, load  85%)   31.8 MiB 
+17:08:23 round 4  nginx       http_64k         36809/s  p50 3.37 p99 36.38 ms    cpu 397% (origin 136%, load 219%)   85.1 MiB 
+17:08:37 round 4  nvelox      http_64k         64879/s  p50 1.83 p99 38.22 ms    cpu 397% (origin 207%, load 259%)   27.0 MiB 
+17:08:51 round 4  haproxy     http_64k         39963/s  p50 3.01 p99 28.05 ms    cpu 397% (origin 126%, load 182%)   73.0 MiB 
+17:09:04 round 4  envoy       http_64k         24852/s  p50 5.15 p99 10.77 ms    cpu 398% (origin  85%, load 107%)  100.2 MiB 
+17:09:18 round 4  traefik     http_64k         19035/s  p50 6.16 p99 33.08 ms    cpu 370% (origin  69%, load 107%)   80.7 MiB 
+17:09:32 round 4  caddy       http_64k         15768/s  p50 7.37 p99 33.92 ms    cpu 355% (origin  56%, load  86%)   68.8 MiB 
+17:09:45 round 4  nvelox      https_1k        132943/s  p50 0.88 p99 1.60 ms     cpu 395% (origin 249%, load 326%)   33.2 MiB 
+17:09:59 round 4  nginx       https_1k         97236/s  p50 1.25 p99 2.33 ms     cpu 397% (origin 181%, load 250%)   85.1 MiB 
+17:10:13 round 4  haproxy     https_1k         86731/s  p50 1.39 p99 4.55 ms     cpu 387% (origin 171%, load 189%)   73.1 MiB 
+17:10:26 round 4  envoy       https_1k         34238/s  p50 3.79 p99 6.09 ms     cpu 397% (origin  78%, load 103%)  100.2 MiB 
+17:10:40 round 4  traefik     https_1k         29359/s  p50 3.99 p99 16.41 ms    cpu 372% (origin  68%, load  95%)   83.2 MiB 
+17:10:54 round 4  caddy       https_1k         20505/s  p50 5.59 p99 23.06 ms    cpu 364% (origin  51%, load  77%)   62.5 MiB 
+17:11:07 round 4  nvelox-prev https_1k         18875/s  p50 6.77 p99 22.71 ms    cpu 361% (origin  47%, load  70%)   31.0 MiB 
+17:11:21 round 4  envoy       tcp_1k          128858/s  p50 0.90 p99 1.92 ms     cpu 398% (origin 234%, load 228%)  100.2 MiB 
+17:11:35 round 4  traefik     tcp_1k          124601/s  p50 0.96 p99 3.94 ms     cpu 374% (origin 232%, load 220%)   74.7 MiB 
+17:11:48 round 4  nvelox-prev tcp_1k          113252/s  p50 1.07 p99 3.35 ms     cpu 386% (origin 214%, load 196%)   25.7 MiB 
+17:12:02 round 4  nginx       tcp_1k          186627/s  p50 0.70 p99 1.21 ms     cpu 397% (origin 327%, load 288%)   85.0 MiB 
+17:12:16 round 4  nvelox      tcp_1k          189745/s  p50 0.64 p99 1.10 ms     cpu 396% (origin 313%, load 290%)   33.2 MiB 
+17:12:29 round 4  haproxy     tcp_1k          156573/s  p50 0.76 p99 1.33 ms     cpu 397% (origin 268%, load 260%)   73.1 MiB 
+17:12:43 round 4  envoy       http_1k_log      35333/s  p50 3.60 p99 6.69 ms     cpu 398% (origin  77%, load  76%)  100.2 MiB 
+17:12:57 round 4  traefik     http_1k_log      23209/s  p50 5.08 p99 18.12 ms    cpu 380% (origin  58%, load  56%)   58.2 MiB 
+17:13:10 round 4  caddy       http_1k_log      20175/s  p50 5.68 p99 23.44 ms    cpu 355% (origin  51%, load  49%)   62.4 MiB 
+17:13:24 round 4  nvelox-prev http_1k_log      19216/s  p50 6.67 p99 22.44 ms    cpu 354% (origin  50%, load  48%)   27.8 MiB 
+17:13:38 round 4  nvelox      http_1k_log     153141/s  p50 0.81 p99 1.27 ms     cpu 396% (origin 271%, load 244%)   33.2 MiB 
+17:13:51 round 4  nginx       http_1k_log     121725/s  p50 1.11 p99 1.69 ms     cpu 397% (origin 217%, load 205%)   85.0 MiB 
+17:14:05 round 4  haproxy     http_1k_log      97284/s  p50 1.27 p99 1.97 ms     cpu 396% (origin 178%, load 157%)   63.1 MiB 
+17:14:19 round 4  traefik     h2_m1            19804/s  p50 5.82 p99 20.04 ms    cpu 379% (origin  53%, load  92%)   75.7 MiB 
+17:14:32 round 4  caddy       h2_m1            15262/s  p50 7.21 p99 26.34 ms    cpu 369% (origin  46%, load  85%)   59.0 MiB 
+17:14:46 round 4  nvelox-prev h2_m1            12980/s  p50 9.42 p99 28.09 ms    cpu 358% (origin  41%, load  72%)   34.4 MiB 
+17:14:59 round 4  nginx       h2_m1            96176/s  p50 1.33 p99 2.30 ms     cpu 399% (origin 199%, load 310%)   85.0 MiB 
+17:15:13 round 4  nvelox      h2_m1           128277/s  p50 0.87 p99 3.56 ms     cpu 396% (origin 234%, load 325%)   30.0 MiB 
+17:15:26 round 4  haproxy     h2_m1            85724/s  p50 1.43 p99 2.22 ms     cpu 399% (origin 169%, load 254%)   63.1 MiB 
+17:15:40 round 4  envoy       h2_m1            30167/s  p50 4.16 p99 6.76 ms     cpu 400% (origin  73%, load 110%)  100.2 MiB 
+17:15:53 round 4  caddy       h2_m10           13573/s  p50 94.90 p99 171.35 ms  cpu 382% (origin  62%, load  68%)  158.3 MiB 
+17:16:07 round 4  nvelox-prev h2_m10           12610/s  p50 97.32 p99 218.52 ms  cpu 379% (origin  51%, load  66%)  109.8 MiB 
+17:16:20 round 4  nvelox      h2_m10          223153/s  p50 5.43 p99 9.13 ms     cpu 399% (origin 373%, load 203%)   33.4 MiB 
+17:16:34 round 4  nginx       h2_m10          120370/s  p50 10.37 p99 16.05 ms   cpu 399% (origin 242%, load 207%)   85.0 MiB 
+17:16:47 round 4  haproxy     h2_m10           89960/s  p50 13.99 p99 18.77 ms   cpu 400% (origin 190%, load 176%)   63.5 MiB 
+17:17:01 round 4  envoy       h2_m10           34628/s  p50 36.71 p99 46.94 ms   cpu 400% (origin  84%, load  30%)  100.6 MiB 
+17:17:14 round 4  traefik     h2_m10           14840/s  p50 84.34 p99 178.94 ms  cpu 384% (origin  66%, load  76%)  395.8 MiB 
+17:17:28 round 4  nvelox-prev h3_m1            11844/s  p50 9.68 p99 27.33 ms    cpu 377% (origin  35%, load  89%)   75.0 MiB 
+17:17:41 round 4  nginx       h3_m1            88435/s  p50 1.31 p99 2.76 ms     cpu 399% (origin 164%, load 359%)   83.9 MiB 
+17:17:55 round 4  nvelox      h3_m1           119600/s  p50 1.01 p99 2.06 ms     cpu 397% (origin 224%, load 466%)   64.2 MiB 
+17:18:08 round 4  haproxy     h3_m1            67925/s  p50 1.73 p99 3.43 ms     cpu 399% (origin 133%, load 371%)   63.5 MiB 
+17:18:22 round 4  envoy       h3_m1            15620/s  p50 8.32 p99 12.61 ms    cpu 400% (origin  37%, load 131%)  100.7 MiB 
+17:18:35 round 4  traefik     h3_m1            17544/s  p50 6.82 p99 21.28 ms    cpu 395% (origin  50%, load 124%)  268.2 MiB 
+17:18:49 round 4  caddy       h3_m1            13045/s  p50 8.50 p99 26.90 ms    cpu 384% (origin  37%, load 106%)   83.2 MiB 
+17:19:02 round 4  nvelox      h3_m10          183629/s  p50 6.68 p99 11.66 ms    cpu 398% (origin 327%, load 232%)   53.9 MiB 
+17:19:16 round 4  nginx       h3_m10          116346/s  p50 7.07 p99 59.96 ms    cpu 400% (origin 209%, load 292%)   94.8 MiB 
+17:19:29 round 4  haproxy     h3_m10           77102/s  p50 16.51 p99 51.24 ms   cpu 399% (origin 168%, load 225%)   73.2 MiB 
+17:19:43 round 4  envoy       h3_m10           15544/s  p50 53.35 p99 82.56 ms   cpu 400% (origin  40%, load 105%)  101.1 MiB 
+17:19:56 round 4  traefik     h3_m10           13267/s  p50 92.00 p99 226.48 ms  cpu 382% (origin  65%, load  52%)  374.2 MiB 
+17:20:10 round 4  caddy       h3_m10           11244/s  p50 104.16 p99 312.68 ms cpu 358% (origin  52%, load  45%)  169.2 MiB 
+17:20:23 round 4  nvelox-prev h3_m10           12110/s  p50 97.96 p99 253.26 ms  cpu 377% (origin  50%, load  47%)  107.1 MiB 
+17:20:37 round 4  origin      udp_1024        411605/s  p50 0.23 p99 3.22 ms      
+17:20:50 round 4  envoy       udp_1024        203783/s  p50 0.62 p99 1.05 ms     cpu 398% (origin 183%, load 320%)  101.1 MiB 
+17:21:04 round 4  traefik     udp_1024        110042/s  p50 0.75 p99 2.73 ms     cpu 294% (origin 120%, load 165%)  316.9 MiB lost=0.33%
+17:21:17 round 4  nvelox-prev udp_1024         92701/s  p50 0.68 p99 2.08 ms     cpu 225% (origin  99%, load 161%)   71.5 MiB lost=0.59%
+17:21:31 round 4  nginx       udp_1024        263727/s  p50 0.43 p99 1.88 ms     cpu 380% (origin 224%, load 380%)   85.1 MiB 
+17:21:44 round 4  nvelox      udp_1024        272894/s  p50 0.31 p99 3.79 ms     cpu 339% (origin 206%, load 360%)   49.2 MiB 
+17:21:58 round 4  traefik     udp_64          118567/s  p50 0.99 p99 3.25 ms     cpu 288% (origin 122%, load 168%)  138.8 MiB 
+17:22:11 round 4  nvelox-prev udp_64           93394/s  p50 1.21 p99 3.81 ms     cpu 218% (origin  93%, load 171%)   38.9 MiB 
+17:22:24 round 4  nvelox      udp_64          292739/s  p50 0.29 p99 3.65 ms     cpu 333% (origin 201%, load 363%)   49.2 MiB 
+17:22:38 round 4  nginx       udp_64          282358/s  p50 0.39 p99 2.39 ms     cpu 372% (origin 219%, load 373%)   85.1 MiB 
+17:22:51 round 4  envoy       udp_64          220420/s  p50 0.55 p99 1.07 ms     cpu 397% (origin 182%, load 321%)  101.1 MiB 
+17:23:05 round 5  origin      http_1k         205505/s  p50 0.61 p99 0.90 ms      
+17:23:19 round 5  nvelox-prev http_1k          19748/s  p50 6.49 p99 22.05 ms    cpu 358% (origin  51%, load  43%)   29.6 MiB 
+17:23:32 round 5  nginx       http_1k         133795/s  p50 0.92 p99 1.56 ms     cpu 397% (origin 245%, load 208%)   85.1 MiB 
+17:23:46 round 5  nvelox      http_1k         153005/s  p50 0.81 p99 1.25 ms     cpu 396% (origin 275%, load 228%)   27.0 MiB 
+17:24:00 round 5  haproxy     http_1k         108548/s  p50 1.14 p99 1.74 ms     cpu 397% (origin 196%, load 169%)   71.0 MiB 
+17:24:13 round 5  envoy       http_1k          38071/s  p50 3.36 p99 4.71 ms     cpu 398% (origin  85%, load  70%)  101.1 MiB 
+17:24:27 round 5  traefik     http_1k          30866/s  p50 3.80 p99 15.59 ms    cpu 373% (origin  76%, load  64%)   80.3 MiB 
+17:24:41 round 5  caddy       http_1k          21790/s  p50 5.25 p99 22.16 ms    cpu 362% (origin  57%, load  46%)   63.8 MiB 
+17:24:54 round 5  nvelox      http_64k         63633/s  p50 1.87 p99 38.18 ms    cpu 396% (origin 203%, load 255%)   27.0 MiB 
+17:25:08 round 5  nginx       http_64k         37386/s  p50 3.28 p99 36.52 ms    cpu 397% (origin 128%, load 212%)   85.1 MiB 
+17:25:22 round 5  haproxy     http_64k         41720/s  p50 2.98 p99 20.86 ms    cpu 397% (origin 126%, load 192%)   71.0 MiB 
+17:25:35 round 5  envoy       http_64k         24238/s  p50 4.83 p99 10.35 ms    cpu 398% (origin  83%, load 108%)  101.7 MiB 
+17:25:49 round 5  traefik     http_64k         19726/s  p50 5.93 p99 33.08 ms    cpu 374% (origin  69%, load 107%)   79.8 MiB 
+17:26:03 round 5  caddy       http_64k         15662/s  p50 7.45 p99 33.67 ms    cpu 354% (origin  55%, load  89%)   64.2 MiB 
+17:26:16 round 5  nvelox-prev http_64k         13231/s  p50 9.33 p99 37.76 ms    cpu 337% (origin  46%, load  79%)   30.4 MiB 
+17:26:30 round 5  haproxy     https_1k         87851/s  p50 1.44 p99 2.32 ms     cpu 397% (origin 171%, load 198%)   71.0 MiB 
+17:26:44 round 5  envoy       https_1k         34637/s  p50 3.46 p99 6.37 ms     cpu 397% (origin  80%, load  98%)  101.7 MiB 
+17:26:57 round 5  traefik     https_1k         30057/s  p50 3.94 p99 16.23 ms    cpu 377% (origin  76%, load  83%)   81.3 MiB 
+17:27:11 round 5  caddy       https_1k         20471/s  p50 5.62 p99 23.04 ms    cpu 359% (origin  56%, load  69%)   63.2 MiB 
+17:27:25 round 5  nvelox-prev https_1k         19048/s  p50 6.57 p99 21.60 ms    cpu 363% (origin  50%, load  60%)   35.2 MiB 
+17:27:38 round 5  nginx       https_1k         96765/s  p50 1.17 p99 2.26 ms     cpu 397% (origin 183%, load 221%)   85.1 MiB 
+17:27:52 round 5  nvelox      https_1k        141406/s  p50 0.88 p99 1.37 ms     cpu 396% (origin 258%, load 284%)   33.3 MiB 
+17:28:06 round 5  traefik     tcp_1k          124295/s  p50 0.97 p99 3.97 ms     cpu 376% (origin 235%, load 199%)   78.2 MiB 
+17:28:19 round 5  nvelox-prev tcp_1k          119203/s  p50 1.02 p99 3.45 ms     cpu 383% (origin 228%, load 192%)   34.0 MiB 
+17:28:33 round 5  nvelox      tcp_1k          195647/s  p50 0.60 p99 1.15 ms     cpu 396% (origin 336%, load 284%)   33.3 MiB 
+17:28:47 round 5  nginx       tcp_1k          186407/s  p50 0.67 p99 1.09 ms     cpu 397% (origin 318%, load 277%)   85.1 MiB 
+17:29:00 round 5  haproxy     tcp_1k          168926/s  p50 0.74 p99 1.17 ms     cpu 397% (origin 296%, load 247%)   71.0 MiB 
+17:29:14 round 5  envoy       tcp_1k          130360/s  p50 0.96 p99 1.69 ms     cpu 397% (origin 243%, load 208%)  101.7 MiB 
+17:29:28 round 5  traefik     http_1k_log      23116/s  p50 5.10 p99 18.60 ms    cpu 377% (origin  59%, load  48%)   56.0 MiB 
+17:29:41 round 5  caddy       http_1k_log      20571/s  p50 5.54 p99 23.40 ms    cpu 362% (origin  54%, load  43%)   63.3 MiB 
+17:29:55 round 5  nvelox-prev http_1k_log      19798/s  p50 6.48 p99 21.92 ms    cpu 356% (origin  51%, load  42%)   28.8 MiB 
+17:30:09 round 5  nginx       http_1k_log     129214/s  p50 0.93 p99 3.70 ms     cpu 396% (origin 252%, load 201%)   85.1 MiB 
+17:30:22 round 5  nvelox      http_1k_log     153661/s  p50 0.81 p99 1.23 ms     cpu 397% (origin 273%, load 232%)   33.4 MiB 
+17:30:36 round 5  haproxy     http_1k_log      98524/s  p50 1.26 p99 1.83 ms     cpu 397% (origin 178%, load 157%)   63.9 MiB 
+17:30:50 round 5  envoy       http_1k_log      35569/s  p50 3.62 p99 5.45 ms     cpu 398% (origin  81%, load  74%)  101.7 MiB 
+17:31:03 round 5  caddy       h2_m1            15280/s  p50 7.16 p99 26.67 ms    cpu 364% (origin  43%, load  79%)   60.1 MiB 
+17:31:17 round 5  nvelox-prev h2_m1            13059/s  p50 9.32 p99 28.80 ms    cpu 356% (origin  39%, load  73%)   34.1 MiB 
+17:31:30 round 5  nvelox      h2_m1           137823/s  p50 0.88 p99 1.49 ms     cpu 398% (origin 255%, load 346%)   33.9 MiB 
+17:31:44 round 5  nginx       h2_m1            99941/s  p50 1.28 p99 1.94 ms     cpu 399% (origin 201%, load 293%)   85.1 MiB 
+17:31:57 round 5  haproxy     h2_m1            86215/s  p50 1.43 p99 2.21 ms     cpu 399% (origin 172%, load 249%)   63.9 MiB 
+17:32:11 round 5  envoy       h2_m1            30684/s  p50 4.12 p99 6.54 ms     cpu 400% (origin  73%, load 110%)  101.7 MiB 
+17:32:24 round 5  traefik     h2_m1            19665/s  p50 5.85 p99 20.35 ms    cpu 377% (origin  53%, load  96%)   68.6 MiB 
+17:32:38 round 5  nvelox-prev h2_m10           12707/s  p50 95.81 p99 236.47 ms  cpu 374% (origin  47%, load  64%)  104.3 MiB 
+17:32:51 round 5  nginx       h2_m10          120124/s  p50 11.31 p99 19.74 ms   cpu 399% (origin 243%, load 200%)   83.7 MiB 
+17:33:05 round 5  nvelox      h2_m10          232995/s  p50 5.51 p99 8.19 ms     cpu 399% (origin 363%, load 158%)   35.5 MiB 
+17:33:18 round 5  haproxy     h2_m10           86313/s  p50 14.15 p99 21.82 ms   cpu 399% (origin 183%, load 173%)   63.9 MiB 
+17:33:31 round 5  envoy       h2_m10           32344/s  p50 37.12 p99 54.52 ms   cpu 400% (origin  78%, load  29%)  101.8 MiB 
+17:33:45 round 5  traefik     h2_m10           15421/s  p50 81.54 p99 166.70 ms  cpu 384% (origin  66%, load  80%)  386.4 MiB 
+17:33:58 round 5  caddy       h2_m10           13961/s  p50 91.57 p99 166.39 ms  cpu 381% (origin  61%, load  72%)  163.5 MiB 
+17:34:12 round 5  nvelox      h3_m1           118309/s  p50 1.05 p99 1.87 ms     cpu 398% (origin 215%, load 466%)   63.6 MiB 
+17:34:25 round 5  nginx       h3_m1            86834/s  p50 1.35 p99 2.51 ms     cpu 399% (origin 167%, load 347%)   83.7 MiB 
+17:34:39 round 5  haproxy     h3_m1            70483/s  p50 1.77 p99 2.71 ms     cpu 399% (origin 131%, load 375%)   63.9 MiB 
+17:34:52 round 5  envoy       h3_m1            15566/s  p50 8.16 p99 13.09 ms    cpu 400% (origin  37%, load 133%)  101.8 MiB 
+17:35:06 round 5  traefik     h3_m1            16422/s  p50 7.10 p99 23.48 ms    cpu 385% (origin  44%, load 121%)  344.2 MiB 
+17:35:19 round 5  caddy       h3_m1            13173/s  p50 8.37 p99 28.28 ms    cpu 381% (origin  34%, load  90%)  130.2 MiB 
+17:35:33 round 5  nvelox-prev h3_m1            11602/s  p50 10.94 p99 28.94 ms   cpu 369% (origin  33%, load 101%)   61.1 MiB 
+17:35:46 round 5  haproxy     h3_m10           73160/s  p50 17.90 p99 52.35 ms   cpu 399% (origin 157%, load 218%)   72.6 MiB 
+17:36:00 round 5  envoy       h3_m10           15504/s  p50 52.57 p99 82.52 ms   cpu 400% (origin  40%, load 106%)  102.2 MiB 
+17:36:13 round 5  traefik     h3_m10           12867/s  p50 95.74 p99 230.33 ms  cpu 386% (origin  64%, load  52%)  408.1 MiB 
+17:36:27 round 5  caddy       h3_m10           12450/s  p50 98.11 p99 228.32 ms  cpu 384% (origin  59%, load  48%)  162.2 MiB 
+17:36:40 round 5  nvelox-prev h3_m10           11967/s  p50 97.24 p99 276.82 ms  cpu 378% (origin  52%, load  48%)  106.7 MiB 
+17:36:54 round 5  nginx       h3_m10          118190/s  p50 7.01 p99 59.07 ms    cpu 399% (origin 208%, load 271%)   95.1 MiB 
+17:37:07 round 5  nvelox      h3_m10          180223/s  p50 6.71 p99 11.89 ms    cpu 398% (origin 324%, load 230%)   54.9 MiB 
+17:37:21 round 5  origin      udp_1024        404607/s  p50 0.23 p99 3.23 ms      
+17:37:34 round 5  traefik     udp_1024        109852/s  p50 0.76 p99 2.63 ms     cpu 294% (origin 123%, load 158%)  363.6 MiB lost=0.33%
+17:37:48 round 5  nvelox-prev udp_1024         93232/s  p50 0.67 p99 2.06 ms     cpu 220% (origin  97%, load 155%)   51.2 MiB lost=0.59%
+17:38:01 round 5  nvelox      udp_1024        303397/s  p50 0.31 p99 3.31 ms     cpu 361% (origin 222%, load 374%)   54.9 MiB 
+17:38:15 round 5  nginx       udp_1024        260512/s  p50 0.42 p99 2.19 ms     cpu 375% (origin 222%, load 377%)   88.9 MiB 
+17:38:28 round 5  envoy       udp_1024        206115/s  p50 0.61 p99 1.10 ms     cpu 397% (origin 179%, load 315%)  102.3 MiB 
+17:38:42 round 5  nvelox-prev udp_64          100814/s  p50 1.09 p99 3.36 ms     cpu 224% (origin 102%, load 162%)   34.1 MiB 
+17:38:55 round 5  nginx       udp_64          291539/s  p50 0.38 p99 1.70 ms     cpu 375% (origin 224%, load 385%)   88.9 MiB 
+17:39:09 round 5  nvelox      udp_64          322269/s  p50 0.28 p99 3.33 ms     cpu 351% (origin 220%, load 376%)   54.9 MiB 
+17:39:22 round 5  envoy       udp_64          217803/s  p50 0.58 p99 1.07 ms     cpu 397% (origin 181%, load 321%)  102.3 MiB 
+17:39:36 round 5  traefik     udp_64          121172/s  p50 0.97 p99 3.12 ms     cpu 290% (origin 127%, load 169%)  153.6 MiB 
+17:39:49 round 6  origin      http_1k         205731/s  p50 0.62 p99 0.93 ms      
+17:40:03 round 6  nvelox      http_1k         152262/s  p50 0.81 p99 1.70 ms     cpu 396% (origin 276%, load 230%)   52.4 MiB 
+17:40:17 round 6  nginx       http_1k         125899/s  p50 0.96 p99 3.04 ms     cpu 394% (origin 232%, load 206%)   88.9 MiB 
+17:40:30 round 6  nginx       http_64k         36582/s  p50 3.22 p99 36.02 ms    cpu 397% (origin 116%, load 210%)   88.9 MiB 
+17:40:44 round 6  nvelox      http_64k         62647/s  p50 1.84 p99 38.12 ms    cpu 396% (origin 199%, load 251%)   52.4 MiB 
+17:40:58 round 6  nvelox      https_1k        134787/s  p50 0.89 p99 1.55 ms     cpu 396% (origin 244%, load 279%)   52.4 MiB 
+17:41:11 round 6  nginx       https_1k        101951/s  p50 1.21 p99 2.06 ms     cpu 397% (origin 194%, load 228%)   88.9 MiB 
+17:41:25 round 6  nginx       tcp_1k          189825/s  p50 0.66 p99 1.06 ms     cpu 397% (origin 330%, load 270%)   88.9 MiB 
+17:41:39 round 6  nvelox      tcp_1k          186878/s  p50 0.64 p99 1.18 ms     cpu 396% (origin 316%, load 271%)   52.4 MiB 
+17:41:52 round 6  nvelox      http_1k_log     150623/s  p50 0.81 p99 1.30 ms     cpu 396% (origin 269%, load 233%)   52.4 MiB 
+17:42:06 round 6  nginx       http_1k_log     131652/s  p50 0.96 p99 1.49 ms     cpu 397% (origin 242%, load 205%)   88.9 MiB 
+17:42:20 round 6  nginx       h2_m1            99697/s  p50 1.12 p99 2.44 ms     cpu 399% (origin 199%, load 300%)   88.9 MiB 
+17:42:33 round 6  nvelox      h2_m1           137824/s  p50 0.87 p99 1.52 ms     cpu 398% (origin 248%, load 343%)   52.5 MiB 
+17:42:47 round 6  nvelox      h2_m10          219343/s  p50 5.72 p99 9.45 ms     cpu 399% (origin 374%, load 201%)   56.2 MiB 
+17:43:00 round 6  nginx       h2_m10          119887/s  p50 10.10 p99 15.90 ms   cpu 399% (origin 239%, load 209%)   88.9 MiB 
+17:43:14 round 6  nginx       h3_m1            88815/s  p50 1.48 p99 2.38 ms     cpu 399% (origin 164%, load 353%)   86.7 MiB 
+17:43:27 round 6  nvelox      h3_m1           116929/s  p50 1.06 p99 1.97 ms     cpu 398% (origin 214%, load 474%)   82.6 MiB 
+17:43:41 round 6  nvelox      h3_m10          174442/s  p50 7.09 p99 12.79 ms    cpu 398% (origin 301%, load 210%)   58.5 MiB 
+17:43:54 round 6  nginx       h3_m10          115552/s  p50 6.95 p99 64.00 ms    cpu 400% (origin 202%, load 302%)   95.3 MiB 
+17:44:07 round 6  origin      udp_1024        395513/s  p50 0.23 p99 3.25 ms      
+17:44:21 round 6  nginx       udp_1024        258278/s  p50 0.44 p99 2.34 ms     cpu 375% (origin 220%, load 381%)   90.1 MiB 
+17:44:34 round 6  nvelox      udp_1024        295143/s  p50 0.29 p99 3.46 ms     cpu 353% (origin 216%, load 371%)   58.5 MiB 
+17:44:48 round 6  nvelox      udp_64          313707/s  p50 0.27 p99 3.56 ms     cpu 341% (origin 207%, load 370%)   58.5 MiB 
+17:45:01 round 6  nginx       udp_64          276148/s  p50 0.38 p99 3.00 ms     cpu 367% (origin 214%, load 380%)   89.9 MiB 
+17:45:15 round 7  origin      http_1k         203859/s  p50 0.58 p99 2.19 ms      
+17:45:29 round 7  nginx       http_1k         139417/s  p50 0.90 p99 1.35 ms     cpu 397% (origin 251%, load 218%)   89.9 MiB 
+17:45:42 round 7  nvelox      http_1k         155044/s  p50 0.81 p99 1.23 ms     cpu 397% (origin 271%, load 225%)   58.5 MiB 
+17:45:56 round 7  nvelox      http_64k         61927/s  p50 1.83 p99 38.09 ms    cpu 396% (origin 195%, load 247%)   48.0 MiB 
+17:46:10 round 7  nginx       http_64k         37491/s  p50 2.86 p99 36.45 ms    cpu 397% (origin 116%, load 200%)   88.0 MiB 
+17:46:23 round 7  nginx       https_1k        106596/s  p50 1.15 p99 1.90 ms     cpu 397% (origin 200%, load 233%)   85.1 MiB 
+17:46:37 round 7  nvelox      https_1k        137756/s  p50 0.89 p99 1.46 ms     cpu 396% (origin 247%, load 283%)   48.2 MiB 
+17:46:51 round 7  nvelox      tcp_1k          198782/s  p50 0.61 p99 0.99 ms     cpu 397% (origin 335%, load 284%)   48.0 MiB 
+17:47:04 round 7  nginx       tcp_1k          188085/s  p50 0.65 p99 1.15 ms     cpu 397% (origin 325%, load 274%)   85.1 MiB 
+17:47:18 round 7  nginx       http_1k_log     135376/s  p50 0.92 p99 1.34 ms     cpu 397% (origin 240%, load 201%)   85.0 MiB 
+17:47:32 round 7  nvelox      http_1k_log     151264/s  p50 0.81 p99 1.30 ms     cpu 397% (origin 275%, load 225%)   48.0 MiB 
+17:47:45 round 7  nvelox      h2_m1           139712/s  p50 0.87 p99 1.36 ms     cpu 399% (origin 254%, load 342%)   48.2 MiB 
+17:47:59 round 7  nginx       h2_m1            94726/s  p50 1.16 p99 2.28 ms     cpu 399% (origin 179%, load 267%)   85.0 MiB 
+17:48:12 round 7  nginx       h2_m10          121164/s  p50 9.92 p99 15.74 ms    cpu 399% (origin 237%, load 209%)   84.8 MiB 
+17:48:26 round 7  nvelox      h2_m10          225511/s  p50 5.54 p99 8.93 ms     cpu 399% (origin 371%, load 196%)   51.7 MiB 
+17:48:39 round 7  nvelox      h3_m1           115755/s  p50 1.13 p99 2.03 ms     cpu 398% (origin 217%, load 489%)   77.4 MiB 
+17:48:53 round 7  nginx       h3_m1            89429/s  p50 1.45 p99 2.50 ms     cpu 400% (origin 162%, load 339%)   80.9 MiB 
+17:49:06 round 7  nginx       h3_m10          118259/s  p50 6.91 p99 59.88 ms    cpu 399% (origin 209%, load 278%)   98.5 MiB 
+17:49:20 round 7  nvelox      h3_m10          183769/s  p50 6.61 p99 12.03 ms    cpu 398% (origin 324%, load 228%)   56.8 MiB 
+17:49:33 round 7  origin      udp_1024        407023/s  p50 0.23 p99 3.22 ms      
+17:49:47 round 7  nvelox      udp_1024        304567/s  p50 0.31 p99 3.25 ms     cpu 363% (origin 223%, load 381%)   56.2 MiB 
+17:50:00 round 7  nginx       udp_1024        268305/s  p50 0.44 p99 1.55 ms     cpu 385% (origin 226%, load 381%)   81.3 MiB 
+17:50:13 round 7  nginx       udp_64          241816/s  p50 0.40 p99 3.85 ms     cpu 326% (origin 190%, load 313%)   81.3 MiB 
+17:50:27 round 7  nvelox      udp_64          303527/s  p50 0.27 p99 3.68 ms     cpu 334% (origin 199%, load 362%)   56.2 MiB 
+17:50:41 round 8  origin      http_1k         203041/s  p50 0.59 p99 1.03 ms      
+17:50:54 round 8  nvelox      http_1k         152820/s  p50 0.81 p99 1.39 ms     cpu 395% (origin 272%, load 226%)   56.2 MiB 
+17:51:08 round 8  nginx       http_1k         139131/s  p50 1.00 p99 1.47 ms     cpu 397% (origin 247%, load 208%)   81.3 MiB 
+17:51:22 round 8  nginx       http_64k         39040/s  p50 3.00 p99 36.06 ms    cpu 397% (origin 123%, load 215%)   80.7 MiB 
+17:51:35 round 8  nvelox      http_64k         65741/s  p50 1.79 p99 38.22 ms    cpu 396% (origin 206%, load 253%)   42.1 MiB 
+17:51:49 round 8  nvelox      https_1k        140878/s  p50 0.88 p99 1.39 ms     cpu 396% (origin 256%, load 293%)   43.7 MiB 
+17:52:03 round 8  nginx       https_1k        106347/s  p50 1.18 p99 1.88 ms     cpu 397% (origin 196%, load 230%)   80.6 MiB 
+17:52:16 round 8  nginx       tcp_1k          186304/s  p50 0.69 p99 1.17 ms     cpu 397% (origin 319%, load 292%)   80.6 MiB 
+17:52:30 round 8  nvelox      tcp_1k          196010/s  p50 0.63 p99 0.99 ms     cpu 396% (origin 325%, load 283%)   43.8 MiB 
+17:52:44 round 8  nvelox      http_1k_log     155440/s  p50 0.80 p99 1.22 ms     cpu 397% (origin 272%, load 226%)   43.8 MiB 
+17:52:57 round 8  nginx       http_1k_log     133506/s  p50 0.95 p99 1.34 ms     cpu 397% (origin 242%, load 200%)   80.6 MiB 
+17:53:11 round 8  nginx       h2_m1           101892/s  p50 1.26 p99 1.78 ms     cpu 399% (origin 197%, load 276%)   80.6 MiB 
+17:53:24 round 8  nvelox      h2_m1           136007/s  p50 0.88 p99 1.57 ms     cpu 398% (origin 246%, load 363%)   44.1 MiB 
+17:53:38 round 8  nvelox      h2_m10          219298/s  p50 5.42 p99 9.46 ms     cpu 399% (origin 367%, load 204%)   47.9 MiB 
+17:53:51 round 8  nginx       h2_m10          119976/s  p50 9.80 p99 16.35 ms    cpu 399% (origin 237%, load 210%)   78.2 MiB 
+17:54:05 round 8  nginx       h3_m1            85046/s  p50 1.49 p99 2.27 ms     cpu 399% (origin 141%, load 340%)   76.2 MiB 
+17:54:18 round 8  nvelox      h3_m1           115186/s  p50 1.07 p99 2.05 ms     cpu 398% (origin 210%, load 496%)   75.6 MiB 
+17:54:32 round 8  nvelox      h3_m10          181007/s  p50 6.76 p99 14.26 ms    cpu 399% (origin 321%, load 236%)   55.8 MiB 
+17:54:45 round 8  nginx       h3_m10          114505/s  p50 7.06 p99 81.64 ms    cpu 400% (origin 200%, load 298%)   92.9 MiB 
+17:54:59 round 8  origin      udp_1024        394350/s  p50 0.23 p99 3.23 ms      
+17:55:12 round 8  nginx       udp_1024        212673/s  p50 0.43 p99 4.08 ms     cpu 322% (origin 189%, load 289%)   79.7 MiB 
+17:55:26 round 8  nvelox      udp_1024        287662/s  p50 0.31 p99 3.43 ms     cpu 350% (origin 215%, load 366%)   55.8 MiB 
+17:55:39 round 8  nvelox      udp_64          307045/s  p50 0.27 p99 3.56 ms     cpu 337% (origin 205%, load 366%)   55.8 MiB 
+17:55:53 round 8  nginx       udp_64          287599/s  p50 0.39 p99 2.06 ms     cpu 374% (origin 224%, load 380%)   79.7 MiB 
+17:56:06 round 9  origin      http_1k         221255/s  p50 0.59 p99 0.87 ms      
+17:56:20 round 9  nginx       http_1k         137980/s  p50 0.89 p99 1.43 ms     cpu 398% (origin 244%, load 212%)   79.7 MiB 
+17:56:33 round 9  nvelox      http_1k         152223/s  p50 0.81 p99 1.31 ms     cpu 396% (origin 273%, load 233%)   55.8 MiB 
+17:56:47 round 9  nvelox      http_64k         65961/s  p50 1.78 p99 38.24 ms    cpu 396% (origin 206%, load 256%)   44.2 MiB 
+17:57:01 round 9  nginx       http_64k         38319/s  p50 3.28 p99 36.39 ms    cpu 397% (origin 126%, load 215%)   77.4 MiB 
+17:57:14 round 9  nginx       https_1k        100394/s  p50 1.21 p99 1.78 ms     cpu 397% (origin 182%, load 216%)   77.4 MiB 
+17:57:28 round 9  nvelox      https_1k        131303/s  p50 0.91 p99 1.51 ms     cpu 396% (origin 234%, load 276%)   44.5 MiB 
+17:57:42 round 9  nvelox      tcp_1k          186763/s  p50 0.64 p99 1.05 ms     cpu 397% (origin 304%, load 265%)   44.3 MiB 
+17:57:55 round 9  nginx       tcp_1k          175990/s  p50 0.68 p99 1.10 ms     cpu 397% (origin 292%, load 251%)   77.4 MiB 
+17:58:09 round 9  nginx       http_1k_log     121352/s  p50 1.02 p99 1.65 ms     cpu 397% (origin 217%, load 194%)   77.4 MiB 
+17:58:23 round 9  nvelox      http_1k_log     152511/s  p50 0.82 p99 1.19 ms     cpu 396% (origin 266%, load 228%)   44.3 MiB 
+17:58:36 round 9  nvelox      h2_m1           135833/s  p50 0.87 p99 1.53 ms     cpu 398% (origin 243%, load 349%)   44.6 MiB 
+17:58:50 round 9  nginx       h2_m1           103008/s  p50 1.08 p99 2.24 ms     cpu 400% (origin 203%, load 282%)   77.4 MiB 
+17:59:03 round 9  nginx       h2_m10          120869/s  p50 10.65 p99 15.82 ms   cpu 400% (origin 242%, load 208%)   77.4 MiB 
+17:59:17 round 9  nvelox      h2_m10          221663/s  p50 5.57 p99 9.48 ms     cpu 398% (origin 368%, load 206%)   48.9 MiB 
+17:59:30 round 9  nvelox      h3_m1           119561/s  p50 1.05 p99 1.89 ms     cpu 398% (origin 218%, load 474%)   74.9 MiB 
+17:59:44 round 9  nginx       h3_m1            86596/s  p50 1.51 p99 2.74 ms     cpu 399% (origin 156%, load 366%)   76.0 MiB 
+17:59:57 round 9  nginx       h3_m10          119445/s  p50 6.89 p99 58.79 ms    cpu 399% (origin 207%, load 280%)   96.4 MiB 
+18:00:11 round 9  nvelox      h3_m10          163062/s  p50 7.10 p99 19.93 ms    cpu 394% (origin 304%, load 232%)   57.1 MiB 
+18:00:24 round 9  origin      udp_1024        402888/s  p50 0.23 p99 3.23 ms      
+18:00:38 round 9  nvelox      udp_1024        293533/s  p50 0.31 p99 3.49 ms     cpu 353% (origin 214%, load 368%)   57.1 MiB 
+18:00:51 round 9  nginx       udp_1024        264268/s  p50 0.42 p99 1.92 ms     cpu 378% (origin 222%, load 377%)   77.8 MiB 
+18:01:05 round 9  nginx       udp_64          285579/s  p50 0.38 p99 2.19 ms     cpu 375% (origin 221%, load 383%)   77.8 MiB 
+18:01:18 round 9  nvelox      udp_64          317540/s  p50 0.28 p99 3.33 ms     cpu 348% (origin 214%, load 381%)   57.1 MiB 
+18:01:32 round 10 origin      http_1k         222477/s  p50 0.56 p99 0.78 ms      
+18:01:45 round 10 nvelox      http_1k         151874/s  p50 0.82 p99 1.28 ms     cpu 396% (origin 275%, load 225%)   57.1 MiB 
+18:01:59 round 10 nginx       http_1k         137293/s  p50 0.92 p99 1.50 ms     cpu 397% (origin 245%, load 203%)   77.8 MiB 
+18:02:13 round 10 nginx       http_64k         38616/s  p50 2.93 p99 36.58 ms    cpu 397% (origin 128%, load 209%)   76.3 MiB 
+18:02:26 round 10 nvelox      http_64k         64356/s  p50 1.79 p99 38.17 ms    cpu 396% (origin 196%, load 248%)   50.4 MiB 
+18:02:40 round 10 nvelox      https_1k        131401/s  p50 0.90 p99 1.45 ms     cpu 396% (origin 229%, load 270%)   50.6 MiB 
+18:02:54 round 10 nginx       https_1k        104718/s  p50 1.22 p99 2.19 ms     cpu 396% (origin 199%, load 235%)   75.9 MiB 
+18:03:07 round 10 nginx       tcp_1k          184929/s  p50 0.70 p99 1.07 ms     cpu 397% (origin 319%, load 262%)   75.8 MiB 
+18:03:21 round 10 nvelox      tcp_1k          197847/s  p50 0.62 p99 1.06 ms     cpu 396% (origin 337%, load 285%)   50.4 MiB 
+18:03:35 round 10 nvelox      http_1k_log     152163/s  p50 0.81 p99 1.23 ms     cpu 396% (origin 259%, load 219%)   50.4 MiB 
+18:03:48 round 10 nginx       http_1k_log     132828/s  p50 0.98 p99 1.36 ms     cpu 397% (origin 238%, load 199%)   75.8 MiB 
+18:04:02 round 10 nginx       h2_m1           100277/s  p50 1.29 p99 1.81 ms     cpu 400% (origin 189%, load 293%)   75.8 MiB 
+18:04:15 round 10 nvelox      h2_m1           140962/s  p50 0.86 p99 1.41 ms     cpu 398% (origin 250%, load 336%)   50.7 MiB 
+18:04:29 round 10 nvelox      h2_m10          225283/s  p50 5.75 p99 9.42 ms     cpu 399% (origin 356%, load 163%)   52.1 MiB 
+18:04:42 round 10 nginx       h2_m10          122834/s  p50 10.50 p99 15.64 ms   cpu 399% (origin 239%, load 199%)   75.7 MiB 
+18:04:56 round 10 nginx       h3_m1            82782/s  p50 1.37 p99 2.89 ms     cpu 399% (origin 152%, load 334%)   75.7 MiB 
+18:05:09 round 10 nvelox      h3_m1           118146/s  p50 0.97 p99 3.87 ms     cpu 397% (origin 216%, load 436%)   63.5 MiB 
+18:05:23 round 10 nvelox      h3_m10          183968/s  p50 6.63 p99 12.06 ms    cpu 398% (origin 320%, load 225%)   55.8 MiB 
+18:05:36 round 10 nginx       h3_m10          120124/s  p50 6.97 p99 55.63 ms    cpu 400% (origin 212%, load 271%)   95.4 MiB 
+18:05:50 round 10 origin      udp_1024        400319/s  p50 0.24 p99 3.23 ms      
+18:06:03 round 10 nginx       udp_1024        256286/s  p50 0.44 p99 1.94 ms     cpu 377% (origin 222%, load 381%)   83.3 MiB 
+18:06:17 round 10 nvelox      udp_1024        272049/s  p50 0.31 p99 3.75 ms     cpu 340% (origin 202%, load 351%)   55.4 MiB 
+18:06:30 round 10 nvelox      udp_64          307498/s  p50 0.27 p99 3.48 ms     cpu 345% (origin 206%, load 367%)   55.4 MiB 
+18:06:44 round 10 nginx       udp_64          286650/s  p50 0.39 p99 1.77 ms     cpu 373% (origin 221%, load 377%)   82.6 MiB 
+18:06:57 round 11 origin      http_1k         225174/s  p50 0.49 p99 0.92 ms      
+18:07:11 round 11 nginx       http_1k         137408/s  p50 0.92 p99 1.29 ms     cpu 397% (origin 246%, load 206%)   82.6 MiB 
+18:07:24 round 11 nvelox      http_1k         151198/s  p50 0.82 p99 1.24 ms     cpu 396% (origin 270%, load 228%)   55.4 MiB 
+18:07:38 round 11 nvelox      http_64k         65094/s  p50 1.82 p99 38.21 ms    cpu 397% (origin 205%, load 258%)   48.7 MiB 
+18:07:52 round 11 nginx       http_64k         36715/s  p50 3.00 p99 36.15 ms    cpu 397% (origin 118%, load 204%)   78.7 MiB 
+18:08:05 round 11 nginx       https_1k        105483/s  p50 1.14 p99 2.09 ms     cpu 397% (origin 205%, load 233%)   76.9 MiB 
+18:08:19 round 11 nvelox      https_1k        142702/s  p50 0.87 p99 1.32 ms     cpu 395% (origin 251%, load 284%)   48.9 MiB 
+18:08:33 round 11 nvelox      tcp_1k          190038/s  p50 0.64 p99 1.15 ms     cpu 397% (origin 319%, load 261%)   47.9 MiB 
+18:08:46 round 11 nginx       tcp_1k          190354/s  p50 0.65 p99 1.00 ms     cpu 397% (origin 328%, load 272%)   76.8 MiB 
+18:09:00 round 11 nginx       http_1k_log     131929/s  p50 1.03 p99 1.58 ms     cpu 397% (origin 239%, load 198%)   76.8 MiB 
+18:09:14 round 11 nvelox      http_1k_log     152604/s  p50 0.81 p99 1.30 ms     cpu 396% (origin 275%, load 230%)   47.9 MiB 
+18:09:27 round 11 nvelox      h2_m1           139492/s  p50 0.87 p99 1.43 ms     cpu 398% (origin 253%, load 344%)   48.3 MiB 
+18:09:41 round 11 nginx       h2_m1           100100/s  p50 1.34 p99 2.20 ms     cpu 399% (origin 199%, load 294%)   76.8 MiB 
+18:09:54 round 11 nginx       h2_m10          113785/s  p50 11.32 p99 14.06 ms   cpu 399% (origin 215%, load 196%)   76.8 MiB 
+18:10:08 round 11 nvelox      h2_m10          217631/s  p50 5.62 p99 10.06 ms    cpu 398% (origin 374%, load 184%)   51.1 MiB 
+18:10:21 round 11 nvelox      h3_m1           118714/s  p50 1.06 p99 1.77 ms     cpu 398% (origin 215%, load 450%)   75.1 MiB 
+18:10:35 round 11 nginx       h3_m1            89312/s  p50 1.41 p99 2.34 ms     cpu 399% (origin 165%, load 339%)   76.8 MiB 
+18:10:48 round 11 nginx       h3_m10          113662/s  p50 7.46 p99 62.67 ms    cpu 399% (origin 195%, load 277%)   95.1 MiB 
+18:11:02 round 11 nvelox      h3_m10          183231/s  p50 6.65 p99 13.02 ms    cpu 398% (origin 325%, load 220%)   57.4 MiB 
+18:11:15 round 11 origin      udp_1024        397280/s  p50 0.23 p99 3.23 ms      
+18:11:29 round 11 nvelox      udp_1024        274762/s  p50 0.28 p99 4.02 ms     cpu 335% (origin 201%, load 351%)   57.4 MiB 
+18:11:42 round 11 nginx       udp_1024        261583/s  p50 0.43 p99 1.96 ms     cpu 374% (origin 220%, load 376%)   86.1 MiB 
+18:11:56 round 11 nginx       udp_64          284876/s  p50 0.37 p99 2.42 ms     cpu 368% (origin 221%, load 372%)   86.1 MiB 
+18:12:09 round 11 nvelox      udp_64          308368/s  p50 0.27 p99 3.59 ms     cpu 339% (origin 205%, load 368%)   57.4 MiB 
+18:12:23 round 12 origin      http_1k         219702/s  p50 0.56 p99 0.81 ms      
+18:12:36 round 12 nvelox      http_1k         154073/s  p50 0.81 p99 1.22 ms     cpu 396% (origin 271%, load 225%)   57.4 MiB 
+18:12:50 round 12 nginx       http_1k         137634/s  p50 0.91 p99 1.37 ms     cpu 397% (origin 246%, load 216%)   86.1 MiB 
+18:13:04 round 12 nginx       http_64k         38832/s  p50 2.80 p99 36.54 ms    cpu 397% (origin 126%, load 211%)   86.1 MiB 
+18:13:17 round 12 nvelox      http_64k         65462/s  p50 1.80 p99 38.21 ms    cpu 397% (origin 202%, load 251%)   45.1 MiB 
+18:13:31 round 12 nvelox      https_1k        141564/s  p50 0.87 p99 1.36 ms     cpu 396% (origin 252%, load 275%)   45.5 MiB 
+18:13:45 round 12 nginx       https_1k        106309/s  p50 1.19 p99 1.80 ms     cpu 397% (origin 198%, load 224%)   86.1 MiB 
+18:13:58 round 12 nginx       tcp_1k          188057/s  p50 0.65 p99 1.19 ms     cpu 397% (origin 320%, load 278%)   86.1 MiB 
+18:14:12 round 12 nvelox      tcp_1k          198057/s  p50 0.62 p99 1.00 ms     cpu 397% (origin 337%, load 279%)   44.5 MiB 
+18:14:26 round 12 nvelox      http_1k_log     148982/s  p50 0.82 p99 1.31 ms     cpu 397% (origin 268%, load 228%)   44.6 MiB 
+18:14:39 round 12 nginx       http_1k_log     132754/s  p50 0.94 p99 1.51 ms     cpu 397% (origin 238%, load 203%)   86.1 MiB 
+18:14:53 round 12 nginx       h2_m1           101022/s  p50 1.31 p99 1.82 ms     cpu 400% (origin 189%, load 291%)   86.1 MiB 
+18:15:06 round 12 nvelox      h2_m1           140222/s  p50 0.84 p99 2.76 ms     cpu 397% (origin 259%, load 338%)   45.0 MiB 
+18:15:20 round 12 nvelox      h2_m10          222272/s  p50 5.43 p99 9.28 ms     cpu 399% (origin 371%, load 200%)   48.2 MiB 
+18:15:33 round 12 nginx       h2_m10          119943/s  p50 10.56 p99 18.97 ms   cpu 399% (origin 238%, load 205%)   86.1 MiB 
+18:15:47 round 12 nginx       h3_m1            89025/s  p50 1.41 p99 2.15 ms     cpu 399% (origin 166%, load 345%)   82.7 MiB 
+18:16:00 round 12 nvelox      h3_m1           117666/s  p50 1.05 p99 1.99 ms     cpu 397% (origin 219%, load 481%)   75.1 MiB 
+18:16:14 round 12 nvelox      h3_m10          176836/s  p50 6.97 p99 13.18 ms    cpu 399% (origin 315%, load 255%)   57.9 MiB 
+18:16:27 round 12 nginx       h3_m10          116835/s  p50 7.07 p99 63.66 ms    cpu 399% (origin 207%, load 297%)   98.3 MiB 
+18:16:41 round 12 origin      udp_1024        399057/s  p50 0.23 p99 3.24 ms      
+18:16:54 round 12 nginx       udp_1024        271558/s  p50 0.43 p99 1.51 ms     cpu 385% (origin 229%, load 389%)   96.6 MiB 
+18:17:08 round 12 nvelox      udp_1024        276897/s  p50 0.29 p99 3.74 ms     cpu 341% (origin 204%, load 359%)   58.1 MiB 
+18:17:21 round 12 nvelox      udp_64          328644/s  p50 0.26 p99 3.37 ms     cpu 354% (origin 218%, load 379%)   58.1 MiB 
+18:17:35 round 12 nginx       udp_64          274566/s  p50 0.38 p99 3.27 ms     cpu 362% (origin 213%, load 371%)   94.9 MiB 
+18:17:42 large objects: 3 rounds, 12s measured, 3s warm-up, the proxies freshly started
+18:17:57 round 1  origin         down 1m   x64   21.31 GB/s   
+18:18:13 round 1  nginx          down 1m   x64    2.95 GB/s  cpu 399% 1.35 s/GB   39.2 MiB, sockets 40 MiB 
+18:18:28 round 1  nginx-tuned    down 1m   x64    4.37 GB/s  cpu 397% 0.91 s/GB   41.1 MiB, sockets 40 MiB 
+18:18:44 round 1  haproxy        down 1m   x64    5.53 GB/s  cpu 400% 0.72 s/GB   20.3 MiB, sockets 46 MiB 
+18:18:59 round 1  envoy          down 1m   x64    4.26 GB/s  cpu 400% 0.94 s/GB   59.1 MiB, sockets 19 MiB 
+18:19:15 round 1  traefik        down 1m   x64    5.24 GB/s  cpu 392% 0.75 s/GB   47.0 MiB, sockets 48 MiB 
+18:19:30 round 1  caddy          down 1m   x64    4.48 GB/s  cpu 365% 0.82 s/GB   24.7 MiB, sockets 42 MiB 
+18:19:46 round 1  nvelox-prev    down 1m   x64    4.11 GB/s  cpu 340% 0.83 s/GB   14.4 MiB, sockets 43 MiB 
+18:20:01 round 1  nvelox         down 1m   x64    7.89 GB/s  cpu 398% 0.50 s/GB    4.2 MiB, sockets 36 MiB 
+18:20:17 round 1  origin         down 16m  x16   22.56 GB/s   
+18:20:32 round 1  nginx          down 16m  x16    2.62 GB/s  cpu 399% 1.52 s/GB   37.9 MiB, sockets 68 MiB 
+18:20:48 round 1  nginx-tuned    down 16m  x16    4.16 GB/s  cpu 300% 0.72 s/GB   51.9 MiB, sockets 66 MiB 
+18:21:03 round 1  haproxy        down 16m  x16    5.13 GB/s  cpu 400% 0.78 s/GB   20.3 MiB, sockets 24 MiB 
+18:21:19 round 1  envoy          down 16m  x16    4.47 GB/s  cpu 400% 0.89 s/GB   59.2 MiB, sockets 81 MiB 
+18:21:34 round 1  traefik        down 16m  x16    4.78 GB/s  cpu 374% 0.78 s/GB   47.0 MiB, sockets 44 MiB 
+18:21:50 round 1  caddy          down 16m  x16    4.47 GB/s  cpu 371% 0.83 s/GB   23.4 MiB, sockets 70 MiB 
+18:22:05 round 1  nvelox-prev    down 16m  x16    4.51 GB/s  cpu 373% 0.83 s/GB   12.8 MiB, sockets 41 MiB 
+18:22:21 round 1  nvelox         down 16m  x16    6.04 GB/s  cpu 399% 0.66 s/GB    4.4 MiB, sockets 49 MiB 
+18:22:36 round 1  origin         down 1g   x4    12.91 GB/s   
+18:22:53 round 1  nginx          down 1g   x4     1.39 GB/s  cpu 200% 1.44 s/GB   37.9 MiB, sockets 17 MiB 
+18:23:09 round 1  nginx-tuned    down 1g   x4     6.38 GB/s  cpu 399% 0.62 s/GB   41.2 MiB, sockets 22 MiB 
+18:23:25 round 1  haproxy        down 1g   x4     4.15 GB/s  cpu 399% 0.96 s/GB   20.3 MiB, sockets 4 MiB 
+18:23:42 round 1  envoy          down 1g   x4     4.14 GB/s  cpu 300% 0.72 s/GB   59.2 MiB, sockets 25 MiB 
+18:23:58 round 1  traefik        down 1g   x4     3.71 GB/s  cpu 326% 0.88 s/GB   29.3 MiB, sockets 9 MiB 
+18:24:15 round 1  caddy          down 1g   x4     3.69 GB/s  cpu 323% 0.87 s/GB   19.7 MiB, sockets 25 MiB 
+18:24:31 round 1  nvelox-prev    down 1g   x4     3.43 GB/s  cpu 326% 0.95 s/GB    9.6 MiB, sockets 7 MiB 
+18:24:47 round 1  nvelox         down 1g   x4     5.64 GB/s  cpu 399% 0.71 s/GB    4.5 MiB, sockets 9 MiB 
+18:25:02 round 1  sink           up   16m  x16   13.72 GB/s   
+18:25:18 round 1  nginx          up   16m  x16    2.41 GB/s  cpu 389% 1.61 s/GB   37.9 MiB, sockets 54 MiB 
+18:25:34 round 1  nginx-streamed up   16m  x16    3.00 GB/s  cpu 399% 1.33 s/GB   37.9 MiB, sockets 43 MiB 
+18:25:49 round 1  haproxy        up   16m  x16    3.87 GB/s  cpu 400% 1.03 s/GB   20.3 MiB, sockets 40 MiB 
+18:26:05 round 1  envoy          up   16m  x16    5.11 GB/s  cpu 394% 0.77 s/GB   59.2 MiB, sockets 83 MiB 
+18:26:20 round 1  traefik        up   16m  x16    5.38 GB/s  cpu 377% 0.70 s/GB   32.1 MiB, sockets 51 MiB 
+18:26:36 round 1  caddy          up   16m  x16    5.27 GB/s  cpu 378% 0.72 s/GB   20.9 MiB, sockets 67 MiB 
+18:26:51 round 1  nvelox-prev    up   16m  x16    5.11 GB/s  cpu 373% 0.73 s/GB   10.5 MiB, sockets 44 MiB 
+18:27:07 round 1  nvelox         up   16m  x16    6.73 GB/s  cpu 399% 0.59 s/GB    4.8 MiB, sockets 60 MiB 
+18:27:23 round 1  sink           up   1g   x2     4.44 GB/s   
+18:27:40 round 1  nginx          up   1g   x2     0.52 GB/s  cpu 100% 1.91 s/GB   37.9 MiB, sockets 3 MiB 
+18:27:57 round 1  nginx-streamed up   1g   x2     1.63 GB/s  cpu 200% 1.23 s/GB   37.9 MiB, sockets 3 MiB 
+18:28:13 round 1  haproxy        up   1g   x2     2.30 GB/s  cpu 199% 0.87 s/GB   20.3 MiB, sockets 3 MiB 
+18:28:29 round 1  envoy          up   1g   x2     1.45 GB/s  cpu 100% 0.69 s/GB   59.2 MiB, sockets 12 MiB 
+18:28:45 round 1  traefik        up   1g   x2     2.88 GB/s  cpu 201% 0.70 s/GB   32.1 MiB, sockets 5 MiB 
+18:29:01 round 1  caddy          up   1g   x2     2.87 GB/s  cpu 203% 0.71 s/GB   20.9 MiB, sockets 9 MiB 
+18:29:17 round 1  nvelox-prev    up   1g   x2     2.85 GB/s  cpu 203% 0.71 s/GB    9.5 MiB, sockets 7 MiB 
+18:29:33 round 1  nvelox         up   1g   x2     3.44 GB/s  cpu 191% 0.55 s/GB    4.9 MiB, sockets 7 MiB 
+18:29:48 round 2  origin         down 1m   x64   21.00 GB/s   
+18:30:03 round 2  nginx-tuned    down 1m   x64    5.09 GB/s  cpu 397% 0.78 s/GB   41.3 MiB, sockets 45 MiB 
+18:30:19 round 2  haproxy        down 1m   x64    5.36 GB/s  cpu 399% 0.75 s/GB   20.4 MiB, sockets 44 MiB 
+18:30:34 round 2  envoy          down 1m   x64    4.14 GB/s  cpu 400% 0.97 s/GB   69.0 MiB, sockets 17 MiB 
+18:30:50 round 2  traefik        down 1m   x64    5.02 GB/s  cpu 392% 0.78 s/GB   50.7 MiB, sockets 42 MiB 
+18:31:05 round 2  caddy          down 1m   x64    4.49 GB/s  cpu 367% 0.82 s/GB   25.4 MiB, sockets 46 MiB 
+18:31:21 round 2  nvelox-prev    down 1m   x64    4.16 GB/s  cpu 346% 0.83 s/GB   14.4 MiB, sockets 44 MiB 
+18:31:36 round 2  nvelox         down 1m   x64    7.91 GB/s  cpu 399% 0.50 s/GB    5.0 MiB, sockets 38 MiB 
+18:31:52 round 2  nginx          down 1m   x64    2.93 GB/s  cpu 399% 1.36 s/GB   38.7 MiB, sockets 41 MiB 
+18:32:07 round 2  origin         down 16m  x16   24.97 GB/s   
+18:32:23 round 2  nginx-tuned    down 16m  x16    5.72 GB/s  cpu 399% 0.70 s/GB   53.9 MiB, sockets 71 MiB 
+18:32:38 round 2  haproxy        down 16m  x16    5.28 GB/s  cpu 400% 0.76 s/GB   20.4 MiB, sockets 35 MiB 
+18:32:54 round 2  envoy          down 16m  x16    4.52 GB/s  cpu 400% 0.88 s/GB   69.0 MiB, sockets 92 MiB 
+18:33:09 round 2  traefik        down 16m  x16    4.83 GB/s  cpu 376% 0.78 s/GB   50.7 MiB, sockets 44 MiB 
+18:33:25 round 2  caddy          down 16m  x16    4.49 GB/s  cpu 372% 0.83 s/GB   24.5 MiB, sockets 73 MiB 
+18:33:40 round 2  nvelox-prev    down 16m  x16    4.52 GB/s  cpu 371% 0.82 s/GB   13.8 MiB, sockets 41 MiB 
+18:33:56 round 2  nvelox         down 16m  x16    6.17 GB/s  cpu 399% 0.65 s/GB    5.0 MiB, sockets 50 MiB 
+18:34:11 round 2  nginx          down 16m  x16    2.70 GB/s  cpu 399% 1.48 s/GB   38.6 MiB, sockets 67 MiB 
+18:34:27 round 2  origin         down 1g   x4    13.27 GB/s   
+18:34:43 round 2  nginx-tuned    down 1g   x4     6.49 GB/s  cpu 398% 0.61 s/GB   41.4 MiB, sockets 24 MiB 
+18:34:59 round 2  haproxy        down 1g   x4     4.35 GB/s  cpu 399% 0.92 s/GB   20.4 MiB, sockets 6 MiB 
+18:35:15 round 2  envoy          down 1g   x4     2.89 GB/s  cpu 200% 0.69 s/GB   69.0 MiB, sockets 27 MiB 
+18:35:31 round 2  traefik        down 1g   x4     3.77 GB/s  cpu 325% 0.86 s/GB   30.1 MiB, sockets 9 MiB 
+18:35:48 round 2  caddy          down 1g   x4     3.78 GB/s  cpu 324% 0.86 s/GB   21.0 MiB, sockets 22 MiB 
+18:36:04 round 2  nvelox-prev    down 1g   x4     3.43 GB/s  cpu 328% 0.95 s/GB    9.5 MiB, sockets 4 MiB 
+18:36:20 round 2  nvelox         down 1g   x4     5.88 GB/s  cpu 398% 0.68 s/GB    5.0 MiB, sockets 16 MiB 
+18:36:38 round 2  nginx          down 1g   x4     1.40 GB/s  cpu 200% 1.42 s/GB   38.6 MiB, sockets 22 MiB 
+18:36:53 round 2  sink           up   16m  x16   13.10 GB/s   
+18:37:09 round 2  nginx-streamed up   16m  x16    2.92 GB/s  cpu 399% 1.37 s/GB   38.6 MiB, sockets 38 MiB 
+18:37:24 round 2  haproxy        up   16m  x16    3.86 GB/s  cpu 400% 1.04 s/GB   20.4 MiB, sockets 31 MiB 
+18:37:40 round 2  envoy          up   16m  x16    5.14 GB/s  cpu 400% 0.78 s/GB   69.0 MiB, sockets 76 MiB 
+18:37:55 round 2  traefik        up   16m  x16    5.41 GB/s  cpu 378% 0.70 s/GB   32.4 MiB, sockets 49 MiB 
+18:38:11 round 2  caddy          up   16m  x16    5.29 GB/s  cpu 378% 0.71 s/GB   21.5 MiB, sockets 55 MiB 
+18:38:26 round 2  nvelox-prev    up   16m  x16    5.25 GB/s  cpu 375% 0.71 s/GB   10.4 MiB, sockets 66 MiB 
+18:38:42 round 2  nvelox         up   16m  x16    6.79 GB/s  cpu 399% 0.59 s/GB    5.1 MiB, sockets 60 MiB 
+18:38:57 round 2  nginx          up   16m  x16    1.91 GB/s  cpu 400% 2.09 s/GB   38.6 MiB, sockets 54 MiB 
+18:39:13 round 2  sink           up   1g   x2     4.44 GB/s   
+18:39:29 round 2  nginx-streamed up   1g   x2     1.60 GB/s  cpu 200% 1.25 s/GB   38.6 MiB, sockets 4 MiB 
+18:39:46 round 2  haproxy        up   1g   x2     2.32 GB/s  cpu 199% 0.86 s/GB   20.4 MiB, sockets 3 MiB 
+18:40:01 round 2  envoy          up   1g   x2     3.35 GB/s  cpu 191% 0.57 s/GB   69.0 MiB, sockets 9 MiB 
+18:40:17 round 2  traefik        up   1g   x2     2.78 GB/s  cpu 196% 0.70 s/GB   32.4 MiB, sockets 20 MiB 
+18:40:33 round 2  caddy          up   1g   x2     2.80 GB/s  cpu 202% 0.72 s/GB   21.5 MiB, sockets 4 MiB 
+18:40:49 round 2  nvelox-prev    up   1g   x2     2.81 GB/s  cpu 204% 0.73 s/GB   10.3 MiB, sockets 9 MiB 
+18:41:05 round 2  nvelox         up   1g   x2     3.53 GB/s  cpu 192% 0.55 s/GB    5.1 MiB, sockets 12 MiB 
+18:41:22 round 2  nginx          up   1g   x2     0.99 GB/s  cpu 200% 2.02 s/GB   38.6 MiB, sockets 6 MiB 
+18:41:37 round 3  origin         down 1m   x64   21.22 GB/s   
+18:41:53 round 3  haproxy        down 1m   x64    5.52 GB/s  cpu 399% 0.72 s/GB   20.5 MiB, sockets 50 MiB 
+18:42:08 round 3  envoy          down 1m   x64    4.25 GB/s  cpu 400% 0.94 s/GB   73.1 MiB, sockets 13 MiB 
+18:42:24 round 3  traefik        down 1m   x64    5.16 GB/s  cpu 389% 0.75 s/GB   42.9 MiB, sockets 43 MiB 
+18:42:39 round 3  caddy          down 1m   x64    4.52 GB/s  cpu 368% 0.82 s/GB   25.6 MiB, sockets 42 MiB 
+18:42:55 round 3  nvelox-prev    down 1m   x64    4.18 GB/s  cpu 344% 0.82 s/GB   13.7 MiB, sockets 43 MiB 
+18:43:10 round 3  nvelox         down 1m   x64    7.94 GB/s  cpu 399% 0.50 s/GB    5.2 MiB, sockets 37 MiB 
+18:43:26 round 3  nginx          down 1m   x64    2.98 GB/s  cpu 400% 1.34 s/GB   39.4 MiB, sockets 49 MiB 
+18:43:41 round 3  nginx-tuned    down 1m   x64    3.85 GB/s  cpu 396% 1.03 s/GB   41.0 MiB, sockets 38 MiB 
+18:43:57 round 3  origin         down 16m  x16   22.56 GB/s   
+18:44:12 round 3  haproxy        down 16m  x16    5.22 GB/s  cpu 399% 0.77 s/GB   20.5 MiB, sockets 32 MiB 
+18:44:28 round 3  envoy          down 16m  x16    4.54 GB/s  cpu 400% 0.88 s/GB   73.1 MiB, sockets 93 MiB 
+18:44:43 round 3  traefik        down 16m  x16    4.83 GB/s  cpu 376% 0.78 s/GB   42.9 MiB, sockets 41 MiB 
+18:44:59 round 3  caddy          down 16m  x16    4.59 GB/s  cpu 373% 0.81 s/GB   21.5 MiB, sockets 74 MiB 
+18:45:14 round 3  nvelox-prev    down 16m  x16    4.34 GB/s  cpu 365% 0.84 s/GB   13.4 MiB, sockets 63 MiB 
+18:45:30 round 3  nvelox         down 16m  x16    6.25 GB/s  cpu 399% 0.64 s/GB    5.3 MiB, sockets 62 MiB 
+18:45:45 round 3  nginx          down 16m  x16    2.71 GB/s  cpu 399% 1.47 s/GB   37.5 MiB, sockets 68 MiB 
+18:46:01 round 3  nginx-tuned    down 16m  x16    5.69 GB/s  cpu 399% 0.70 s/GB   51.9 MiB, sockets 71 MiB 
+18:46:16 round 3  origin         down 1g   x4    12.78 GB/s   
+18:46:32 round 3  haproxy        down 1g   x4     4.46 GB/s  cpu 399% 0.89 s/GB   20.5 MiB, sockets 7 MiB 
+18:46:49 round 3  envoy          down 1g   x4     3.85 GB/s  cpu 300% 0.78 s/GB   73.1 MiB, sockets 26 MiB 
+18:47:05 round 3  traefik        down 1g   x4     3.84 GB/s  cpu 324% 0.84 s/GB   29.2 MiB, sockets 10 MiB 
+18:47:21 round 3  caddy          down 1g   x4     3.76 GB/s  cpu 321% 0.85 s/GB   20.9 MiB, sockets 24 MiB 
+18:47:37 round 3  nvelox-prev    down 1g   x4     3.53 GB/s  cpu 326% 0.93 s/GB    9.7 MiB, sockets 6 MiB 
+18:47:53 round 3  nvelox         down 1g   x4     5.70 GB/s  cpu 398% 0.70 s/GB    5.3 MiB, sockets 17 MiB 
+18:48:10 round 3  nginx          down 1g   x4     2.20 GB/s  cpu 300% 1.36 s/GB   37.4 MiB, sockets 22 MiB 
+18:48:27 round 3  nginx-tuned    down 1g   x4     5.06 GB/s  cpu 300% 0.59 s/GB   41.3 MiB, sockets 23 MiB 
+18:48:42 round 3  sink           up   16m  x16   13.18 GB/s   
+18:48:58 round 3  haproxy        up   16m  x16    3.85 GB/s  cpu 400% 1.04 s/GB   20.5 MiB, sockets 38 MiB 
+18:49:13 round 3  envoy          up   16m  x16    5.06 GB/s  cpu 400% 0.79 s/GB   73.1 MiB, sockets 71 MiB 
+18:49:29 round 3  traefik        up   16m  x16    5.48 GB/s  cpu 380% 0.69 s/GB   31.8 MiB, sockets 50 MiB 
+18:49:44 round 3  caddy          up   16m  x16    5.33 GB/s  cpu 379% 0.71 s/GB   21.4 MiB, sockets 49 MiB 
+18:50:00 round 3  nvelox-prev    up   16m  x16    5.26 GB/s  cpu 376% 0.72 s/GB   10.7 MiB, sockets 50 MiB 
+18:50:15 round 3  nvelox         up   16m  x16    6.65 GB/s  cpu 398% 0.60 s/GB    5.3 MiB, sockets 71 MiB 
+18:50:31 round 3  nginx          up   16m  x16    2.41 GB/s  cpu 399% 1.66 s/GB   37.4 MiB, sockets 46 MiB 
+18:50:46 round 3  nginx-streamed up   16m  x16    3.02 GB/s  cpu 397% 1.32 s/GB   37.4 MiB, sockets 45 MiB 
+18:51:02 round 3  sink           up   1g   x2     4.48 GB/s   
+18:51:18 round 3  haproxy        up   1g   x2     1.94 GB/s  cpu 200% 1.03 s/GB   20.5 MiB, sockets 4 MiB 
+18:51:34 round 3  envoy          up   1g   x2     3.35 GB/s  cpu 199% 0.59 s/GB   73.1 MiB, sockets 13 MiB 
+18:51:50 round 3  traefik        up   1g   x2     2.88 GB/s  cpu 202% 0.70 s/GB   31.8 MiB, sockets 6 MiB 
+18:52:06 round 3  caddy          up   1g   x2     2.91 GB/s  cpu 202% 0.69 s/GB   21.3 MiB, sockets 6 MiB 
+18:52:21 round 3  nvelox-prev    up   1g   x2     2.82 GB/s  cpu 203% 0.72 s/GB   10.5 MiB, sockets 12 MiB 
+18:52:37 round 3  nvelox         up   1g   x2     3.75 GB/s  cpu 191% 0.51 s/GB    5.3 MiB, sockets 12 MiB 
+18:52:56 round 3  nginx          up   1g   x2     0.47 GB/s  cpu 100% 2.13 s/GB   37.4 MiB, sockets 5 MiB 
+18:53:12 round 3  nginx-streamed up   1g   x2     1.89 GB/s  cpu 200% 1.06 s/GB   37.4 MiB, sockets 3 MiB 
+18:53:12 slow download: 1 GiB at 20 MiB/s through every proxy, about a minute each
+18:54:05 slow download through nvelox: {"proxy": "nvelox", "summary": true, "cpu_s": 1.226189, "ms": 51658, "client": "1073741824 51.171738"}
+18:54:58 slow download through nginx: {"proxy": "nginx", "summary": true, "cpu_s": 3.103802, "ms": 51282, "client": "1073741824 51.177819"}
+18:55:51 slow download through nginx-tuned: {"proxy": "nginx-tuned", "summary": true, "cpu_s": 2.181847, "ms": 51423, "client": "1073741824 51.174763"}
+18:56:44 slow download through haproxy: {"proxy": "haproxy", "summary": true, "cpu_s": 0.961569, "ms": 51674, "client": "1073741824 51.172187"}
+18:57:37 slow download through envoy: {"proxy": "envoy", "summary": true, "cpu_s": 1.301064, "ms": 51657, "client": "1073741824 51.169442"}
+18:58:30 slow download through traefik: {"proxy": "traefik", "summary": true, "cpu_s": 1.129102, "ms": 51649, "client": "1073741824 51.172784"}
+18:59:23 slow download through caddy: {"proxy": "caddy", "summary": true, "cpu_s": 1.030464, "ms": 51652, "client": "1073741824 51.170341"}
+19:00:16 slow download through nvelox-prev: {"proxy": "nvelox-prev", "summary": true, "cpu_s": 1.003168, "ms": 51689, "client": "1073741824 51.177039"}
+19:00:17 done: bench.sh report results/v2.0.0-rc.3
