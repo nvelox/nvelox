@@ -12,7 +12,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -904,206 +903,30 @@ func TestFastPath_ManyConcurrent(t *testing.T) {
 	}
 }
 
-func TestFastParse_Handoffs(t *testing.T) {
-	var h reqHead
-	for _, raw := range []string{
-		"GET / HTTP/1.0\r\nHost: x\r\n\r\n",
-		"GET http://x/ HTTP/1.1\r\nHost: x\r\n\r\n",
-		"OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n",
-		"CONNECT x:443 HTTP/1.1\r\nHost: x\r\n\r\n",
-		"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc",
-		"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 3x\r\n\r\nabc",
-		"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: +0\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: x\r\nConnection: upgrade\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n",
-		"GET / HTTP/1.1\r\nX: y\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: x\r\nX: y\r\n z\r\n\r\n",
-		"GET / HTTP/1.1\nHost: x\n\n",
-		"GET / HTTP/1.1\r\nHost: x\nX: y\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost : x\r\n\r\n",
-		"GET / HTTP/1.1\r\nHo st: x\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: x\r\nX: a\x00b\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: x\r\nX: a\rb\r\n\r\n",
-		"GET /a b HTTP/1.1\r\nHost: x\r\n\r\n",
-		"GET /a\"b HTTP/1.1\r\nHost: x\r\n\r\n",
-		"GET /a|b HTTP/1.1\r\nHost: x\r\n\r\n",
-		"GET /a%zz HTTP/1.1\r\nHost: x\r\n\r\n",
-		"GET /a%2 HTTP/1.1\r\nHost: x\r\n\r\n",
-		"GET /\xc3\xa9 HTTP/1.1\r\nHost: x\r\n\r\n",
-		"GET /?a\x7fb HTTP/1.1\r\nHost: x\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: x%00\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: x y\r\n\r\n",
-		"GET  / HTTP/1.1\r\nHost: x\r\n\r\n",
-		"G@T / HTTP/1.1\r\nHost: x\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: x\r\nConnection: host\r\n\r\n",
-	} {
-		if r := parseRequest([]byte(raw), &h); r != parseHandoff {
-			t.Errorf("%q: parse = %v, want handoff", raw, r)
-		}
-	}
-	for _, raw := range []string{"GET / HTTP/1.1\r\nHost: x\r\n", "GET / HTT", ""} {
-		if r := parseRequest([]byte(raw), &h); r != parseMore {
-			t.Errorf("%q: parse = %v, want more", raw, r)
-		}
-	}
-}
-
-// TestFastParse_AgreesWithNetHTTP: every request head the fast parser
-// accepts, net/http reads with the same method, target, Host and headers.
-func TestFastParse_AgreesWithNetHTTP(t *testing.T) {
-	for _, raw := range fastParseCorpus {
-		checkAgainstNetHTTP(t, []byte(raw))
-	}
-}
-
-var fastParseCorpus = []string{
-	"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
-	"GET /a/b?c=d HTTP/1.1\r\nHost: example.com:8080\r\nUser-Agent: curl\r\nAccept: */*\r\n\r\n",
-	"HEAD /%41%2f HTTP/1.1\r\nHost: [::1]:80\r\nX:\r\n\r\n",
-	"DELETE /x HTTP/1.1\r\nhost: X\r\nContent-Length: 0\r\nConnection: close, x-foo\r\nx-foo: 1\r\n\r\n",
-	"GET /x HTTP/1.1\r\nHost: x\r\nTE: trailers, deflate\r\nX: \t v \t\r\n\r\n",
-}
-
-func checkAgainstNetHTTP(t *testing.T, raw []byte) {
-	t.Helper()
-	var h reqHead
-	if parseRequest(raw, &h) != parseOK {
-		return
-	}
-	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(raw)))
-	if err != nil {
-		t.Fatalf("%q: fast path accepts, net/http refuses: %v", raw, err)
-	}
-	if req.Method != string(h.method) || req.RequestURI != string(h.target) || req.Host != string(h.headers[h.host].value) {
-		t.Fatalf("%q: net/http %s %s host %q, fast %s %s host %q", raw, req.Method, req.RequestURI, req.Host, h.method, h.target, h.headers[h.host].value)
-	}
-	if req.ContentLength != 0 || len(req.TransferEncoding) != 0 {
-		t.Fatalf("%q: net/http sees a body (%d %v)", raw, req.ContentLength, req.TransferEncoding)
-	}
-	got := http.Header{}
-	for i := 0; i < h.n; i++ {
-		if h.headers[i].kind == hkHost {
-			continue
-		}
-		k := http.CanonicalHeaderKey(string(h.headers[i].name))
-		got[k] = append(got[k], string(h.headers[i].value))
-	}
-	want := req.Header.Clone()
-	want.Del("Host")
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("%q: headers\n fast %v\n net/http %v", raw, got, want)
-	}
-	if h.headLen != len(raw) && !bytes.HasPrefix(raw[h.headLen:], []byte("")) {
-		t.Fatalf("%q: head length %d", raw, h.headLen)
-	}
-	// The path net/url decodes is the one the fast path decodes.
-	path := h.path
-	if h.pathHasPct {
-		path = decodePath(nil, h.path)
-	}
-	if string(path) != req.URL.Path {
-		t.Fatalf("%q: path fast %q, net/url %q", raw, path, req.URL.Path)
-	}
-	if string(h.path) != req.URL.EscapedPath() {
-		t.Fatalf("%q: escaped path: verbatim %q, net/url %q", raw, h.path, req.URL.EscapedPath())
-	}
-	if string(h.query) != req.URL.RawQuery || h.hasQuery != (req.URL.RawQuery != "" || req.URL.ForceQuery) {
-		t.Fatalf("%q: query fast %q/%v, net/url %q/%v", raw, h.query, h.hasQuery, req.URL.RawQuery, req.URL.ForceQuery)
-	}
-}
-
-func FuzzFastParse(f *testing.F) {
-	for _, s := range fastParseCorpus {
-		f.Add([]byte(s))
-	}
-	f.Fuzz(func(t *testing.T, raw []byte) {
-		checkAgainstNetHTTP(t, raw)
-	})
-}
-
-func TestChunkReader(t *testing.T) {
-	in := "5;a=b\r\nhello\r\n1\r\n \r\n0\r\nX-T: 1\r\nY: 2\r\n\r\nNEXT"
-	for split := 1; split <= len(in); split++ {
-		var ck chunkReader
-		var data []byte
-		rest := ""
-		done := false
-		for _, part := range []string{in[:split], in[split:]} {
-			p := []byte(part)
-			for len(p) > 0 && !done {
-				off, n, used, d, err := ck.next(p)
-				if err != nil {
-					t.Fatalf("split %d: %v", split, err)
+// Every header a client can claim something about itself or the request
+// with (untrustedForwardingHeaders) is taken off a request that does not
+// come from a trusted proxy, in any spelling of its name, and kept on one
+// that does: by the event loops, which know these names themselves, as by
+// net/http.
+func TestFastPath_UntrustedForwardingClaimsMatchNetHTTP(t *testing.T) {
+	be := newRawBackend(t)
+	for _, trusted := range []bool{false, true} {
+		bothPaths(t, func(t *testing.T, fast bool) {
+			l := &ListenerConfig{Name: "site", Addr: "127.0.0.1:0", Protocol: "http"}
+			if trusted {
+				l.TrustedProxies = []string{"127.0.0.0/8"}
+			}
+			addr := startTestGroup(t, fastTestSite(l, &config.Backend{Servers: []string{be.addr()}}), fast)
+			for _, h := range untrustedForwardingHeaders {
+				for _, name := range []string{h, strings.ToLower(h), strings.ToUpper(h)} {
+					exchange(t, addr, "GET /claims HTTP/1.1\r\nHost: h\r\n"+name+": claimed\r\nX-Kept: yes\r\n\r\n", "GET")
+					got := be.last().Header
+					if kept := got.Get(h) == "claimed"; kept != trusted || got.Get("X-Kept") != "yes" {
+						t.Errorf("%s sent as %q, peer trusted %v: the backend got %q (and X-Kept %q)", h, name, trusted, got.Get(h), got.Get("X-Kept"))
+					}
 				}
-				data = append(data, p[off:off+n]...)
-				p = p[used:]
-				done = d
 			}
-			if done {
-				rest += string(p)
-			}
-		}
-		if !done || string(data) != "hello " || rest != "NEXT" {
-			t.Fatalf("split %d: done %v data %q rest %q", split, done, data, rest)
-		}
-		if tr, ok := ck.trailerLines(); !ok || string(tr) != "X-T: 1\r\nY: 2\r\n" {
-			t.Fatalf("split %d: trailer %q %v", split, tr, ok)
-		}
-	}
-	for _, bad := range []string{"g\r\n", "5\r\nhelloX", "\r\n", "5 x\nhello", "0\r\nbad\nline\r\n\r\n", "fffffffffffffffff\r\n"} {
-		var ck chunkReader
-		p := []byte(bad)
-		var err error
-		for len(p) > 0 {
-			var used int
-			var d bool
-			_, _, used, d, err = ck.next(p)
-			if err != nil || d {
-				break
-			}
-			p = p[used:]
-		}
-		if err == nil {
-			t.Errorf("%q: no error", bad)
-		}
-	}
-}
-
-func TestHeaderKindCoversUntrustedForwarding(t *testing.T) {
-	for _, h := range untrustedForwardingHeaders {
-		k := headerKind([]byte(h))
-		switch h {
-		case "Forwarded":
-			if k != hkForwarded {
-				t.Errorf("%s: kind %d", h, k)
-			}
-		case "X-Forwarded-Host":
-			if k != hkXForwardedHost {
-				t.Errorf("%s: kind %d", h, k)
-			}
-		default:
-			if k != hkUntrustedFwd {
-				t.Errorf("%s: kind %d", h, k)
-			}
-		}
-		if k2 := headerKind([]byte(strings.ToLower(h))); k2 != k {
-			t.Errorf("%s: lower-case kind %d", h, k2)
-		}
-	}
-}
-
-func TestEscapedPathMatchesNetURL(t *testing.T) {
-	for c := 0; c < 256; c++ {
-		p := "/a" + string([]byte{byte(c)}) + "b"
-		u := (&url.URL{Path: p}).EscapedPath()
-		if got := string(appendEscapedPath(nil, []byte(p))); got != u {
-			t.Errorf("byte %#x: %q, net/url %q", c, got, u)
-		}
+		})
 	}
 }
 

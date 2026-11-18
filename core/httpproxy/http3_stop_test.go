@@ -1,9 +1,5 @@
 package httpproxy
 
-// A stop of the group lets the HTTP/3 requests in flight finish, as it does
-// for HTTP/1.1 and HTTP/2, and does not wait for clients that have nothing
-// in flight.
-
 import (
 	"context"
 	"io"

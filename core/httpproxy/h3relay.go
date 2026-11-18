@@ -72,7 +72,7 @@ type h3Pin struct {
 // h3Pins is the pin table of one socket: which client each relay socket
 // that sends to it stands for. It is not safe for concurrent use: the
 // quic-go path's socket guards its table (h3RelayConn.mu), a loop's socket
-// is read by its loop alone (quicloop_linux.go).
+// is read by its loop alone (web.Relays.Datagram).
 type h3Pins struct {
 	pins  map[netip.AddrPort]h3Pin
 	swept int64

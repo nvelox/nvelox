@@ -25,8 +25,9 @@ import (
 // header from them is plain garbage, as before.
 //
 // The header is read where the client's bytes enter: on the event loop for
-// plain HTTP (fast_linux.go), in the handshake goroutine for HTTPS
-// (fasttls_linux.go), and by proxyListener when net/http accepts.
+// plain HTTP and in the handshake goroutine for HTTPS (the server of the
+// event loops asks fastHost, its Relays), and by proxyListener when
+// net/http accepts.
 
 // proxyTrust returns the group's accept_proxy_from trust (nil: none). The
 // sites of one bind address share one relay list and key file (checked when

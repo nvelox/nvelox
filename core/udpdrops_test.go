@@ -9,11 +9,10 @@ import (
 	"nvelox/core/metrics"
 )
 
-// Every UDP drop reason is counted: a datagram with a bad signature and a
-// relay session refused for the pending limit used to vanish without a count
-// or a log line.
+// Every UDP drop reason is counted: a datagram with a bad signature used to
+// vanish without a count or a log line.
 func TestUDPDrops_EveryReasonCounted(t *testing.T) {
-	for _, r := range []string{udpDropSessionLimit, udpDropSourceLimit, udpDropNoProxyHeader, udpDropClientChanged, udpDropBadSignature, udpDropRelayPending} {
+	for _, r := range []string{udpDropSessionLimit, udpDropSourceLimit, udpDropNoProxyHeader, udpDropClientChanged, udpDropBadSignature} {
 		if udpDropText[r] == "" {
 			t.Errorf("%s has no log text", r)
 		}

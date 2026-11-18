@@ -21,7 +21,7 @@ import (
 // listener's ordinary socket and is a direct client.
 //
 // The interface-bound sockets and the listener's own socket share the port.
-// On the event loops (udpfast_linux.go) with SO_REUSEPORT, which only a
+// On the event loops (udpfast.go) with SO_REUSEPORT, which only a
 // socket of the same user can join. Without them (udpsock.go: listenShared,
 // listenDevice; tests only on Linux, where the interfaces are supported)
 // with SO_REUSEADDR, which lets any program on the machine bind the port.

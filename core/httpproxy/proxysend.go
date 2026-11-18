@@ -24,7 +24,7 @@ import (
 // opened for it, kept idle for it and closed with it. How many idle ones a
 // client connection keeps: on the event loops as many as it had in use at
 // the same time in the last seconds, and never fewer than ownConnsMin
-// (proxysend_linux.go); on net/http ownConnsMin, a fixed number, for each
+// (package web of the ngx module); on net/http ownConnsMin, a fixed number, for each
 // backend it uses.
 //
 // The header's source is the client of the connection: the socket's peer,

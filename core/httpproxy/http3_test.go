@@ -1,9 +1,5 @@
 package httpproxy
 
-// The HTTP/3 listener: 0-RTT is off, and a request header section is limited
-// to 64 KiB, which also bounds what a HEADERS frame can make the server
-// reserve before the frame's bytes arrive.
-
 import (
 	"context"
 	"crypto/tls"

@@ -22,7 +22,8 @@ const (
 )
 
 // WriteProxyHeaderV2 writes the PROXY Protocol v2 header to the writer.
-// It supports IPv4 and IPv6 over TCP and UDP.
+// It supports IPv4 and IPv6 over TCP and UDP; an IPv4 address paired with an
+// IPv6 one goes as IPv6, in its IPv4-mapped form.
 func WriteProxyHeaderV2(w io.Writer, src, dst net.Addr) error {
 	header := make([]byte, 16, 108) // Min 16 bytes for header + 0 addr
 	copy(header, sigV2)
@@ -86,8 +87,12 @@ func WriteProxyHeaderV2(w io.Writer, src, dst net.Addr) error {
 		binary.BigEndian.PutUint16(portBuf[2:], uint16(dstPort))
 		header = append(header, portBuf...)
 
-	} else if sIP4 == nil && dIP4 == nil {
-		// IPv6
+	} else if s16, d16 := srcIP.To16(), dstIP.To16(); s16 != nil && d16 != nil {
+		// IPv6. Also when one side is IPv4 and the other IPv6 (a relay names
+		// an IPv4 client to an IPv6 listener address, or the reverse): the
+		// header has no family for such a pair, so both go as IPv6, the IPv4
+		// address in its IPv4-mapped form (::ffff:203.0.113.7), as HAProxy
+		// writes it.
 		header[13] = v2FamIPv6
 		if _, ok := src.(*net.TCPAddr); ok {
 			header[13] |= v2ProtoTCP
@@ -97,15 +102,15 @@ func WriteProxyHeaderV2(w io.Writer, src, dst net.Addr) error {
 		// Length (36 bytes for 2xIPv6 + 2xPort)
 		binary.BigEndian.PutUint16(header[14:], 36)
 
-		header = append(header, srcIP.To16()...)
-		header = append(header, dstIP.To16()...)
+		header = append(header, s16...)
+		header = append(header, d16...)
 
 		portBuf := make([]byte, 4)
 		binary.BigEndian.PutUint16(portBuf[0:], uint16(srcPort))
 		binary.BigEndian.PutUint16(portBuf[2:], uint16(dstPort))
 		header = append(header, portBuf...)
 	} else {
-		return fmt.Errorf("IP family mismatch or unsupported")
+		return fmt.Errorf("unsupported IP address: %v or %v", srcIP, dstIP)
 	}
 
 	_, err := w.Write(header)

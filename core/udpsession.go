@@ -37,11 +37,6 @@ const (
 	// one-datagram (or spoofed) source frees its slot after 10 s instead of
 	// 60 s. A session the backend answered keeps udpIdleTimeout.
 	udpNoReplyTimeout = 10 * time.Second
-	// udpRelayPendingTimeout ends a trusted relay's session that no datagram
-	// with a PROXY header has reached (an empty datagram opens a session but
-	// never reaches OnData). A real relay's header arrives with the datagram
-	// that opened the session.
-	udpRelayPendingTimeout = 2 * time.Second
 	// udpIdleTimeout ends a session after this long without a backend reply
 	// (udpClientReadTimeout, for a silent client, is the same).
 	udpIdleTimeout = 60 * time.Second
@@ -56,7 +51,21 @@ const (
 	udpDropNoProxyHeader = "no_proxy_header" // trusted relay datagram without a valid PROXY v2 header
 	udpDropClientChanged = "client_changed"  // trusted relay datagram naming another client than the session's
 	udpDropBadSignature  = "bad_signature"   // trusted relay datagram whose header signature is missing or wrong (accept_proxy_key_file)
-	udpDropRelayPending  = "relay_pending"   // too many trusted-relay sessions still waiting for a header: new one refused
+	// The backend wants the PROXY v2 header with every datagram
+	// (send_proxy_v2), and a datagram never goes to it without one: where
+	// the backend expects the header, a client could put one of its own
+	// first and so name any source.
+	udpDropNoBackendHeader = "no_backend_header"  // the header could not be built for the session's client: session refused
+	udpDropHeaderChanged   = "send_proxy_changed" // a reload changed send_proxy_v2 of the session's backend: session ended
+
+	// New sessions refused before they hold anything. A refused source
+	// sends on, and every datagram of it is a new session to refuse: each
+	// is counted here, and the source's line in the access log is written
+	// once in udpRefusalMemory (udpRefusals).
+	udpDropRefused      = "refused"       // the listener's ip_denylist, ip_allowlist or acl
+	udpDropDenylisted   = "denylisted"    // the denylist (admin API)
+	udpDropRateLimit    = "rate_limit"    // the listener's rate_limit
+	udpDropBackendLimit = "backend_limit" // the backend's max_connections
 )
 
 // udpSessionLimiter counts live UDP sessions, globally and per client IP,
@@ -69,30 +78,10 @@ type udpSessionLimiter struct {
 	perIP    map[netip.Addr]int
 	maxTotal int
 	maxPerIP int
-	pending  int
 }
 
 func newUDPSessionLimiter(maxTotal, maxPerIP int) *udpSessionLimiter {
 	return &udpSessionLimiter{perIP: make(map[netip.Addr]int), maxTotal: maxTotal, maxPerIP: maxPerIP}
-}
-
-// acquirePending reserves a place for a trusted relay's session that no
-// header has admitted yet; "" on success, else the drop reason.
-func (s *udpSessionLimiter) acquirePending() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.pending >= s.maxTotal {
-		return udpDropRelayPending
-	}
-	s.pending++
-	return ""
-}
-
-// releasePending frees a place taken by acquirePending.
-func (s *udpSessionLimiter) releasePending() {
-	s.mu.Lock()
-	s.pending--
-	s.mu.Unlock()
 }
 
 // acquire reserves a session slot, charged to ip when ip is valid. A trusted
@@ -219,5 +208,81 @@ var udpDropText = map[string]string{
 	udpDropNoProxyHeader: "datagrams from a trusted relay without a valid PROXY v2 header",
 	udpDropClientChanged: "datagrams from a trusted relay naming another client than the session's",
 	udpDropBadSignature:  "datagrams from a trusted relay without a valid header signature",
-	udpDropRelayPending:  fmt.Sprintf("trusted-relay sessions waiting for a PROXY header (limit %d), new ones refused", maxUDPSessions),
+
+	udpDropNoBackendHeader: "sessions refused: their backend wants the PROXY v2 header (send_proxy_v2), which cannot be built for the client",
+	udpDropHeaderChanged:   "sessions ended: a reload changed send_proxy_v2 of their backend",
+
+	udpDropRefused:      "new sessions refused by the listener's access policy (ip_denylist, ip_allowlist, acl)",
+	udpDropDenylisted:   "new sessions refused: the source is on the denylist",
+	udpDropRateLimit:    "new sessions refused: the listener's rate limit",
+	udpDropBackendLimit: "new sessions refused: the backend is at max_connections",
+}
+
+// udpDropOfStatus is the drop reason of a refusal by the access policy,
+// from its access-log status.
+func udpDropOfStatus(status string) string {
+	if status == l4StatusDenylisted {
+		return udpDropDenylisted
+	}
+	return udpDropRefused
+}
+
+const (
+	// udpRefusalMemory is how long a listener remembers a source it
+	// refused: within it the source's refusals are counted and have no
+	// line of their own in the access log.
+	udpRefusalMemory = 10 * time.Second
+	// udpRefusalsKept is how many refused sources a listener remembers.
+	// Past it (a flood from made-up sources) a refusal is counted only.
+	udpRefusalsKept = 1024
+)
+
+// udpRefusals is what a UDP listener remembers of the sources it refused:
+// a datagram of a source without a session is a new session, so a refused
+// source has its session refused again with every datagram it sends. The
+// policy is asked each time (a change of it holds at once); what is not
+// repeated is the line in the access log.
+type udpRefusals struct {
+	mu    sync.Mutex
+	until map[netip.Addr]int64 // the source's next line is due then (unix nanos)
+	swept int64
+}
+
+// first reports whether a refusal of ip at now gets a line in the access
+// log: the source has had none within udpRefusalMemory, and there is room
+// to remember it.
+func (r *udpRefusals) first(ip netip.Addr, now int64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if until, ok := r.until[ip]; ok && now < until {
+		return false
+	}
+	if len(r.until) >= udpRefusalsKept {
+		// Full: the sources whose time is over make room, looked for at
+		// most once a second.
+		if now-r.swept < int64(time.Second) {
+			return false
+		}
+		r.swept = now
+		for k, until := range r.until {
+			if now >= until {
+				delete(r.until, k)
+			}
+		}
+		if len(r.until) >= udpRefusalsKept {
+			return false
+		}
+	}
+	if r.until == nil {
+		r.until = make(map[netip.Addr]int64)
+	}
+	r.until[ip] = now + int64(udpRefusalMemory)
+	return true
+}
+
+// udpRefused counts a new UDP session that listener refused to ip, for
+// reason. True: the refusal's line is to be written to the access log.
+func (h *ProxyEventHandler) udpRefused(r *udpRefusals, reason, listener string, ip netip.Addr) bool {
+	h.udpDrops.noteIP(reason, listener, ip)
+	return r == nil || r.first(ip, time.Now().UnixNano())
 }

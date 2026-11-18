@@ -134,6 +134,9 @@ type LoggingConfig struct {
 	Level     string `yaml:"level"`      // debug, info, warning, error
 	AccessLog string `yaml:"access_log"` // path to access log
 	ErrorLog  string `yaml:"error_log"`  // path to error log
+	// Access turns the access log on or off for every listener (on when
+	// not set); a listener's own access_log wins over it.
+	Access *bool `yaml:"access,omitempty"`
 }
 
 // Listener defines a frontend listener.
@@ -270,7 +273,16 @@ type Listener struct {
 	GRPC        bool              `yaml:"grpc,omitempty"`       // Enable gRPC-aware proxying
 	Throttle    ThrottleConfig    `yaml:"throttle,omitempty"`   // NOT IMPLEMENTED: rejected at load when set
 	RequestID   RequestIDConfig   `yaml:"request_id,omitempty"` // Edge correlation-id (X-Request-ID)
+
+	// AccessLog turns this listener's access-log lines on or off, whatever
+	// logging.access says. Load sets it from logging.access when the
+	// listener does not.
+	AccessLog *bool `yaml:"access_log,omitempty"`
 }
+
+// AccessLogOn reports whether the listener writes access-log lines: its
+// own access_log, else on (Load fills that in from logging.access).
+func (l *Listener) AccessLogOn() bool { return l.AccessLog == nil || *l.AccessLog }
 
 // BufferingConfig defines request/response buffer sizes.
 type BufferingConfig struct {
@@ -738,6 +750,12 @@ func Load(path string) (*Config, error) {
 		l := &cfg.Listeners[i]
 		if l.Protocol == "" {
 			l.Protocol = "tcp"
+		}
+		// The access log: the listener's own access_log, else
+		// logging.access, else on.
+		if l.AccessLog == nil && cfg.Logging.Access != nil {
+			on := *cfg.Logging.Access
+			l.AccessLog = &on
 		}
 		// Migrate the deprecated `default_backend:` key into `backend:`.
 		// Setting both is a load error — it's almost always a typo or a

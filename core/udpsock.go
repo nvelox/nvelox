@@ -109,8 +109,8 @@ func (s *udpListenSock) forget(c *udpConn) {
 }
 
 // read hands every datagram to the handler: OnOpen for the first one of a
-// client, then OnData. An empty datagram starts (or keeps) its client's
-// session and is not handed on. A datagram is valid only during the call.
+// client, then OnData. An empty datagram keeps its client's session, begins
+// none and is not handed on. A datagram is valid only during the call.
 func (s *udpListenSock) read() {
 	defer s.wg.Done()
 	buf := make([]byte, udpMaxDatagram)
@@ -137,6 +137,12 @@ func (s *udpListenSock) read() {
 		c := s.conns[from]
 		fresh := c == nil
 		if fresh {
+			if n == 0 {
+				// An empty datagram is not relayed, so it begins nothing
+				// (on a session it counts as its client's activity).
+				s.mu.Unlock()
+				continue
+			}
 			c = &udpConn{sock: s, remote: from, raddr: net.UDPAddrFromAddrPort(from)}
 			s.conns[from] = c
 		}

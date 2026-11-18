@@ -25,6 +25,9 @@ type PassiveHealthTracker struct {
 	balancer lb.Balancer
 	backend  string
 	ejectFor time.Duration
+	// allOut: every server of the backend was ejected when last looked at
+	// (the balancer then uses them anyway); the warning is for the change.
+	allOut bool
 }
 
 // NewPassiveHealthTracker creates a tracker for the given backend.
@@ -49,6 +52,13 @@ func (p *PassiveHealthTracker) RecordFailure(server string) {
 		logging.Warn("[PASSIVE-HEALTH] Server %s in backend %s ejected for %v after %d failures",
 			server, p.backend, p.ejectFor, p.failures[server])
 		p.balancer.Eject(server, p.ejectFor)
+		if out := p.balancer.AllOut(); out != p.allOut {
+			p.allOut = out
+			if out {
+				logging.Warn("[PASSIVE-HEALTH] Every server of backend %s is ejected: requests go to them as if they were healthy until one is back",
+					p.backend)
+			}
+		}
 	}
 }
 
@@ -58,6 +68,9 @@ func (p *PassiveHealthTracker) RecordSuccess(server string) {
 	defer p.mu.Unlock()
 	if p.failures[server] > 0 {
 		p.failures[server] = 0
+	}
+	if p.allOut { // looked at again only then: this runs for every request
+		p.allOut = p.balancer.AllOut()
 	}
 }
 

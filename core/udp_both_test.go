@@ -37,9 +37,13 @@ func udpTestUDP_EmptyDatagrams(t *testing.T) {
 	if d, ok := stWaitGot(got, 300*time.Millisecond); ok {
 		t.Fatalf("an empty datagram reached the backend: %q", d)
 	}
-	waitFor(t, "the empty datagram's session", func() bool { return len(stUDPSessions(e)) == 1 })
+	// It is not relayed, and begins nothing: no session, no socket to the
+	// backend held for a source that has sent no byte.
+	if n := len(stUDPSessions(e)); n != 0 {
+		t.Fatalf("%d sessions after an empty datagram, want none", n)
+	}
 
-	// The same session relays what follows.
+	// The session begins with the first datagram that has something in it.
 	c.Write([]byte("answer with nothing"))
 	if d, ok := stWaitGot(got, 2*time.Second); !ok || string(d) != "answer with nothing" {
 		t.Fatalf("backend got %q (ok=%v)", d, ok)

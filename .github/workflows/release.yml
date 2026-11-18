@@ -13,10 +13,17 @@ on:
 permissions:
   contents: write
   packages: write
+  # For the signed statement of where the release archives were built
+  # (the last step).
+  id-token: write
+  attestations: write
 
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
+    # The engine's read key is a secret of the environment ngx-engine, which
+    # only main and release tags (v*) may use.
+    environment: ngx-engine
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -70,6 +77,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # syft writes the list of what is in each archive (.goreleaser.yaml,
+      # sboms).
+      - name: Set up syft
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0
         with:
@@ -78,3 +90,12 @@ jobs:
           args: release --clean --release-notes=/tmp/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # A signed statement, kept by GitHub, that the archives of this
+      # release (by their checksums) were built by this workflow from this
+      # commit: `gh attestation verify nvelox_linux_amd64.tar.gz --repo
+      # nvelox/nvelox` checks a download against it.
+      - name: Attest where the archives were built
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/checksums.txt

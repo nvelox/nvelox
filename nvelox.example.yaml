@@ -86,6 +86,9 @@ server:
 # and nvelox reopens both; SIGHUP reopens them too, then reloads.
 logging:
   level: "info"  # debug, info, warning, error
+  access: on     # Access-log lines of every listener: on (the default) or off.
+                 # A listener's own access_log: on|off wins over it; a reload
+                 # applies a change, also to running TCP and UDP listeners.
   access_log: "/var/log/nvelox/access.log"  # Per-request CLF format
   error_log: "/var/log/nvelox/error.log"
 
@@ -162,6 +165,7 @@ listeners:
           url: "https://${host}${uri}"  # Variable substitution
           code: 301
     # Redirect routes don't need a backend
+    access_log: off  # No access-log lines for this listener (logging.access is the default)
 
   # ─── HTTPS with HTTP/2 + HTTP/3 ────────────────────────
   - name: "https-main"
@@ -518,7 +522,12 @@ backends:
     # sees the real client address.
     #   - TCP backends: header sent once per connection (STREAM variant).
     #   - UDP backends: header prepended to each datagram (DGRAM variant)
-    #     so QUIC/HTTP3 backends can recover the client IP per packet.
+    #     so QUIC/HTTP3 backends can recover the client IP per packet. No
+    #     datagram goes to the backend without it: a session whose header
+    #     cannot be built (a relay names an IPv6 client to a listener bound
+    #     to an IPv4 address) is refused, and a reload that changes
+    #     send_proxy_v2 ends the backend's open UDP sessions; their clients
+    #     start new ones with their next datagram.
     #   - HTTP backends (http and https listeners, every HTTP version):
     #     header sent once per backend connection, before the TLS handshake
     #     of a backend_tls backend. A backend connection then serves one
@@ -571,7 +580,9 @@ backends:
         interval: "5s"
         timeout: "2s"
       passive:
-        max_fails: 3           # Out of rotation for 30s after 3 consecutive backend failures
+        max_fails: 3           # Out of rotation for 30s after 3 consecutive backend failures.
+                               # When every server is out, they are used anyway (a warning
+                               # is logged) until one is back: no 503 for everyone.
 
     # Circuit breaker
     circuit_breaker:

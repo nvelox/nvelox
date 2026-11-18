@@ -4,6 +4,7 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net"
 	"os"
@@ -13,12 +14,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nvelox/ngx/relay"
+
 	"nvelox/config"
 	"nvelox/core/logging"
 )
 
 // The relay tests of relay_test.go, run through an engine whose plain TCP
-// listener is served by the event loops (l4fast_linux.go).
+// listener is served by the event loops (l4fast.go, with the relay of the
+// ngx module).
 
 type l4Fixture struct {
 	client  *net.TCPConn
@@ -185,6 +189,102 @@ func TestL4Fast_StalledWriterAborts(t *testing.T) {
 	f.ended(t, 10*time.Second)
 }
 
+// A client that reads nothing does not keep its session by sending a byte
+// now and then: what the session holds for it (output that waits, the
+// kernel's buffers, a place among the backend's connections) is given up
+// when it has not taken that output for the idle time, as a write that
+// times out ends a session of the goroutine relay.
+func TestL4Fast_PeerThatReadsNothingButSendsIsCutOff(t *testing.T) {
+	const idle = 400 * time.Millisecond
+	f := startL4Fast(t, "400ms", 4096)
+	go io.Copy(io.Discard, f.backend) // the backend takes what the client sends
+	go func() {
+		chunk := make([]byte, 1<<20)
+		for {
+			f.backend.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if _, err := f.backend.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+	start := time.Now()
+	for {
+		// Five times in every idle period: the session is not idle.
+		if _, err := f.client.Write([]byte{'x'}); err != nil {
+			break
+		}
+		if time.Since(start) > 6*time.Second {
+			t.Fatalf("a client that reads nothing kept its session for %v by sending a byte now and then", time.Since(start).Round(time.Millisecond))
+		}
+		time.Sleep(idle / 5)
+	}
+	f.ended(t, 2*time.Second)
+}
+
+// Output that the client takes in time does not end the session, however
+// often it has to wait: the idle time is for each piece that waits, from
+// when it began to wait, and is over when the client has taken it. (A
+// piece waits until the client's socket has room again, which the kernel
+// says when a third of its buffer is free: megabytes on a tuned host.)
+func TestL4Fast_ReaderThatPausesKeepsItsSession(t *testing.T) {
+	const idle = 500 * time.Millisecond
+	f := startL4Fast(t, "500ms", 0)
+	const size = 64 << 20
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		chunk := make([]byte, 1<<20)
+		for sent := 0; sent < size; sent += len(chunk) {
+			f.backend.SetWriteDeadline(time.Now().Add(20 * time.Second))
+			if _, err := f.backend.Write(chunk); err != nil {
+				return
+			}
+		}
+		// Then a byte now and then: the session is not idle.
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(idle / 10):
+			}
+			if _, err := f.backend.Write([]byte{'.'}); err != nil {
+				return
+			}
+		}
+	}()
+	// The client reads four megabytes, pauses for a fifth of the idle
+	// time, and so on: output waits for it again and again, never long.
+	buf := make([]byte, 64<<10)
+	start := time.Now()
+	got, burst := 0, 0
+	for got < size {
+		f.client.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, err := f.client.Read(buf)
+		if err != nil {
+			t.Fatalf("after %d of %d bytes and %v: %v (a session whose output is taken was ended)", got, size, time.Since(start).Round(time.Millisecond), err)
+		}
+		got += n
+		if burst += n; burst >= 4<<20 {
+			burst = 0
+			time.Sleep(idle / 5)
+		}
+	}
+	if el := time.Since(start); el < 3*idle {
+		t.Fatalf("the client read everything in %v: the test needs it to take more than three idle periods", el)
+	}
+	// Nothing waits any more, for three idle periods and more: the wait
+	// that is over counts for nothing.
+	for until := time.Now().Add(3*idle + idle/2); time.Now().Before(until); {
+		f.client.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := f.client.Read(buf); err != nil {
+			t.Fatalf("%v after the last of the output was taken: %v", time.Since(start).Round(time.Millisecond), err)
+		}
+	}
+	if !f.running(t) {
+		t.Fatal("the session ended")
+	}
+}
+
 func TestL4Fast_ClientKeepsSendingAfterBackendClosed(t *testing.T) {
 	f := startL4Fast(t, "0", 4096)
 	resp := bytes.Repeat([]byte("R"), 48*1024)
@@ -341,7 +441,7 @@ func TestL4Fast_LogLinesNameAddresses(t *testing.T) {
 	for {
 		b, _ := os.ReadFile(errPath)
 		s := string(b)
-		if strings.Contains(s, "dial tcp "+dead+": connect: connection refused") && strings.Contains(s, "[CONN] Closed "+local+" ") {
+		if strings.Contains(s, "Backend TCP dial failed: dial tcp "+dead+": connect: connection refused") && strings.Contains(s, "[CONN] Closed "+local+" ") {
 			return
 		}
 		if time.Now().After(deadline) {
@@ -351,7 +451,7 @@ func TestL4Fast_LogLinesNameAddresses(t *testing.T) {
 	}
 }
 
-// A session with more to relay than one turn (l4RelayRound) gives way to
+// A session with more to relay than one turn (relay.TCPRound) gives way to
 // the loop's other sessions and goes on after them: a long transfer in both
 // directions at once arrives whole and in order.
 func TestL4Fast_LongRelayTakesTurns(t *testing.T) {
@@ -363,7 +463,7 @@ func TestL4Fast_LongRelayTakesTurns(t *testing.T) {
 		}
 		return b
 	}
-	down, up := pattern(24*l4RelayRound+12345, 0x5a), pattern(8*l4RelayRound+321, 0xa5)
+	down, up := pattern(24*relay.TCPRound+12345, 0x5a), pattern(8*relay.TCPRound+321, 0xa5)
 	go func() {
 		f.backend.Write(down)
 		f.backend.CloseWrite()
@@ -386,5 +486,102 @@ func TestL4Fast_LongRelayTakesTurns(t *testing.T) {
 	}
 	if rec := f.ended(t, 5*time.Second); !strings.Contains(rec, " ok ") {
 		t.Fatalf("access record %q", rec)
+	}
+}
+
+// A session that is over is not among the engine's connections any more:
+// the engine stops without waiting for it, whether the session was relayed
+// or never reached its backend.
+func TestL4Fast_EndedSessionsAreNotWaitedFor(t *testing.T) {
+	if !l4FastEnabled() {
+		t.Skip("event-loop relay off")
+	}
+	quiet := filepath.Join(t.TempDir(), "access.log")
+	if err := logging.Init("warning", quiet, ""); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { logging.Init("warning", "", "") })
+	beLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { beLn.Close() })
+	go func() {
+		for {
+			c, err := beLn.Accept()
+			if err != nil {
+				return
+			}
+			go func() { io.Copy(c, c); c.Close() }()
+		}
+	}()
+	addr, deadAddr := stFreeTCPAddr(t), stFreeTCPAddr(t)
+	cfg := &config.Config{Version: "2",
+		Listeners: []config.Listener{
+			{Name: "l4", Bind: addr, Protocol: "tcp", Backend: "be"},
+			{Name: "l4-dead", Bind: deadAddr, Protocol: "tcp", Backend: "gone"}},
+		Backends: []config.Backend{
+			{Name: "be", Servers: []string{beLn.Addr().String()}},
+			{Name: "gone", Servers: []string{stFreeTCPAddr(t)}}},
+	}
+	exp, err := ExpandListeners(cfg.Listeners)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := NewEngine(cfg)
+	e.Listeners = exp
+	e.DrainTimeout = 6 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- e.Start(ctx) }()
+	stopped := false
+	defer func() {
+		cancel()
+		if !stopped {
+			<-done
+		}
+	}()
+	waitTCP(t, addr)
+	waitTCP(t, deadAddr)
+	// A session that is relayed and ended by its client, and one whose
+	// backend is not there.
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	c.Write([]byte("ping"))
+	if _, err := io.ReadFull(c, make([]byte, 4)); err != nil {
+		t.Fatalf("the echo through the relay: %v", err)
+	}
+	c.Close()
+	d, err := net.Dial("tcp", deadAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.SetReadDeadline(time.Now().Add(5 * time.Second))
+	d.Read(make([]byte, 1))
+	d.Close()
+	// Both are over when the engine lists no connection.
+	listed := func() (n int) {
+		e.l4Conns.Range(func(any, any) bool { n++; return true })
+		return n
+	}
+	for deadline := time.Now().Add(5 * time.Second); listed() != 0; {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d sessions still listed after their connections were closed", listed())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	start := time.Now()
+	cancel()
+	select {
+	case <-done:
+		stopped = true
+	case <-time.After(15 * time.Second):
+		t.Fatal("the engine did not stop")
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Errorf("the engine took %v to stop with no session open: sessions that were over were still counted", took.Round(time.Millisecond))
 	}
 }

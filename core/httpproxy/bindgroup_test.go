@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,10 +88,10 @@ func TestBindGroup_PickCert(t *testing.T) {
 		sni  string
 		want string // expected cert source (matched by Leaf.Subject.CommonName)
 	}{
-		{"api.example.com", "api.example.com"},                  // exact
-		{"other.example.com", "wild.example.com"},               // wildcard
-		{"unknown.com", "default.example.com"},                  // fallback to default
-		{"", "default.example.com"},                             // no SNI → default
+		{"api.example.com", "api.example.com"},    // exact
+		{"other.example.com", "wild.example.com"}, // wildcard
+		{"unknown.com", "default.example.com"},    // fallback to default
+		{"", "default.example.com"},               // no SNI → default
 	}
 	for _, c := range cases {
 		t.Run(c.sni, func(t *testing.T) {
@@ -246,6 +247,84 @@ func TestBindGroup_ReloadCerts_PartialFailure(t *testing.T) {
 	}
 }
 
+// A site that has no certificate yet and whose files do not load (a site
+// that a reload adds) is left without one, and the error names it. The
+// other sites of the address are not held up: their certificates and
+// their client CAs are the new ones.
+func TestBindGroup_ReloadCerts_NewSiteWithoutACertificate(t *testing.T) {
+	dir := t.TempDir()
+	webCert, webKey := genCertWithCN(t, dir, "web.example.com")
+	before, after := newCAPKI(t, "ca-before"), newCAPKI(t, "ca-after")
+
+	web := newSite("web", nil, true, webCert, webKey)
+	web.Listener.TLS.ClientAuth, web.Listener.TLS.ClientCA = "require", before.caPath
+	g := NewBindGroup(":443", "https")
+	g.AddSite(web)
+	if g.ServesTLS() {
+		t.Fatal("a bind group that was not started serves TLS")
+	}
+	if _, err := g.buildTLSConfig(); err != nil {
+		t.Fatalf("buildTLSConfig: %v", err)
+	}
+	if ca := g.siteClientAuth(web); !g.ServesTLS() || ca == nil || !ca.CAs.Equal(before.pool) {
+		t.Fatal("before the reload: the site's client CA is not the one it was started with")
+	}
+
+	// The reload: web has a new certificate and another client CA, and a
+	// site is added whose certificate is not one.
+	renewedCert, renewedKey := genCertWithCN(t, dir, "renewed.web.example.com")
+	in, _ := os.ReadFile(renewedCert)
+	os.WriteFile(webCert, in, 0644)
+	in, _ = os.ReadFile(renewedKey)
+	os.WriteFile(webKey, in, 0600)
+	web.Listener.TLS.ClientCA = after.caPath
+	broken := filepath.Join(dir, "added.pem")
+	os.WriteFile(broken, []byte("not a certificate"), 0600)
+	g.AddSite(newSite("added", []string{"added.example.com"}, false, broken, broken))
+
+	rotated, err := g.ReloadCerts()
+	if err == nil || !strings.Contains(err.Error(), "site added") {
+		t.Errorf("ReloadCerts: %v, want an error that names the site without a certificate", err)
+	}
+	if rotated != 1 {
+		t.Errorf("%d certificates rotated, want web's one", rotated)
+	}
+	cn := func(name string) string {
+		c := g.pickCert(name)
+		if c == nil {
+			return ""
+		}
+		leaf, _ := x509.ParseCertificate(c.Certificate[0])
+		return leaf.Subject.CommonName
+	}
+	if got := cn("web.example.com"); got != "renewed.web.example.com" {
+		t.Errorf("web's certificate after the reload: CN %q, want the renewed one", got)
+	}
+	if ca := g.siteClientAuth(web); ca == nil || !ca.CAs.Equal(after.pool) {
+		t.Error("web's client CA after the reload is not the one the reload gave it")
+	}
+	// The added site has no certificate of its own: its name gets the
+	// default site's.
+	if got := cn("added.example.com"); got != "renewed.web.example.com" {
+		t.Errorf("the added site's name is answered with the certificate of %q, want the default site's", got)
+	}
+
+	// With every site new and none loading there is nothing to publish:
+	// the state stays, and the error names the sites.
+	g2 := NewBindGroup(":443", "https")
+	g2.AddSite(newSite("web", nil, true, webCert, webKey))
+	if _, err := g2.buildTLSConfig(); err != nil {
+		t.Fatalf("buildTLSConfig: %v", err)
+	}
+	g2.sites.Store(buildSiteSet([]*HTTPServer{newSite("other", nil, true, broken, broken)}))
+	if _, err := g2.ReloadCerts(); err == nil || !strings.Contains(err.Error(), "site other") || !strings.Contains(err.Error(), "no TLS-enabled sites") {
+		t.Errorf("ReloadCerts with no site that loads: %v", err)
+	}
+	if got, _ := x509.ParseCertificate(g2.pickCert("x").Certificate[0]); got.Subject.CommonName != "renewed.web.example.com" {
+		t.Errorf("after a reload with no site that loads, the state is not the one from before")
+	}
+}
+
 // TestBindGroup_ReloadCerts_BeforeStart guards against a caller bug.
 func TestBindGroup_ReloadCerts_BeforeStart(t *testing.T) {
 	g := NewBindGroup(":443", "https")
@@ -323,5 +402,14 @@ func TestBindGroup_HeaderIdleTimeouts_PartialConfig(t *testing.T) {
 	rh, _ := g.resolveHeaderAndIdleTimeouts()
 	if rh != 20*time.Second {
 		t.Errorf("configured value should win over unset peer: got %v, want 20s", rh)
+	}
+}
+
+// A bind group without a site (none was added: Start refuses such a group,
+// and a reload never leaves one) has no site for the event loops either:
+// asked all the same, it sends the request to net/http, which answers 503.
+func TestFastHost_GroupWithoutSites(t *testing.T) {
+	if s := (fastHost{NewBindGroup("127.0.0.1:0", "http")}).Site("example.test"); s != nil {
+		t.Fatalf("a group without sites gave the event loops a site: %+v", s)
 	}
 }

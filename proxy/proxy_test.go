@@ -108,14 +108,43 @@ func TestWriteProxyHeaderV2_IPv4_UDP(t *testing.T) {
 	}
 }
 
-func TestWriteProxyHeaderV2_Mismatch(t *testing.T) {
-	src := &net.TCPAddr{IP: net.ParseIP("192.168.1.1"), Port: 12345}
-	dst := &net.TCPAddr{IP: net.ParseIP("2001:db8::2"), Port: 80}
-
+// An IPv4 address and an IPv6 one have no family of their own in the header:
+// both go as IPv6, the IPv4 one in its IPv4-mapped form, whichever side it
+// is on, over UDP and TCP alike. An address of neither family is an error.
+func TestWriteProxyHeaderV2_MixedFamiliesGoAsIPv6(t *testing.T) {
+	mapped := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff}
+	for _, c := range []struct {
+		src, dst net.Addr
+		famProto byte
+		v4At     int // where the IPv4 address is in the header: 16 the source, 32 the destination
+	}{
+		{&net.UDPAddr{IP: net.ParseIP("203.0.113.7"), Port: 4444}, &net.UDPAddr{IP: net.ParseIP("2001:db8::2"), Port: 443}, 0x22, 16},
+		{&net.UDPAddr{IP: net.ParseIP("2001:db8::7"), Port: 4444}, &net.UDPAddr{IP: net.IPv4(198, 51, 100, 2).To4(), Port: 443}, 0x22, 32},
+		{&net.TCPAddr{IP: net.ParseIP("203.0.113.7"), Port: 4444}, &net.TCPAddr{IP: net.ParseIP("2001:db8::2"), Port: 443}, 0x21, 16},
+	} {
+		var buf bytes.Buffer
+		if err := WriteProxyHeaderV2(&buf, c.src, c.dst); err != nil {
+			t.Fatalf("%v -> %v: %v", c.src, c.dst, err)
+		}
+		data := buf.Bytes()
+		if len(data) != 16+36 || data[13] != c.famProto || binary.BigEndian.Uint16(data[14:]) != 36 {
+			t.Fatalf("%v -> %v: %d bytes, family/protocol 0x%02x, length %d; want 52, 0x%02x, 36", c.src, c.dst, len(data), data[13], binary.BigEndian.Uint16(data[14:]), c.famProto)
+		}
+		if v4 := data[c.v4At : c.v4At+16]; !bytes.Equal(v4[:12], mapped) {
+			t.Errorf("%v -> %v: the IPv4 address went as % x, want ::ffff: in front of it", c.src, c.dst, v4)
+		}
+		done, h, n, err := ParseStreamStrict(data)
+		if !done || err != nil || h == nil || n != len(data) {
+			t.Fatalf("%v -> %v: the header does not parse back: %v, %v", c.src, c.dst, done, err)
+		}
+		// To Go the mapped form is the same address.
+		if h.SourceAddr.String() != c.src.String() || h.DestinationAddr.String() != c.dst.String() {
+			t.Errorf("%v -> %v: parsed back as %v -> %v", c.src, c.dst, h.SourceAddr, h.DestinationAddr)
+		}
+	}
 	var buf bytes.Buffer
-	err := WriteProxyHeaderV2(&buf, src, dst)
-	if err == nil {
-		t.Fatal("Expected error for mismatched address families, got nil")
+	if err := WriteProxyHeaderV2(&buf, &net.UDPAddr{IP: net.IP{1, 2, 3}, Port: 1}, &net.UDPAddr{IP: net.ParseIP("2001:db8::2"), Port: 443}); err == nil {
+		t.Errorf("an address of 3 bytes: no error")
 	}
 }
 

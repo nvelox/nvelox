@@ -13,25 +13,25 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"unsafe"
 
 	"github.com/nvelox/ngx"
+	"github.com/nvelox/ngx/relay"
 	"golang.org/x/sys/unix"
 
 	"nvelox/config"
 	"nvelox/proxy"
 )
 
-// Tests of the event-loop UDP engine itself (udpfast_linux.go). What UDP
-// listeners do, on either engine, is tested by the tests that run through
-// stUDPEngines.
+// Tests of UDP on the event loops (udpfast.go and the relay of the ngx
+// module). What UDP listeners do, on either engine, is tested by the tests
+// that run through stUDPEngines.
 
 func udpFastOf(t *testing.T, e *Engine) *udpFast {
 	t.Helper()
 	e.reloadMu.Lock()
 	u := e.udpFast
 	e.reloadMu.Unlock()
-	if u == nil {
+	if u == nil || u.relay == nil {
 		t.Fatal("the udp listeners are not on the event loops")
 	}
 	return u
@@ -39,19 +39,13 @@ func udpFastOf(t *testing.T, e *Engine) *udpFast {
 
 // perLoopSessions returns how many live sessions each loop holds.
 func perLoopSessions(u *udpFast) []int {
-	out := make([]int, len(u.per))
-	var wg sync.WaitGroup
-	for i, per := range u.per {
-		i, per := i, per
-		wg.Add(1)
-		per.lp.Post(func() {
-			defer wg.Done()
-			for s := per.list.head; s != nil; s = s.lnext {
-				out[i]++
-			}
-		})
-	}
-	wg.Wait()
+	out := make([]int, len(ngx.Default().Loops()))
+	var mu sync.Mutex
+	u.relay.Each(func(s *relay.UDPSession) {
+		mu.Lock()
+		out[s.Loop()]++
+		mu.Unlock()
+	})
 	return out
 }
 
@@ -123,7 +117,7 @@ func TestUDPFast_SocketsPerPort(t *testing.T) {
 		Listeners: []config.Listener{{Name: "one", Bind: "127.0.0.1:" + port, Protocol: "udp", Backend: "be"}},
 		Backends:  []config.Backend{{Name: "be", Servers: []string{be}}},
 	}, nil)
-	if n := len(udpFastOf(t, e).socks); n != loops {
+	if n := udpFastOf(t, e).relay.Sockets(); n != loops {
 		t.Fatalf("a single port has %d sockets on %d loops", n, loops)
 	}
 
@@ -154,7 +148,7 @@ func TestUDPFast_SocketsPerPort(t *testing.T) {
 		Backends:  []config.Backend{{Name: "be", Servers: []string{be}}},
 	}, nil)
 	u := udpFastOf(t, e2)
-	if n := len(u.socks); n != ports {
+	if n := u.relay.Sockets(); n != ports {
 		t.Fatalf("a range of %d ports has %d sockets on %d loops", ports, n, loops)
 	}
 	// Every port of the range answers.
@@ -302,70 +296,6 @@ func TestUDPFast_DatagramsWaitApart(t *testing.T) {
 	}
 }
 
-// The session's deadline: 60 s after the peer's last datagram and, apart
-// from that, 10 s after the backend socket opened while it has not
-// answered, then 60 s after its last reply; a relay's session that no
-// header admitted yet, the pending timeout from its start.
-func TestUDPFast_Deadline(t *testing.T) {
-	const sec = int64(time.Second)
-	u := &udpFast{e: &Engine{udpNoReplyTimeout: udpNoReplyTimeout, udpRelayPendingTimeout: udpRelayPendingTimeout}}
-	sock := &udpSock{u: u}
-	for name, tc := range map[string]struct {
-		s    udpSess
-		want int64
-	}{
-		"waiting for a relay's header":      {udpSess{start: 100 * sec, lastPeer: 100 * sec, bfd: -1, relayPending: true}, 102 * sec},
-		"no backend socket yet":             {udpSess{start: 100 * sec, lastPeer: 105 * sec, bfd: -1}, 165 * sec},
-		"backend silent":                    {udpSess{start: 100 * sec, lastPeer: 105 * sec, bfd: 7, opened: 101 * sec}, 111 * sec},
-		"backend silent, peer silent first": {udpSess{start: 100 * sec, lastPeer: 40 * sec, bfd: 7, opened: 101 * sec}, 100 * sec},
-		"backend answered":                  {udpSess{start: 100 * sec, lastPeer: 105 * sec, bfd: 7, opened: 101 * sec, replied: true, lastReply: 103 * sec}, 163 * sec},
-		"peer went quiet first":             {udpSess{start: 100 * sec, lastPeer: 105 * sec, bfd: 7, opened: 101 * sec, replied: true, lastReply: 130 * sec}, 165 * sec},
-	} {
-		s := tc.s
-		s.sock = sock
-		if got := s.deadline(); got != tc.want {
-			t.Errorf("%s: deadline at %d s, want %d s", name, got/sec, tc.want/sec)
-		}
-	}
-}
-
-// udpPeerOf reads what the kernel wrote: IPv4, IPv6, and an IPv4 peer of a
-// dual-stack socket as IPv4.
-func TestUDPPeerOf(t *testing.T) {
-	read := func(sa unix.Sockaddr) (netip.AddrPort, bool) {
-		// Round-trip through a real socket pair: recvfrom fills the raw form.
-		var raw unix.RawSockaddrInet6
-		switch a := sa.(type) {
-		case *unix.SockaddrInet4:
-			r4 := (*unix.RawSockaddrInet4)(unsafe.Pointer(&raw))
-			r4.Family = unix.AF_INET
-			r4.Addr = a.Addr
-			r4.Port = uint16(a.Port>>8) | uint16(a.Port&0xff)<<8
-		case *unix.SockaddrInet6:
-			raw.Family = unix.AF_INET6
-			raw.Addr = a.Addr
-			raw.Port = uint16(a.Port>>8) | uint16(a.Port&0xff)<<8
-		}
-		return udpPeerOf(&raw)
-	}
-	mapped := netip.MustParseAddr("::ffff:192.0.2.7").As16()
-	for name, tc := range map[string]struct {
-		sa   unix.Sockaddr
-		want string
-	}{
-		"ipv4":        {&unix.SockaddrInet4{Port: 4660, Addr: [4]byte{192, 0, 2, 7}}, "192.0.2.7:4660"},
-		"ipv6":        {&unix.SockaddrInet6{Port: 53, Addr: netip.MustParseAddr("2001:db8::7").As16()}, "[2001:db8::7]:53"},
-		"ipv4-mapped": {&unix.SockaddrInet6{Port: 65535, Addr: mapped}, "192.0.2.7:65535"},
-	} {
-		if got, ok := read(tc.sa); !ok || got.String() != tc.want {
-			t.Errorf("%s: %v (ok=%v), want %s", name, got, ok, tc.want)
-		}
-	}
-	if _, ok := udpPeerOf(&unix.RawSockaddrInet6{Family: unix.AF_UNIX}); ok {
-		t.Error("an address of another family was read as a peer")
-	}
-}
-
 // Relaying a datagram and its reply allocates nothing: the engine's work per
 // datagram stays out of the garbage collector's way.
 func TestUDPFast_NoAllocationPerDatagram(t *testing.T) {
@@ -472,8 +402,8 @@ func rawUDPSocket(t *testing.T) (fd, port int) {
 	return fd, sa.(*unix.SockaddrInet4).Port
 }
 
-// FuzzUDPInbound feeds the per-datagram input paths arbitrary bytes: the
-// PROXY v2 header of a relay's datagram and the peer address.
+// FuzzUDPInbound feeds the PROXY v2 header of a relay's datagram arbitrary
+// bytes.
 func FuzzUDPInbound(f *testing.F) {
 	var seed bytes.Buffer
 	proxy.WriteProxyHeaderV2(&seed, &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 4000}, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 53})
@@ -492,11 +422,6 @@ func FuzzUDPInbound(f *testing.F) {
 		}
 		if !isProxy && consumed != 0 {
 			t.Fatalf("no header, yet %d bytes consumed", consumed)
-		}
-		var raw unix.RawSockaddrInet6
-		copy((*[unix.SizeofSockaddrInet6]byte)(unsafe.Pointer(&raw))[:], data)
-		if ap, ok := udpPeerOf(&raw); ok && !ap.Addr().IsValid() {
-			t.Fatal("a peer without an address")
 		}
 	})
 }

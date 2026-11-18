@@ -94,10 +94,11 @@ func (e *Engine) closeL4Conns() {
 // own goroutine, with the accept-time gating, PROXY-v2 handling and L4
 // access record that the UDP sessions have (handler.go).
 //
-// Order: listener rate limit -> access policy on the RESOLVED client (the peer
-// for a direct client; for a trusted accept_proxy_from relay, the client its
-// PROXY-v2 header names, read before anything is dialed) -> backend
-// max_connections -> dial -> relay.
+// Order: access policy on a direct client (the peer) -> listener rate limit
+// -> for a trusted accept_proxy_from relay, access policy on the client its
+// PROXY-v2 header names, read before anything is dialed -> backend
+// max_connections -> dial -> relay. A client the policy refuses takes
+// nothing from the listener's rate, which is for the clients it serves.
 func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 	e := h.engine
 	dstPort := portOf(clientConn.LocalAddr())
@@ -107,14 +108,6 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 	// suppress a record that would blame the relay for its clients.
 	peerTrusted := l.proxyTrust.trusts(clientConn.RemoteAddr())
 
-	if rl, ok := e.RateLimiters[l.Name]; ok && !rl.Allow() {
-		logging.Warn("[RATE] Connection from %s rejected (rate limit on %s)", clientConn.RemoteAddr(), l.Name)
-		if !peerTrusted {
-			logging.AccessL4(ipStrOf(clientConn.RemoteAddr()), l.Protocol, dstPort, l4StatusRateLimited, 0, 0, 0)
-		}
-		clientConn.Close()
-		return
-	}
 	// Access policy (ip_denylist, dynamic denylist, ip_allowlist, acl) on the
 	// immediate peer when it IS the client. A trusted relay's real client is
 	// checked below, once its header is read.
@@ -123,10 +116,20 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 	if !peerTrusted {
 		e.setL4Client(clientConn, ipOf(clientConn.RemoteAddr()))
 		if ok, status := h.l4Admit(l, ipOf(clientConn.RemoteAddr())); !ok {
-			logging.AccessL4(ipStrOf(clientConn.RemoteAddr()), l.Protocol, dstPort, status, 0, 0, 0)
+			if l.logsAccess() {
+				logging.AccessL4(ipStrOf(clientConn.RemoteAddr()), l.Protocol, dstPort, status, 0, 0, 0)
+			}
 			clientConn.Close()
 			return
 		}
+	}
+	if rl, ok := e.RateLimiters[l.Name]; ok && !rl.Allow() {
+		logging.Warn("[RATE] Connection from %s rejected (rate limit on %s)", clientConn.RemoteAddr(), l.Name)
+		if !peerTrusted && l.logsAccess() {
+			logging.AccessL4(ipStrOf(clientConn.RemoteAddr()), l.Protocol, dstPort, l4StatusRateLimited, 0, 0, 0)
+		}
+		clientConn.Close()
+		return
 	}
 
 	logging.Info("[CONN] New %s client %s -> :%d", l.Protocol, clientConn.RemoteAddr(), dstPort)
@@ -151,8 +154,10 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 			case linked:
 				status = "ok"
 			}
-			durMs := float64(time.Since(start).Nanoseconds()) / 1e6
-			logging.AccessL4(realClientIP, l.Protocol, dstPort, status, 0, 0, durMs)
+			if l.logsAccess() {
+				durMs := float64(time.Since(start).Nanoseconds()) / 1e6
+				logging.AccessL4(realClientIP, l.Protocol, dstPort, status, 0, 0, durMs)
+			}
 		}
 	}()
 

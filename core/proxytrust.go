@@ -1,8 +1,7 @@
 package core
 
 import (
-	"bufio"
-	"bytes"
+	"errors"
 	"net"
 	"sync/atomic"
 	"time"
@@ -45,9 +44,6 @@ func (p *proxyTrust) enabled() bool { return p.shared().Enabled() }
 func (p *proxyTrust) trusts(addr net.Addr) bool { return p.shared().Trusts(addr) }
 
 func ipOf(addr net.Addr) net.IP { return proxy.IPOf(addr) }
-
-// proxyV2Signature is the 12-byte PROXY-protocol-v2 magic prefix.
-var proxyV2Signature = proxy.V2Signature
 
 // relayClient reads the PROXY v2 header a trusted relay's TCP connection
 // must start with, waiting at most wait, and returns the client it names:
@@ -124,17 +120,17 @@ func parseInboundProxyV2Datagram(data []byte) (src net.Addr, consumed int, isPro
 
 // parseInboundProxyV2DatagramHeader is parseInboundProxyV2Datagram returning
 // the parsed header (nil when there is no usable one) for a signature check.
+// A usable header names a datagram's client by an IP address
+// (proxy.ParseDatagramStrict): a LOCAL header, one for a stream, and one
+// with a source that is no IP address (AF_UNIX) name none, and such a
+// client would pass every check that goes by address.
 func parseInboundProxyV2DatagramHeader(data []byte) (hdr *proxyproto.Header, consumed int, isProxy bool) {
-	if len(data) < 16 || !bytes.Equal(data[:len(proxyV2Signature)], proxyV2Signature) {
-		return nil, 0, false
+	hdr, consumed, err := proxy.ParseDatagramStrict(data)
+	switch {
+	case err == nil:
+		return hdr, consumed, true
+	case errors.Is(err, proxy.ErrNoHeader) || consumed == 0:
+		return nil, 0, false // no header, or one cut short: nothing of it is taken off
 	}
-	total := 16 + (int(data[14])<<8 | int(data[15]))
-	if len(data) < total {
-		return nil, 0, false // truncated/garbled — treat as raw rather than block
-	}
-	hdr, err := proxyproto.Read(bufio.NewReader(bytes.NewReader(data[:total])))
-	if err != nil || hdr == nil || hdr.Command == proxyproto.LOCAL || hdr.SourceAddr == nil {
-		return nil, total, true
-	}
-	return hdr, total, true
+	return nil, consumed, true
 }

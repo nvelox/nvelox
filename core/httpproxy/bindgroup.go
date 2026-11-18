@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"nvelox/core/servegate"
 	"nvelox/core/tlsutil"
 
+	"github.com/nvelox/ngx/web"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
@@ -44,9 +46,9 @@ type BindGroup struct {
 	// h3Relay wraps that socket when the group trusts UDP relays
 	// (accept_proxy_from): h3relay.go. nil: QUIC reads the socket itself.
 	h3Relay *h3RelayConn
-	// h3loops is the group's HTTP/3 when the event loops serve it
-	// (h3conn_linux.go); the three fields above are then unused.
-	h3loops *quicServer
+	// h3loops is the group's server on the event loops when it serves the
+	// group's HTTP/3 too; the three fields above are then unused.
+	h3loops *web.Server
 	primary *HTTPServer // for shared TLS / HTTP3 config; first site
 
 	// Site dispatch state. Lives behind an atomic.Pointer so ReplaceSites
@@ -74,10 +76,10 @@ type BindGroup struct {
 	// closes them all.
 	tunnels tunnelSet
 
-	// fast serves the group from the event loops (fast_linux.go); its
+	// fast serves the group from the event loops (package web of the ngx module); its
 	// handed-over connections go to httpServer. nil: httpServer serves the
 	// socket itself.
-	fast *fastServer
+	fast *web.Server
 
 	// bound is the address Start bound (the port chosen for ":0").
 	bound net.Addr
@@ -211,7 +213,7 @@ const (
 // hold by sending a few bytes. Under net/http's default of 1 MiB, which
 // HTTP/1.1 and HTTP/2 keep, the 100 request streams of one connection held
 // 100 MiB that way. (The event loops set nothing aside for what a frame
-// announces, and have the same default: h3stream_linux.go.)
+// announces, and have the same default.)
 const http3MaxHeaderBytes = config.DefaultHTTP3MaxHeaderSize
 
 // ServeHTTP picks the Site that owns r.Host and delegates. Single-site
@@ -234,8 +236,8 @@ func (g *BindGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.TLS == nil {
 		// A TLS connection the fast path handed over carries its state in
-		// the context (fasttls_linux.go).
-		r.TLS = fastTLSState(r)
+		// the context (web.HandoffContext).
+		r.TLS = web.TLSState(r)
 	}
 	ss := g.sites.Load()
 	if ss == nil || len(ss.all) == 0 {
@@ -459,11 +461,11 @@ func (g *BindGroup) ReplaceSites(newSites []*HTTPServer) error {
 	// / Stop pick up the right reference for shared-TLS-profile lookups.
 	g.primary = newSites[0]
 
-	// Refresh TLS state. Per-site failures keep previous cert.
-	if g.tlsState.Load() != nil {
-		if _, err := g.ReloadCerts(); err != nil {
-			logging.Warn("[RELOAD] bind group %s: cert refresh after ReplaceSites: %v", g.addr, err)
-		}
+	// Refresh TLS state. Per-site failures keep previous cert. (A site
+	// that is left without a certificate is reported by the engine's
+	// reload, which reads the certificates once more.)
+	if g.ServesTLS() {
+		_, _ = g.ReloadCerts()
 	}
 
 	// Keep only the tunnels the new sites admit (after the cert refresh:
@@ -601,7 +603,7 @@ func (g *BindGroup) Start() error {
 		// (it used to fail in a goroutine, logged, while nvelox ran on
 		// without it), and once Start returns every socket is held, so the
 		// process may give up root (server.user). The fast path does the
-		// handshakes itself (fasttls_linux.go).
+		// handshakes itself.
 		fast := fastPathEnabled()
 		var ln net.Listener
 		ln, err = net.Listen("tcp", g.addr)
@@ -615,15 +617,28 @@ func (g *BindGroup) Start() error {
 		}
 		g.bound = ln.Addr()
 		h3Loops := false
-		if anyH3 && fast {
-			if h3Loops, err = g.bindH3Loops(tlsCfg, idleTO); err != nil {
+		if fast {
+			if err := g.newFast(ln, readHeaderTO, idleTO); err != nil {
+				ln.Close()
+				return err
+			}
+		}
+		if anyH3 && fast && h3OnLoops {
+			// HTTP/3 on the event loops is part of the group's server
+			// there.
+			if err = g.fast.BindHTTP3(g.addr, tlsCfg, idleTO); err != nil {
+				g.dropFast()
 				ln.Close()
 				return fmt.Errorf("listen %s/udp (HTTP/3): %w", g.addr, err)
 			}
+			h3Loops = true
+			g.h3loops = g.fast
+			logging.Info("[HTTP3] QUIC listener started on %s (event loops)", g.addr)
 		}
 		if anyH3 && !h3Loops {
 			pc, err := net.ListenPacket("udp", g.addr)
 			if err != nil {
+				g.dropFast()
 				ln.Close()
 				return fmt.Errorf("listen %s/udp (HTTP/3): %w", g.addr, err)
 			}
@@ -681,8 +696,7 @@ func (g *BindGroup) Start() error {
 			logging.Info("[HTTP3] QUIC listener started on %s", g.addr)
 		}
 		if fast {
-			g.startFastTLS(ln, readHeaderTO, idleTO)
-			g.serveH3Loops()
+			g.serveFast()
 			return nil
 		}
 		go func() {
@@ -701,7 +715,11 @@ func (g *BindGroup) Start() error {
 		}
 		g.bound = ln.Addr()
 		if fastPathEnabled() {
-			return g.startFast(ln, readHeaderTO, idleTO)
+			if err := g.newFast(ln, readHeaderTO, idleTO); err != nil {
+				return err
+			}
+			g.serveFast()
+			return nil
 		}
 		go func() {
 			if !g.serveGate.Wait(g.gateDone) {
@@ -856,6 +874,16 @@ func (g *BindGroup) loadCertState() (*tlsState, error) {
 // the current snapshot and we log the failure. Operators get a partial
 // reload rather than nothing.
 //
+// A site that has no previous cert to keep (it is new, or has a new name)
+// is left without one, and the error names it: the snapshot is published
+// all the same, so the other sites of the address get their certificates
+// and their client-certificate policies. (ReloadCerts used to return at
+// such a site, before it published anything: a client CA the same reload
+// took away from another site went on being accepted.) Until its
+// certificate loads, that site's names are answered with the default
+// certificate, and where it asks for client certificates its requests are
+// refused (clientAuthOK).
+//
 // Returns the number of certs that were actually rotated (i.e. their
 // raw bytes changed). Zero means no-op; logging.Info can show the count.
 func (g *BindGroup) ReloadCerts() (int, error) {
@@ -876,6 +904,7 @@ func (g *BindGroup) ReloadCerts() (int, error) {
 	sites := g.siteList()
 	certs := make([]siteCert, 0, len(sites))
 	var defaultCert *siteCert
+	var without []error // the sites left without a certificate
 	rotated := 0
 	for _, s := range sites {
 		if s.Listener.TLS == nil || s.Listener.TLS.Cert == "" {
@@ -895,8 +924,9 @@ func (g *BindGroup) ReloadCerts() (int, error) {
 		if err != nil {
 			old, ok := prevByName[s.Listener.Name]
 			if !ok {
-				return rotated, fmt.Errorf("site %s: cert reload failed and no previous cert to fall back to: %v",
-					s.Listener.Name, err)
+				without = append(without, fmt.Errorf("site %s: cert reload failed and no previous cert to fall back to: %v",
+					s.Listener.Name, err))
+				continue
 			}
 			logging.Warn("[TLS] site %s: cert reload failed, keeping previous cert: %v",
 				s.Listener.Name, err)
@@ -927,12 +957,16 @@ func (g *BindGroup) ReloadCerts() (int, error) {
 		}
 	}
 	if len(certs) == 0 {
-		return 0, fmt.Errorf("bind group %s: no TLS-enabled sites after reload", g.addr)
+		return 0, errors.Join(append(without, fmt.Errorf("bind group %s: no TLS-enabled sites after reload", g.addr))...)
 	}
 
 	g.tlsState.Store(&tlsState{certs: certs, defaultCert: defaultCert})
-	return rotated, nil
+	return rotated, errors.Join(without...)
 }
+
+// ServesTLS reports whether the bind address has a TLS state (its sites'
+// certificates and client-certificate policies), which ReloadCerts renews.
+func (g *BindGroup) ServesTLS() bool { return g.tlsState.Load() != nil }
 
 // certBytesEqual reports whether two loaded certs carry the same DER bytes.
 // Used by ReloadCerts to count actual rotations vs. no-ops. Comparing the
@@ -1065,7 +1099,7 @@ func (g *BindGroup) Stop(ctx context.Context) error {
 	if g.httpServer != nil {
 		if g.fast != nil {
 			drained := make(chan bool, 1)
-			go func() { drained <- g.fast.shutdown(ctx.Done()) }()
+			go func() { drained <- g.fast.Shutdown(ctx.Done()) }()
 			err = g.httpServer.Shutdown(ctx)
 			if !<-drained && err == nil {
 				err = ctx.Err()
@@ -1075,7 +1109,9 @@ func (g *BindGroup) Stop(ctx context.Context) error {
 		}
 	}
 	<-h3Stopped
-	g.stopH3Loops()
+	if g.fast != nil {
+		g.fast.StopHTTP3()
+	}
 	for _, s := range g.siteList() {
 		s.Close()
 	}
