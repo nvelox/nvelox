@@ -167,6 +167,8 @@ cat examples/README.md
 
 ## Configuration
 
+Every setting, what it does and its default: [docs/reference/configuration.md](docs/reference/configuration.md). A configuration that shows them: [nvelox.example.yaml](nvelox.example.yaml).
+
 ### Basic HTTP Proxy
 ```yaml
 version: "2"

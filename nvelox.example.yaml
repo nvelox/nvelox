@@ -379,6 +379,11 @@ listeners:
       default_ttl: "5m"
       methods: ["GET"]
 
+    # The buffer a response body is copied through, on a listener that
+    # compresses, caches or asks for client certificates (default 32KB).
+    buffering:
+      response_buffer: "64KB"
+
     # Error pages (custom HTML files, falls back to built-in styled pages)
     # error_pages:
     #   404: "/var/www/errors/404.html"
@@ -388,11 +393,21 @@ listeners:
     headers:
       request_add:
         X-Proxy: "nvelox"
+      request_set:              # in place of a header of the same name
+        X-Environment: "production"
       response_add:
         Strict-Transport-Security: "max-age=31536000"
         X-Content-Type-Options: "nosniff"
       response_remove:
         - "Server"
+
+    # A request ID (X-Request-ID) for every request: passed to the backend,
+    # returned to the client, written in the access log. trust_inbound keeps
+    # the ID any client sends, for internal listeners; otherwise only
+    # trusted_proxies may send one.
+    request_id:
+      enabled: true
+      # trust_inbound: true
 
     # L7 Routes (first match wins)
     routes:
@@ -430,6 +445,7 @@ listeners:
           pass: "127.0.0.1:9000"           # or "unix:/var/run/php-fpm.sock"
           document_root: "/var/www/html"
           split_path_info: "^(.+\\.php)(/.*)$"
+          # script_name: "/index.php"     # SCRIPT_NAME (default: from the path)
           params:
             HTTPS: "on"
 
@@ -608,6 +624,7 @@ backends:
     sticky_session:
       type: "cookie"           # cookie, header, ip_hash
       cookie_name: "NVELOX_SRV"
+      # header_name: "X-Session"  # with type header
       ttl: "1h"
 
     # Health checks

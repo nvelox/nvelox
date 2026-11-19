@@ -30,22 +30,25 @@ type HTTP3Config struct {
 	// path carries, up to this, so it is also the most a download moves
 	// per round trip. 256KB to 1GB, default 16MB.
 	MaxSendBuffer string `yaml:"max_send_buffer,omitempty"`
-	// MaxStreamReceiveWindow and MaxConnectionReceiveWindow are how far
-	// the windows for what a client sends grow: of one request's body, and
-	// of all the requests of a connection together. A window starts at
+	// How far the window for one request's body grows. A window starts at
 	// 1 MiB and doubles while the backend takes an upload as fast as the
-	// path brings it, so they are the most an upload moves per round trip
-	// and the most nvelox holds for a connection whose backend stops
-	// taking. 1MB (nothing grows) to 1GB, defaults 6MB and 15MB.
-	MaxStreamReceiveWindow     string `yaml:"max_stream_receive_window,omitempty"`
+	// path brings it, so this is the most one upload moves per round trip,
+	// and the most nvelox holds of it when the backend stops taking. 1MB
+	// (nothing grows) to 1GB, default 6MB.
+	MaxStreamReceiveWindow string `yaml:"max_stream_receive_window,omitempty"`
+	// How far the window for all the request bodies of one connection
+	// together grows, as max_stream_receive_window does for one: the most
+	// a connection's uploads move per round trip. 1MB (nothing grows) to
+	// 1GB, default 15MB.
 	MaxConnectionReceiveWindow string `yaml:"max_connection_receive_window,omitempty"`
-	// MaxSendMemory bounds what all connections together hold to send,
-	// MaxReceiveMemory what they are granted together beyond their first
-	// receive windows. Past the first a connection takes 16 KiB at a
-	// time; past the second no window grows. 1MB to 1024GB; default for
-	// each: an eighth of the memory nvelox may use (the machine's, or its
-	// control group's limit), 64 MiB at the least.
-	MaxSendMemory    string `yaml:"max_send_memory,omitempty"`
+	// The most all connections together hold to send; past it a
+	// connection takes 16 KiB at a time. 1MB to 1024GB. Default: an eighth
+	// of the memory nvelox may use (the machine's, or its control group's
+	// limit), 64 MiB at the least.
+	MaxSendMemory string `yaml:"max_send_memory,omitempty"`
+	// The most all connections together are granted to receive beyond
+	// their first windows; past it no window grows. 1MB to 1024GB. Default:
+	// an eighth of the memory nvelox may use, 64 MiB at the least.
 	MaxReceiveMemory string `yaml:"max_receive_memory,omitempty"`
 	// SocketBuffer is what nvelox asks the kernel for as the receive and
 	// as the send buffer of each UDP socket of an HTTP/3 listener: there
