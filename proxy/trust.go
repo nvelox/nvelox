@@ -32,6 +32,9 @@ type Trust struct {
 	// keys (accept_proxy_key_file): a trusted peer's header must carry a
 	// valid signature made with one of them. Swapped by a reload (rotation).
 	keys atomic.Pointer[[][]byte]
+	// counted (accept_proxy_replay_window: required): the signature must
+	// have a counter, which only version 2 has. Set by a reload.
+	counted atomic.Bool
 }
 
 // NewTrust builds a Trust for the accept_proxy_from CIDRs and the signing
@@ -50,6 +53,14 @@ func (p *Trust) SetKeys(keys [][]byte) {
 	}
 	p.keys.Store(&keys)
 }
+
+// SetReplayWindow sets whether a signed header must carry a counter
+// (accept_proxy_replay_window: required) or passes without one too, a
+// version 1 signature (when_present).
+func (p *Trust) SetReplayWindow(required bool) { p.counted.Store(required) }
+
+// ReplayWindowRequired reports whether a signed header must carry a counter.
+func (p *Trust) ReplayWindowRequired() bool { return p != nil && p.counted.Load() }
 
 // Keys returns the signing keys, nil when headers need no signature.
 func (p *Trust) Keys() [][]byte {
@@ -79,6 +90,32 @@ func (p *Trust) Verify(h *proxyproto.Header, payload []byte, datagram bool) erro
 		return fmt.Errorf("%w: its transport protocol is not the connection's", ErrSignatureMalformed)
 	}
 	return Verify(h, *keys, payload, time.Now())
+}
+
+// VerifyFrom checks a trusted peer's header h, which came from the relay
+// socket port relayPort in a datagram or on a stream: with keys configured
+// it must name that transport and carry a valid signature over payload (the
+// datagram after the header; nil for a stream), made for that port when it
+// has a counter (version 2). It returns the counter, for the relay socket's
+// ReplayWindow, with counted true; a version 1 signature has none (counted
+// false) and passes only while the window is not required. Without keys
+// every header passes, uncounted.
+func (p *Trust) VerifyFrom(h *proxyproto.Header, payload []byte, datagram bool, relayPort uint16) (counter uint64, counted bool, err error) {
+	if p == nil {
+		return 0, false, nil
+	}
+	keys := p.keys.Load()
+	if keys == nil {
+		return 0, false, nil
+	}
+	if datagram && !h.TransportProtocol.IsDatagram() || !datagram && !h.TransportProtocol.IsStream() {
+		return 0, false, fmt.Errorf("%w: its transport protocol is not the connection's", ErrSignatureMalformed)
+	}
+	counter, counted, err = VerifyFrom(h, *keys, payload, time.Now(), relayPort)
+	if err == nil && !counted && p.counted.Load() {
+		return 0, false, ErrSignatureUncounted
+	}
+	return counter, counted, err
 }
 
 // Enabled reports whether any peer is trusted.
