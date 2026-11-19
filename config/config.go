@@ -413,7 +413,7 @@ type FastCGIConfig struct {
 	ScriptName    string            `yaml:"script_name,omitempty"`     // Override SCRIPT_NAME (default: from URL path)
 	SplitPathInfo string            `yaml:"split_path_info,omitempty"` // Regex to split PATH_INFO (like fastcgi_split_path_info)
 	Params        map[string]string `yaml:"params,omitempty"`          // Extra FastCGI params
-	Index         string            `yaml:"index,omitempty"`           // Default script (e.g., "index.php")
+	Index         string            `yaml:"index,omitempty"`           // NOT IMPLEMENTED: rejected at load when set
 	// Timeouts are an HTTP backend's connect (the dial: else the listener's,
 	// else 10s; 502 when it fails) and response_header (the time the upstream
 	// gets to start answering once it has the request: 60s, then 504).
@@ -1200,8 +1200,8 @@ func rejectUnimplementedServerKeys(cfg *Config) error {
 // rejectUnimplementedListenerKeys refuses listener keys that are parsed but
 // have no implementation (sni_routes, throttle, tls.ocsp_stapling,
 // tls.auto_cert, zero_copy, grpc, buffering.request_body_buffer,
-// routes[].scripts, root). Each would otherwise be a control that silently
-// does nothing.
+// routes[].scripts, routes[].fastcgi.index, root). Each would otherwise be
+// a control that silently does nothing.
 func rejectUnimplementedListenerKeys(l Listener) error {
 	if l.Root != "" {
 		return fmt.Errorf("listener %s: root is not implemented for a listener (nothing reads it); remove it, and serve files from a route with static.root", l.Name)
@@ -1230,6 +1230,9 @@ func rejectUnimplementedListenerKeys(l Listener) error {
 	for i, r := range l.Routes {
 		if r.Scripts.RequestScript != "" || r.Scripts.ResponseScript != "" {
 			return fmt.Errorf("listener %s: route %d: scripts (Lua request/response hooks) are not implemented (no script would run); remove them", l.Name, i)
+		}
+		if r.FastCGI.Index != "" {
+			return fmt.Errorf("listener %s: route %d: fastcgi.index is not implemented (nothing reads it); remove it, and name the script with try_files", l.Name, i)
 		}
 	}
 	return nil

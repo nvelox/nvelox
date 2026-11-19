@@ -104,6 +104,8 @@ func TestValidation_UnimplementedKeysRejected(t *testing.T) {
 		// Accepted and never read until 2.0.0 too: a route's static.root
 		// serves files, the listener's did nothing.
 		{"root", Listener{Name: "l", Bind: ":80", Protocol: "http", Backend: "be", Root: "/var/www/html"}, "root"},
+		{"fastcgi index", Listener{Name: "l", Bind: ":80", Protocol: "http", Backend: "be",
+			Routes: []RouteConfig{{Match: RouteMatch{PathPrefix: "/"}, FastCGI: FastCGIConfig{Pass: "127.0.0.1:9000", DocumentRoot: "/var/www/html", Index: "index.php"}}}}, "fastcgi.index"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
