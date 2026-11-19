@@ -62,7 +62,7 @@ func (g *BindGroup) newFast(ln net.Listener, readHeader, idle time.Duration) err
 		Name:              g.addr,
 		ReadHeaderTimeout: readHeader,
 		IdleTimeout:       idle,
-		TLS:               g.httpServer.TLSConfig,
+		TLS:               g.tlsBase,
 		Slow:              g.httpServer,
 		Host:              fastHost{g},
 		Relays:            fastHost{g},
