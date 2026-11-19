@@ -129,12 +129,47 @@ func ServeFastCGI(w http.ResponseWriter, r *http.Request, cfg config.FastCGIConf
 		},
 	)
 
-	handler := gofast.NewHandler(chain(gofast.BasicSession), clientFactory)
-
 	logging.Info("[FCGI] %s %s -> %s:%s (script: %s)",
 		logging.SanitizeLogField(r.Method), logging.SanitizeLogField(r.URL.Path),
 		network, address, logging.SanitizeLogField(scriptFilename))
-	handler.ServeHTTP(&fcgiResponseWriter{ResponseWriter: w, base: w.Header().Clone(), serveError: serveError}, r)
+
+	// The exchange, without gofast's own handler (gofast.NewHandler): that
+	// one keeps all of the upstream's stderr in memory until the response
+	// ends, then writes it to the standard logger as it came, where a
+	// newline in it (a PHP warning quoting a request) starts a log line of
+	// the upstream's making.
+	client, err := clientFactory()
+	if err != nil {
+		logging.Error("[FCGI] %s %s: %s:%s: %v", logging.SanitizeLogField(r.Method),
+			logging.SanitizeLogField(r.URL.Path), network, address, err)
+		serveError(w, http.StatusBadGateway)
+		return
+	}
+	defer client.Close()
+	resp, err := chain(gofast.BasicSession)(client, gofast.NewRequest(r))
+	if err != nil {
+		logging.Error("[FCGI] %s %s: %s:%s: %v", logging.SanitizeLogField(r.Method),
+			logging.SanitizeLogField(r.URL.Path), network, address, err)
+		serveError(w, http.StatusInternalServerError)
+		return
+	}
+	fw := &fcgiResponseWriter{ResponseWriter: w, base: w.Header().Clone(), serveError: serveError}
+	if err := resp.WriteTo(fw, fcgiStderr{r}); err != nil {
+		logging.Warn("[FCGI] %s %s: %s", logging.SanitizeLogField(r.Method),
+			logging.SanitizeLogField(r.URL.Path), logging.SanitizeLogField(err.Error()))
+	}
+}
+
+// fcgiStderr writes what the FastCGI upstream sends on stderr (PHP's errors
+// and warnings, for one) to the error log as it arrives, at error level as
+// nginx does: a line for each piece read (at most io.Copy's 32 KiB),
+// control characters escaped, nothing kept.
+type fcgiStderr struct{ r *http.Request }
+
+func (e fcgiStderr) Write(p []byte) (int, error) {
+	logging.Error("[FCGI] %s %s: upstream stderr: %s", logging.SanitizeLogField(e.r.Method),
+		logging.SanitizeLogField(e.r.URL.Path), logging.SanitizeLogField(string(p)))
+	return len(p), nil
 }
 
 // fastCGIScript reports whether scriptFilename may be handed to the FastCGI

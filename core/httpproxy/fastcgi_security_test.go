@@ -503,3 +503,60 @@ func TestFastCGI_RefusedResponseHead(t *testing.T) {
 		}
 	}
 }
+
+// TestFastCGI_StderrToErrorLog: what the upstream sends on stderr (PHP's
+// errors and warnings, for one) is in the error log while the response
+// still runs, its control characters escaped: a newline in it (a warning
+// quoting a request) does not start a log line of its own. gofast's own
+// handler kept all of it in memory until the response ended, then wrote it
+// to the standard logger as it came.
+func TestFastCGI_StderrToErrorLog(t *testing.T) {
+	errLog := filepath.Join(t.TempDir(), "error.log")
+	if err := logging.Init("error", "", errLog); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = logging.Init("info", "", "") })
+	logged := func() string {
+		b, _ := os.ReadFile(errLog)
+		return string(b)
+	}
+	cfg, current := fakeFCGIUpstream(t)
+	release := make(chan struct{})
+	current.Store(&fcgiReply{
+		stderr: []byte("PHP Warning: x\n1999/01/01 00:00:00 [ERR] FORGED"),
+		wait:   release,
+		out:    []byte("Content-Type: text/plain\r\n\r\nok"),
+	})
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ServeFastCGI(rec, httptest.NewRequest("GET", "/index.php", nil), cfg, nil)
+	}()
+	// The upstream holds the rest of its answer up to 5 s: the line is to
+	// be there well before.
+	for deadline := time.Now().Add(2 * time.Second); !strings.Contains(logged(), "FORGED"); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			close(release)
+			t.Fatalf("the upstream's stderr is not in the error log while the response runs: %q", logged())
+		}
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request has not ended 5 s after the upstream answered")
+	}
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
+		t.Errorf("answered %d %q, want 200 \"ok\"", rec.Code, rec.Body.String())
+	}
+	log := logged()
+	if !strings.Contains(log, `PHP Warning: x\n1999/01/01 00:00:00 [ERR] FORGED`) {
+		t.Errorf("the error log does not hold the upstream's stderr, escaped: %q", log)
+	}
+	for _, line := range strings.Split(log, "\n") {
+		if strings.HasPrefix(line, "1999/01/01") {
+			t.Errorf("a log line of the upstream's making: %q", line)
+		}
+	}
+}
