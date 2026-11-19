@@ -221,6 +221,19 @@ func preflight(listeners []*ListenerConfig, backends []config.Backend) error {
 	return nil
 }
 
+// Check runs, on a loaded config, what Start refuses before it touches any
+// socket: the port ranges expand, every listener's derived state builds
+// and every backend_tls config builds. `nvelox --check` calls it after
+// config.Load, so a config it accepts is one a start would not refuse for
+// what is written in it (a port that is taken shows only at the start).
+func Check(cfg *config.Config) error {
+	listeners, err := ExpandListeners(cfg.Listeners)
+	if err != nil {
+		return fmt.Errorf("listener expansion: %w", err)
+	}
+	return preflight(listeners, cfg.Backends)
+}
+
 // warnInsecureBackendTLS logs, once per start / reload, every backend that
 // skips certificate verification (backend_tls.insecure).
 func warnInsecureBackendTLS(backends []config.Backend) {

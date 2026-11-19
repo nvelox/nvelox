@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -25,6 +26,14 @@ var (
 	// operator running an unstamped binary sees it immediately.
 	Version = "dev"
 )
+
+// preflightConfig is core.Check, the checks of a start that need no socket:
+// a variable so a test can prove that --check runs them.
+var preflightConfig = core.Check
+
+// setSchedulerSlots is runtime.GOMAXPROCS: a variable so a test can see what
+// a config asks for without resizing the scheduler of the test process.
+var setSchedulerSlots = runtime.GOMAXPROCS
 
 // shutdownMargin is what the wait for the engine to stop, after SIGINT or
 // SIGTERM, allows beyond server.shutdown_timeout (the time the HTTP
@@ -59,6 +68,7 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 	fs := flag.NewFlagSet("nvelox", flag.ContinueOnError)
 	versionFlag := fs.Bool("version", false, "Print version and exit")
 	configPath := fs.String("config", "nvelox.yaml", "Path to configuration file")
+	checkFlag := fs.Bool("check", false, "Check the configuration file and exit: 0 when a start would accept it, 1 with the reason when not")
 
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -72,6 +82,29 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %v", err)
+	}
+
+	// --check: everything a start refuses for what is written in the
+	// config (the keys, the values, the files it names), and nothing that
+	// touches the system: no log file is opened, no port bound, no pid file
+	// written. The warnings a start prints are printed here too.
+	if *checkFlag {
+		if err := preflightConfig(cfg); err != nil {
+			return fmt.Errorf("failed to load config: %v", err)
+		}
+		for _, w := range config.StartupWarnings(cfg) {
+			fmt.Fprintf(os.Stderr, "[CONFIG] WARNING: %s\n", w)
+		}
+		fmt.Printf("%s: configuration is valid\n", *configPath)
+		return nil
+	}
+
+	// server.workers: how many event loops run. The engine starts one loop
+	// per scheduler slot it finds, so the count is set before anything
+	// starts a loop. Unset, the runtime's own count stands (the CPU cores
+	// the process may use).
+	if cfg.Server.Workers > 0 {
+		setSchedulerSlots(cfg.Server.Workers)
 	}
 
 	// Init Logger
@@ -135,6 +168,9 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 		if info != "" {
 			logging.Info("[SERVER] %s", info)
 		}
+		if n := core.EventLoops(); n > 0 {
+			logging.Info("[SERVER] %d event loops", n)
+		}
 		engine.Serve()
 	case err, ok := <-errCh:
 		if ok && err != nil && err != context.Canceled {
@@ -172,6 +208,14 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 					if err != nil {
 						logging.Error("Config reload failed (validation): %v — keeping current config", err)
 						continue
+					}
+					// Read at start only: say so rather than let the
+					// new value sit in the file unapplied.
+					if newCfg.Server.Workers != cfg.Server.Workers {
+						logging.Warn("server.workers changed (%d -> %d): it is read at start, restart nvelox to apply it", cfg.Server.Workers, newCfg.Server.Workers)
+					}
+					if newCfg.Server.PidFile != cfg.Server.PidFile {
+						logging.Warn("server.pid_file changed (%q -> %q): it is read at start, restart nvelox to apply it", cfg.Server.PidFile, newCfg.Server.PidFile)
 					}
 					if err := engine.Reload(newCfg); err != nil {
 						logging.Error("Config reload failed (apply): %v — keeping current config", err)

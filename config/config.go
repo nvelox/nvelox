@@ -91,8 +91,10 @@ type ServerConfig struct {
 	// process still may (core/pidfile). Read at start: a reload does not
 	// move it. Empty (default): no pid file.
 	PidFile string `yaml:"pid_file"`
-	// Workers is NOT IMPLEMENTED: a value above 0 is rejected at load
-	// (nvelox runs one process with one event loop per CPU core).
+	// Workers is how many event loops nvelox runs, and with them how many
+	// CPU cores it uses for traffic: 1 to MaxWorkers. 0 (default): one per
+	// CPU core the process may use. Read at start: a reload does not change
+	// it (main.go applies it before the first loop exists).
 	Workers int `yaml:"workers,omitempty"`
 	// GatewayID identifies THIS gateway on every HTTP access-log line as
 	// gw=<id>, so a request can be attributed to the gateway that first
@@ -1135,14 +1137,17 @@ func validate(cfg *Config) error {
 	return nil
 }
 
-// rejectUnimplementedServerKeys refuses the top-level and server.* keys
-// that are parsed but have no implementation (tracing, server.workers).
+// MaxWorkers is the most event loops server.workers may ask for.
+const MaxWorkers = 1024
+
+// rejectUnimplementedServerKeys refuses the top-level keys that are parsed
+// but have no implementation (tracing), and checks server.workers.
 func rejectUnimplementedServerKeys(cfg *Config) error {
 	if t := cfg.Tracing; t.Enabled || t.Endpoint != "" || t.Service != "" {
 		return fmt.Errorf("tracing is not implemented (no trace would be sent); remove it")
 	}
-	if cfg.Server.Workers > 0 {
-		return fmt.Errorf("server.workers is not implemented (nvelox runs one process with one event loop per CPU core); remove it")
+	if w := cfg.Server.Workers; w < 0 || w > MaxWorkers {
+		return fmt.Errorf("server.workers: %d is not a number of event loops (1 to %d; leave it out for one per CPU core)", w, MaxWorkers)
 	}
 	return nil
 }
@@ -1334,14 +1339,21 @@ func everyAddress(bind string) bool {
 }
 
 // ServerWarnings returns one warning per key of server.http3 that changes
-// nothing on this platform. main prints these at startup. (A key that
-// changes nothing on every platform is refused at load instead:
-// rejectUnimplementedServerKeys.)
-func ServerWarnings(s ServerConfig) []string { return serverWarnings(s, runtime.GOOS) }
+// nothing on this platform, and one when server.workers asks for more
+// event loops than the machine has CPU cores. main prints these at
+// startup. (A key that changes nothing on every platform is refused at
+// load instead: rejectUnimplementedServerKeys.)
+func ServerWarnings(s ServerConfig) []string {
+	return serverWarnings(s, runtime.GOOS, runtime.NumCPU())
+}
 
-// serverWarnings is ServerWarnings on the platform goos.
-func serverWarnings(s ServerConfig, goos string) []string {
-	return http3Warnings(s.HTTP3, goos)
+// serverWarnings is ServerWarnings on the platform goos with cpus CPU cores.
+func serverWarnings(s ServerConfig, goos string, cpus int) []string {
+	var out []string
+	if s.Workers > cpus {
+		out = append(out, fmt.Sprintf("server.workers (%d) is more than this machine's %d CPU cores: the loops beyond them only take turns on the same cores", s.Workers, cpus))
+	}
+	return append(out, http3Warnings(s.HTTP3, goos)...)
 }
 
 // validateServerName checks a server_names entry. Allows exact hostnames and

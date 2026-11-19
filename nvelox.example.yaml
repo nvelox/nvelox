@@ -23,8 +23,12 @@ server:
   # writes, e.g. /run/nvelox.pid); a clean stop removes it when the process
   # still may. Read at start: a reload does not move it.
   # pid_file: "/run/nvelox.pid"
-  # (workers is not implemented and is rejected: nvelox runs one process
-  # with one event loop per CPU core.)
+  # workers: how many event loops run, and with them how many CPU cores
+  # nvelox uses for traffic. Left out: one per CPU core the process may use.
+  # `workers: 4` on a 16-core machine leaves the other cores to whatever
+  # else runs there. Read at start: a reload does not change it. The start
+  # log says how many run ("[SERVER] 4 event loops").
+  # workers: 4
   # shutdown_timeout: how long a stop (SIGINT or SIGTERM) lets the HTTP
   # requests in flight finish; what is left then is closed. Nothing new is
   # accepted on the HTTP ports meanwhile, so this is also the longest that a
@@ -149,10 +153,15 @@ admin:
 # file, the line, the key and, when one is near, the key that was meant
 #   nvelox.yaml:42:5: unknown setting "ip_denylst" in listeners[0] (did you mean "ip_denylist"?)
 # so a misspelled setting cannot start and quietly do nothing. The same
-# holds for a key that is parsed but not implemented yet (`tracing`,
-# `server.workers`, and on a listener `zero_copy`, `grpc`, `tls.auto_cert`,
+# holds for a key that is parsed but not implemented yet (`tracing`, and
+# on a listener `zero_copy`, `grpc`, `tls.auto_cert`,
 # `tls.ocsp_stapling`, `sni_routes`, `throttle`,
 # `buffering.request_body_buffer`, `routes[].scripts`): the error says so.
+# To check a file without starting anything:
+#   nvelox --check --config /etc/nvelox/nvelox.yaml
+# prints "<file>: configuration is valid" and exits 0, or prints what a
+# start would refuse and exits 1. It binds no port and opens no file but
+# the config and the files it names.
 
 # ─── Modular Config Includes ──────────────────────────────
 include: "/etc/nvelox/config.d/*.yaml"

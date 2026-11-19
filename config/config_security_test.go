@@ -130,9 +130,21 @@ func TestValidation_UnimplementedServerKeysRejected(t *testing.T) {
 			wantErr(t, validate(cfg), "tracing is not implemented")
 		})
 	}
+	// server.workers is the number of event loops: 0 (one per core) to
+	// MaxWorkers; anything else is not a number of loops.
+	for _, n := range []int{0, 1, 4, MaxWorkers} {
+		cfg := baseCfg(l)
+		cfg.Server.Workers = n
+		if err := validate(cfg); err != nil {
+			t.Fatalf("server.workers %d must load: %v", n, err)
+		}
+	}
+	for _, n := range []int{-1, MaxWorkers + 1} {
+		cfg := baseCfg(l)
+		cfg.Server.Workers = n
+		wantErr(t, validate(cfg), "server.workers", "not a number of event loops")
+	}
 	cfg := baseCfg(l)
-	cfg.Server.Workers = 4
-	wantErr(t, validate(cfg), "server.workers is not implemented")
 
 	// server.pid_file is implemented: it loads, and without a warning.
 	cfg = baseCfg(l)
@@ -381,8 +393,16 @@ func TestServerWarnings(t *testing.T) {
 	if w := ServerWarnings(ServerConfig{}); len(w) != 0 {
 		t.Fatalf("no server keys set: want no warning, got %q", w)
 	}
-	if w := ServerWarnings(ServerConfig{PidFile: "/var/run/nvelox.pid", User: "nvelox", Group: "nvelox", GatewayID: "gw-1", ShutdownTimeout: "5s"}); len(w) != 0 {
+	if w := ServerWarnings(ServerConfig{PidFile: "/var/run/nvelox.pid", User: "nvelox", Group: "nvelox", GatewayID: "gw-1", ShutdownTimeout: "5s", Workers: 1}); len(w) != 0 {
 		t.Fatalf("keys that are all implemented: want no warning, got %q", w)
+	}
+	// More loops than cores is allowed and said: it gains nothing.
+	w := serverWarnings(ServerConfig{Workers: 16}, "linux", 8)
+	if len(w) != 1 || !strings.Contains(w[0], "server.workers (16)") || !strings.Contains(w[0], "8 CPU cores") {
+		t.Fatalf("16 workers on 8 cores: got %q", w)
+	}
+	if w := serverWarnings(ServerConfig{Workers: 8}, "linux", 8); len(w) != 0 {
+		t.Fatalf("8 workers on 8 cores: no warning, got %q", w)
 	}
 }
 

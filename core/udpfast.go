@@ -94,6 +94,11 @@ type udpFastSess struct {
 	hdrWanted bool
 }
 
+// EventLoops is how many event loops serve traffic: one per scheduler slot
+// found when the first loop was started (server.workers, else the CPU cores
+// the process may use). 0 where the event loops do not exist (not Linux).
+func EventLoops() int { return relay.Loops() }
+
 // startUDPFast binds the sockets of every udp listener and serves them from
 // the event loops once the serve gate opens.
 func (e *Engine) startUDPFast(plan *udpInterfacePlan, h *ProxyEventHandler) error {
