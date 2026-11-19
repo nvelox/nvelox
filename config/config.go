@@ -1,7 +1,6 @@
 package config
 
 import (
-	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"net"
@@ -742,7 +741,7 @@ func Load(path string) (*Config, error) {
 		}
 
 		for _, match := range matches {
-			subData, err := os.ReadFile(match)
+			subData, err := ReadNamedFile(match)
 			if err != nil {
 				// Warn but continue? Or fail? Nginx fails usually.
 				return nil, fmt.Errorf("failed to read included config %s: %w", match, err)
@@ -846,7 +845,7 @@ func loadProxyKeys(cfg *Config) error {
 // spaces trimmed, blank lines and "#" comments skipped, each at least
 // minProxyKeyLen characters. A file other users can read is reported.
 func readProxyKeyFile(path string) ([][]byte, error) {
-	data, err := os.ReadFile(path)
+	data, err := ReadNamedFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -1230,7 +1229,7 @@ func validateBackendTLS(b BackendTLSConfig) error {
 		return fmt.Errorf("client_cert and client_key must both be set (mTLS to the backend) or both be empty")
 	}
 	if b.ClientCert != "" {
-		if _, err := tls.LoadX509KeyPair(b.ClientCert, b.ClientKey); err != nil {
+		if _, err := LoadKeyPair(b.ClientCert, b.ClientKey); err != nil {
 			return fmt.Errorf("client_cert/client_key: %v", err)
 		}
 	}
@@ -1245,7 +1244,7 @@ func validateBackendTLS(b BackendTLSConfig) error {
 // LoadCertPool reads a PEM file and returns a pool of its certificates. It
 // fails when the file cannot be read or holds no PEM certificate.
 func LoadCertPool(path string) (*x509.CertPool, error) {
-	data, err := os.ReadFile(path)
+	data, err := ReadNamedFile(path)
 	if err != nil {
 		return nil, err
 	}

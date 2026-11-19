@@ -1254,7 +1254,7 @@ func warnIfKeyWorldReadable(keyPath string) {
 
 func (e *Engine) startTLSListener(l *ListenerConfig, handler *ProxyEventHandler) error {
 	warnIfKeyWorldReadable(l.TLS.Key)
-	cert, err := tls.LoadX509KeyPair(l.TLS.Cert, l.TLS.Key)
+	cert, err := config.LoadKeyPair(l.TLS.Cert, l.TLS.Key)
 	if err != nil {
 		return fmt.Errorf("failed to load TLS cert/key: %v", err)
 	}
