@@ -59,6 +59,10 @@ type udpFast struct {
 	e     *Engine
 	h     *ProxyEventHandler
 	relay *relay.UDP
+	// windows: the replay windows of the relay sockets, one table per
+	// event loop (a relay socket's datagrams all come to one loop's
+	// socket). Each is touched by its loop only.
+	windows []relayWindows
 }
 
 // udpFastSess is what nvelox keeps of one of the relay's sessions: its
@@ -73,7 +77,8 @@ type udpFastSess struct {
 	slotHeld       bool
 	sessionIP      netip.Addr
 	limiter        *ConnLimiter
-	named          net.Addr // the client the relay's first header named
+	named          net.Addr     // the client the relay's first header named
+	win            *relayWindow // the relay socket's replay window, from its first counted header on
 	// inHdr is that header as it arrived, kept while headers need no
 	// signature: a later datagram that starts with the same bytes names the
 	// same client and needs no parsing.
@@ -106,7 +111,7 @@ func (e *Engine) startUDPFast(plan *udpInterfacePlan, h *ProxyEventHandler) erro
 	if n == 0 {
 		return errors.New("UDP on the event loops is supported on Linux only")
 	}
-	u := &udpFast{e: e, h: h}
+	u := &udpFast{e: e, h: h, windows: make([]relayWindows, n)}
 	var binds []relay.UDPBind
 	var probes []string
 	listeners := 0
@@ -314,9 +319,19 @@ func (u *udpFast) Arrived(s *relay.UDPSession, data []byte) ([]byte, bool) {
 	if hdr != nil {
 		src = hdr.SourceAddr
 		// With accept_proxy_key_file the header must be signed over this
-		// datagram: a forged relay datagram cannot name a client.
-		if err := l.proxyTrust.verify(hdr, data[consumed:], true); err != nil {
-			h.udpDrops.noteIP(udpDropBadSignature, l.Name, s.Peer().Addr())
+		// datagram: a forged relay datagram cannot name a client, and a
+		// copy of one is refused by its relay socket's window.
+		counter, counted, drop := l.proxyTrust.relayDatagram(hdr, data[consumed:], s.Peer().Port())
+		if drop == "" && counted {
+			if d.win == nil {
+				d.win = u.windows[s.Loop()].attach(s.Peer(), time.Now().UnixNano())
+			}
+			if !d.win.Take(counter) {
+				drop = udpDropReplayed
+			}
+		}
+		if drop != "" {
+			h.udpDrops.noteIP(drop, l.Name, s.Peer().Addr())
 			if d.relayPending {
 				s.End(nil)
 			}
@@ -527,6 +542,9 @@ func (u *udpFast) Ended(s *relay.UDPSession, err error) {
 }
 
 func (u *udpFast) ended(s *relay.UDPSession, d *udpFastSess, err error) {
+	if d.win != nil {
+		u.windows[s.Loop()].detach(d.win, time.Now().UnixNano())
+	}
 	if d.onConnect {
 		d.balancer.OnDisconnect(d.target)
 	}

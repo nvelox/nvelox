@@ -461,6 +461,18 @@ func TestProxyKeysAndInterfaces(t *testing.T) {
 	if k := cfg.Listeners[0].AcceptProxyKeys; len(k) != 2 || string(k[0]) != strings.Repeat("n", 40) {
 		t.Fatalf("keys %q", k)
 	}
+	if cfg.Listeners[0].ReplayWindowRequired() {
+		t.Error("accept_proxy_replay_window unset: required")
+	}
+	for value, required := range map[string]bool{"when_present": false, "required": true} {
+		cfg, err := load(udp("    accept_proxy_from: [\"10.0.0.0/8\"]\n    accept_proxy_key_file: \"" + good + "\"\n    accept_proxy_replay_window: " + value + "\n"))
+		if err != nil {
+			t.Fatalf("accept_proxy_replay_window %s: %v", value, err)
+		}
+		if got := cfg.Listeners[0].ReplayWindowRequired(); got != required {
+			t.Errorf("accept_proxy_replay_window %s: required %v", value, got)
+		}
+	}
 	cfg, err = load("listeners:\n  - name: l\n    bind: \":7001\"\n    protocol: tcp\n    backend: b\n" +
 		"backends:\n  - name: b\n    servers: [\"127.0.0.1:1\"]\n    send_proxy_v2: true\n    send_proxy_key_file: \"" + good + "\"\n")
 	if err != nil || string(cfg.Backends[0].SendProxyKey) != strings.Repeat("n", 40) {
@@ -471,6 +483,9 @@ func TestProxyKeysAndInterfaces(t *testing.T) {
 		"no key":            {udp("    accept_proxy_from: [\"10.0.0.0/8\"]\n    accept_proxy_key_file: \"" + empty + "\"\n"), "no key"},
 		"missing file":      {udp("    accept_proxy_from: [\"10.0.0.0/8\"]\n    accept_proxy_key_file: \"" + dir + "/nope\"\n"), "no such file"},
 		"key without trust": {udp("    accept_proxy_key_file: \"" + good + "\"\n"), "needs accept_proxy_from"},
+		"replay window, another value": {udp("    accept_proxy_from: [\"10.0.0.0/8\"]\n    accept_proxy_key_file: \"" + good + "\"\n    accept_proxy_replay_window: always\n"),
+			`accept_proxy_replay_window "always": want when_present or required`},
+		"replay window without a key file": {udp("    accept_proxy_from: [\"10.0.0.0/8\"]\n    accept_proxy_replay_window: required\n"), "accept_proxy_replay_window needs accept_proxy_key_file"},
 		"interfaces on tcp": {"listeners:\n  - name: l\n    bind: \":7002\"\n    protocol: tcp\n    backend: b\n    accept_proxy_from: [\"10.0.0.0/8\"]\n    accept_proxy_interfaces: [\"eth1\"]\n" +
 			"backends:\n  - name: b\n    servers: [\"127.0.0.1:1\"]\n", "applies to udp listeners"},
 		"interfaces without trust": {udp("    accept_proxy_interfaces: [\"eth1\"]\n"), "needs accept_proxy_from"},

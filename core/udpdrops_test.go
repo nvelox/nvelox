@@ -12,7 +12,7 @@ import (
 // Every UDP drop reason is counted: a datagram with a bad signature used to
 // vanish without a count or a log line.
 func TestUDPDrops_EveryReasonCounted(t *testing.T) {
-	for _, r := range []string{udpDropSessionLimit, udpDropSourceLimit, udpDropNoProxyHeader, udpDropClientChanged, udpDropBadSignature} {
+	for _, r := range []string{udpDropSessionLimit, udpDropSourceLimit, udpDropNoProxyHeader, udpDropClientChanged, udpDropBadSignature, udpDropReplayed} {
 		if udpDropText[r] == "" {
 			t.Errorf("%s has no log text", r)
 		}

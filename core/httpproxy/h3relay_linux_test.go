@@ -35,6 +35,11 @@ type relaySocket struct {
 	uc     *net.UDPConn
 	client atomic.Pointer[string] // the client named ("ip:port"); "": no header at all
 	key    []byte                 // signs the header when set
+	// counted: the signature is version 2, with the socket's port and a
+	// counter (accept_proxy_replay_window).
+	counted bool
+	counter atomic.Uint64
+	last    atomic.Pointer[[]byte] // the last datagram sent, header and all
 }
 
 func newRelaySocket(t *testing.T, client string, key []byte) *relaySocket {
@@ -62,7 +67,13 @@ func (r *relaySocket) WriteTo(p []byte, addr net.Addr) (int, error) {
 			return 0, err
 		}
 		hdr := b.Bytes()
-		if r.key != nil {
+		switch {
+		case r.key != nil && r.counted:
+			port := uint16(r.uc.LocalAddr().(*net.UDPAddr).Port)
+			if hdr, err = proxy.SignedHeaderBytesFrom(hdr, r.key, p, time.Now(), port, r.counter.Add(1)); err != nil {
+				return 0, err
+			}
+		case r.key != nil:
 			if hdr, err = proxy.SignedHeaderBytes(hdr, r.key, p, time.Now()); err != nil {
 				return 0, err
 			}
@@ -72,6 +83,8 @@ func (r *relaySocket) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if _, err := r.uc.WriteTo(out, addr); err != nil {
 		return 0, err
 	}
+	sent := append([]byte(nil), out...)
+	r.last.Store(&sent)
 	return len(p), nil
 }
 
@@ -365,6 +378,150 @@ func TestH3RelayPins(t *testing.T) {
 	if _, reason, _ := c.relayed(proxy.NewTrust([]string{"192.0.2.0/24"}, nil), fresh, datagram("203.0.113.9:4321")); reason != proxy.RefusedSignature {
 		t.Errorf("trust without keys: reason %q, want %q", reason, proxy.RefusedSignature)
 	}
+}
+
+// A pin's window: a counter is taken once from its relay socket, a copy is
+// refused also once the pin has expired, until the pin is swept; a copy
+// from another port fails its signature.
+func TestH3RelayPins_Counted(t *testing.T) {
+	if h3RelayPinTTL < 2*proxy.SignatureWindow {
+		t.Fatalf("pins are kept %v, less than the %v a header can pass its time check after it was taken", h3RelayPinTTL, 2*proxy.SignatureWindow)
+	}
+	tr := proxy.NewTrust([]string{"192.0.2.0/24"}, [][]byte{h3RelayKey})
+	c := newH3RelayConn(nil, nil)
+	dst := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 443}
+	relay := netip.MustParseAddrPort("192.0.2.10:7000")
+	datagram := func(client string, port uint16, counter uint64) []byte {
+		src, err := net.ResolveUDPAddr("udp", client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var b bytes.Buffer
+		if err := proxy.WriteProxyHeaderV2(&b, src, dst); err != nil {
+			t.Fatal(err)
+		}
+		payload := []byte("a QUIC packet")
+		hdr, err := proxy.SignedHeaderBytesFrom(b.Bytes(), h3RelayKey, payload, time.Now(), port, counter)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(hdr, payload...)
+	}
+	age := func(by time.Duration) {
+		c.mu.Lock()
+		p := c.pins[relay]
+		p.seen -= int64(by)
+		c.pins[relay] = p
+		c.mu.Unlock()
+	}
+	first := datagram("203.0.113.9:4321", relay.Port(), 500)
+	if _, reason, _ := c.relayed(tr, relay, first); reason != "" {
+		t.Fatalf("first datagram: reason %q", reason)
+	}
+	if _, reason, _ := c.relayed(tr, relay, first); reason != proxy.RefusedReplayed {
+		t.Errorf("a copy: reason %q, want %q", reason, proxy.RefusedReplayed)
+	}
+	if _, reason, _ := c.relayed(tr, netip.AddrPortFrom(relay.Addr(), 7001), first); reason != proxy.RefusedSignature {
+		t.Errorf("a copy from another port: reason %q, want %q", reason, proxy.RefusedSignature)
+	}
+	// Expired, not yet swept: the client may change, the window holds.
+	age(h3RelayPinTTL)
+	if _, reason, _ := c.relayed(tr, relay, first); reason != proxy.RefusedReplayed {
+		t.Errorf("a copy once the pin has expired: reason %q, want %q", reason, proxy.RefusedReplayed)
+	}
+	if _, reason, _ := c.relayed(tr, relay, datagram("198.51.100.1:5", relay.Port(), 501)); reason != "" {
+		t.Errorf("another client once the pin has expired: reason %q", reason)
+	}
+	// Swept (unused for more than h3RelayPinTTL): the window goes with the
+	// pin, as every header it took has passed its time.
+	age(h3RelayPinTTL + 1)
+	c.mu.Lock()
+	c.sweep(time.Now().UnixNano())
+	_, kept := c.pins[relay]
+	c.mu.Unlock()
+	if kept {
+		t.Fatal("a pin unused for more than h3RelayPinTTL was not swept")
+	}
+	if _, reason, _ := c.relayed(tr, relay, datagram("198.51.100.1:5", relay.Port(), 501)); reason != "" {
+		t.Errorf("a counter after the pin was swept: reason %q", reason)
+	}
+}
+
+// A copy of a relay's datagram whose header carries a counter is dropped
+// and counted as replayed; from another port of the relay its signature
+// does not hold. The relay's own datagrams go on.
+func TestHTTP3_RelayCopiesDropped(t *testing.T) { quicGoPath(t); relayCopiesDropped(t, quicGoServes) }
+
+func TestH3Loops_RelayCopiesDropped(t *testing.T) { onLoops(t); relayCopiesDropped(t, loopsServe) }
+
+func relayCopiesDropped(t *testing.T, served func(*testing.T, *BindGroup)) {
+	quietLog(t)
+	pki := newCAPKI(t, "h3-relay-copy-ca")
+	site := h3RelaySite(t, pki, "127.0.0.0/8", nil)
+	name := site.Listener.Name
+	addr := freeAddr(t)
+	served(t, startGroup(t, addr, site))
+	tlsConf := h3ClientTLS(pki)
+	ua, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counted := func(what, reason string, before uint64) {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); h3Refusals(name, reason) == before; {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: not counted as %q", what, reason)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	sock := newRelaySocket(t, "203.0.113.9:4321", h3RelayKey)
+	sock.counted = true
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	qt := &quic.Transport{Conn: sock}
+	defer qt.Close()
+	conn, err := qt.Dial(ctx, ua, tlsConf, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseWithError(0, "")
+	cc := (&http3.Transport{}).NewClientConn(conn)
+	get := func(what string) {
+		t.Helper()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+addr+"/", nil)
+		resp, err := cc.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if string(b) != "client=203.0.113.9" {
+			t.Fatalf("%s: %q, want client=203.0.113.9", what, b)
+		}
+	}
+	get("through the relay")
+	copied := *sock.last.Load()
+
+	before := h3Refusals(name, proxy.RefusedReplayed)
+	if _, err := sock.uc.WriteTo(copied, ua); err != nil {
+		t.Fatal(err)
+	}
+	counted("a copy from the relay socket", proxy.RefusedReplayed, before)
+
+	other, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	before = h3Refusals(name, proxy.RefusedSignature)
+	if _, err := other.WriteTo(copied, ua); err != nil {
+		t.Fatal(err)
+	}
+	counted("a copy from another port", proxy.RefusedSignature, before)
+
+	get("the relay's next request")
 }
 
 // The same through the event loops: a relayed client's requests are its

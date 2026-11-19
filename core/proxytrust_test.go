@@ -8,7 +8,7 @@ import (
 )
 
 func TestProxyTrust_Trusts(t *testing.T) {
-	pt := newProxyTrust([]string{"10.20.0.0/16", "192.0.2.5/32"}, nil)
+	pt := newProxyTrust([]string{"10.20.0.0/16", "192.0.2.5/32"}, nil, false)
 	if !pt.enabled() {
 		t.Fatal("expected enabled")
 	}
@@ -29,7 +29,7 @@ func TestProxyTrust_Trusts(t *testing.T) {
 	}
 
 	// Empty = trust nobody; nil-safe.
-	empty := newProxyTrust(nil, nil)
+	empty := newProxyTrust(nil, nil, false)
 	if empty.enabled() {
 		t.Error("empty trust should be disabled")
 	}

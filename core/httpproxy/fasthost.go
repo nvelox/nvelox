@@ -179,14 +179,14 @@ func (h fastHost) Trusted(peer net.IP) bool { return h.g.proxyTrust().TrustsIP(p
 // Header parses the PROXY v2 header at the start of a trusted relay's
 // plain-HTTP connection; one that does not pass (malformed, a bad
 // signature) is counted and the connection closed.
-func (h fastHost) Header(relay net.IP, data []byte) (int, *net.TCPAddr) {
+func (h fastHost) Header(relay netip.AddrPort, data []byte) (int, *net.TCPAddr) {
 	done, hdr, consumed, perr := proxy.ParseStreamStrict(data)
 	if !done {
 		return 0, nil
 	}
-	client, reason, cause := proxyClient(h.g.proxyTrust(), hdr, perr)
+	client, reason, cause := proxyClient(h.g.proxyTrust(), hdr, perr, relay.Port())
 	if reason != "" {
-		h.g.proxyRejected(&net.TCPAddr{IP: relay}, reason, cause)
+		h.g.proxyRejected(net.TCPAddrFromAddrPort(relay), reason, cause)
 		return -1, nil
 	}
 	return consumed, client
@@ -214,7 +214,7 @@ func (h fastHost) Read(c net.Conn) (*net.TCPAddr, bool) {
 		return nil, true
 	}
 	hdr, err := proxy.ReadStreamHeader(c)
-	client, reason, cause := proxyClient(tr, hdr, err)
+	client, reason, cause := proxyClient(tr, hdr, err, remotePort(remote))
 	if reason != "" {
 		h.g.proxyRejected(remote, reason, cause)
 		return nil, false
@@ -233,14 +233,14 @@ func (h fastHost) Datagram(state *any, from netip.AddrPort, d []byte, now int64)
 	if !tr.Enabled() || !trustsAddr(tr, from.Addr()) {
 		return d, netip.AddrPort{}, true
 	}
-	payload, client, reason, cause := h3RelayHeader(tr, d)
+	payload, client, counter, counted, reason, cause := h3RelayHeader(tr, d, from.Port())
 	if reason == "" {
 		pins, _ := (*state).(*h3Pins)
 		if pins == nil {
 			pins = &h3Pins{}
 			*state = pins
 		}
-		reason, cause = pins.pin(from, client, now)
+		reason, cause = pins.pin(from, client, now, counter, counted)
 	}
 	if reason != "" {
 		h.g.proxyRejected(net.UDPAddrFromAddrPort(from), reason, cause)
@@ -343,7 +343,7 @@ func (s *HTTPServer) fastBackend(name string) *web.Backend {
 	}
 	if sendsProxy(be) {
 		b.ProxyHeaderVaries = len(be.SendProxyKey) > 0 // a signed header carries its time
-		b.ProxyHeader = func(client, local net.Addr) ([]byte, error) {
+		b.ProxyHeader = func(client, local net.Addr, _ netip.AddrPort) ([]byte, error) {
 			if key := be.SendProxyKey; len(key) > 0 {
 				return backendProxyHeader(client, local, key, time.Now())
 			}

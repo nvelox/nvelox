@@ -258,6 +258,15 @@ type Listener struct {
 	// Every key in the file is accepted, so keys can be rotated: add the new
 	// key here, then sign with it, then remove the old one.
 	AcceptProxyKeyFile string `yaml:"accept_proxy_key_file,omitempty"`
+	// AcceptProxyReplayWindow is what a signed header must carry. A header
+	// signed with a counter (signature version 2) is bound to the relay
+	// socket that sent it and refused when its counter was taken before or
+	// is older than that socket's last 64: a copy of it does not pass.
+	// "when_present" (the default) also takes a header signed without one
+	// (version 1, from a relay not updated yet); "required" takes only
+	// headers with a counter, once every relay sends them. Needs
+	// accept_proxy_key_file.
+	AcceptProxyReplayWindow string `yaml:"accept_proxy_replay_window,omitempty"`
 	// AcceptProxyKeys is loaded from AcceptProxyKeyFile by Load.
 	AcceptProxyKeys [][]byte `yaml:"-"`
 	// AcceptProxyInterfaces (udp listeners, Linux): a PROXY header is trusted
@@ -608,6 +617,10 @@ func validateBackendTimeouts(b Backend) error {
 	}
 	return nil
 }
+
+// ReplayWindowRequired reports whether a signed header must carry a counter
+// (accept_proxy_replay_window: required).
+func (l Listener) ReplayWindowRequired() bool { return l.AcceptProxyReplayWindow == "required" }
 
 // validateFastCGITimeouts checks a fastcgi route's timeouts: connect and
 // response_header, as on an HTTP backend; the others would do nothing on a
@@ -1001,6 +1014,14 @@ func validate(cfg *Config) error {
 		}
 		if l.AcceptProxyKeyFile != "" && len(l.AcceptProxyFrom) == 0 {
 			return fmt.Errorf("listener %s: accept_proxy_key_file needs accept_proxy_from (the peers whose signed headers are trusted)", l.Name)
+		}
+		switch l.AcceptProxyReplayWindow {
+		case "", "when_present", "required":
+		default:
+			return fmt.Errorf("listener %s: accept_proxy_replay_window %q: want when_present or required", l.Name, l.AcceptProxyReplayWindow)
+		}
+		if l.AcceptProxyReplayWindow != "" && l.AcceptProxyKeyFile == "" {
+			return fmt.Errorf("listener %s: accept_proxy_replay_window needs accept_proxy_key_file: only a signed header carries a counter", l.Name)
 		}
 		if len(l.AcceptProxyInterfaces) > 0 {
 			if l.Protocol != "udp" {
@@ -1492,8 +1513,9 @@ func validateBindGroups(listeners []Listener) error {
 		// site, so every site on the port answers for the same relays.
 		if proto == "http" || proto == "https" {
 			for _, s := range sites[1:] {
-				if !sameStrings(s.AcceptProxyFrom, sites[0].AcceptProxyFrom) || s.AcceptProxyKeyFile != sites[0].AcceptProxyKeyFile {
-					return fmt.Errorf("bind %s: listeners %s and %s share a port but differ in accept_proxy_from or accept_proxy_key_file",
+				if !sameStrings(s.AcceptProxyFrom, sites[0].AcceptProxyFrom) || s.AcceptProxyKeyFile != sites[0].AcceptProxyKeyFile ||
+					s.ReplayWindowRequired() != sites[0].ReplayWindowRequired() {
+					return fmt.Errorf("bind %s: listeners %s and %s share a port but differ in accept_proxy_from, accept_proxy_key_file or accept_proxy_replay_window",
 						bind, sites[0].Name, s.Name)
 				}
 			}

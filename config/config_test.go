@@ -730,6 +730,20 @@ func TestValidateBindGroups_OK(t *testing.T) {
 				return []Listener{a, b}
 			}(),
 		},
+		{
+			// when_present is the default: written or not, the same.
+			name: "replay window when_present and unset",
+			in: func() []Listener {
+				a := mkListener("a", ":443", "https")
+				a.DefaultServer = true
+				a.AcceptProxyFrom, a.AcceptProxyKeyFile = []string{"10.0.0.0/8"}, "/k"
+				a.AcceptProxyReplayWindow = "when_present"
+				b := mkListener("b", ":443", "https")
+				b.ServerNames = []string{"b.com"}
+				b.AcceptProxyFrom, b.AcceptProxyKeyFile = []string{"10.0.0.0/8"}, "/k"
+				return []Listener{a, b}
+			}(),
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -770,6 +784,27 @@ func TestValidateBindGroups_Rejections(t *testing.T) {
 				}(),
 			},
 			want: "accept_proxy_from",
+		},
+		{
+			// The sites of a port share its relays' headers: they read them
+			// the same way.
+			name: "different replay windows on one bind",
+			in: []Listener{
+				func() Listener {
+					l := mkListener("a", ":443", "https")
+					l.DefaultServer = true
+					l.AcceptProxyFrom, l.AcceptProxyKeyFile = []string{"10.0.0.0/8"}, "/k"
+					l.AcceptProxyReplayWindow = "required"
+					return l
+				}(),
+				func() Listener {
+					l := mkListener("b", ":443", "https")
+					l.ServerNames = []string{"b.com"}
+					l.AcceptProxyFrom, l.AcceptProxyKeyFile = []string{"10.0.0.0/8"}, "/k"
+					return l
+				}(),
+			},
+			want: "accept_proxy_replay_window",
 		},
 		{
 			name: "two default_server",

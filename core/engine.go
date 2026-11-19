@@ -682,6 +682,7 @@ func (e *Engine) Reload(cfg *config.Config) error {
 			continue
 		}
 		running.proxyTrust.setKeys(keys)
+		running.proxyTrust.shared().SetReplayWindow(l.proxyTrust.shared().ReplayWindowRequired())
 	}
 	warnInsecureBackendTLS(cfg.Backends)
 	e.Config = cfg
@@ -923,7 +924,7 @@ func ExpandListeners(listeners []config.Listener) ([]*ListenerConfig, error) {
 			ACL:             l.ACL,
 			TrustedProxies:  l.TrustedProxies,
 			AcceptProxyFrom: l.AcceptProxyFrom,
-			proxyTrust:      newProxyTrust(l.AcceptProxyFrom, l.AcceptProxyKeys),
+			proxyTrust:      newProxyTrust(l.AcceptProxyFrom, l.AcceptProxyKeys, l.ReplayWindowRequired()),
 			proxyInterfaces: l.AcceptProxyInterfaces,
 			accessLogOff:    new(atomic.Bool),
 			ServerNames:     l.ServerNames,

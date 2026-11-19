@@ -98,6 +98,11 @@ type ConnContext struct {
 	sessionIP    netip.Addr
 	limiter      *ConnLimiter
 	resolvedSrc  net.Addr
+	// win is the relay socket's replay window, from its first counted
+	// header on; winReleased: the session no longer uses it. Both under
+	// the listener socket's mu (udpListenSock.takeCounter).
+	win          *relayWindow
+	winReleased  bool
 	refused      string
 	refusedQuiet bool // refused, and its source has had its line in the access log lately
 	closed       bool
@@ -297,6 +302,7 @@ func (h *ProxyEventHandler) OnClose(c *udpConn, err error) {
 	if ctx == nil {
 		return
 	}
+	c.sock.releaseWindow(ctx)
 
 	ctx.Mu.Lock()
 	peer := ctx.PeerConn
@@ -382,9 +388,14 @@ func (h *ProxyEventHandler) OnData(c *udpConn, data []byte) {
 		if hdr != nil {
 			src = hdr.SourceAddr
 			// With accept_proxy_key_file the header must be signed over this
-			// datagram: a forged relay datagram cannot name a client.
-			if err := l.proxyTrust.verify(hdr, data[consumed:], true); err != nil {
-				h.udpDrops.note(udpDropBadSignature, listenerName(l), c.RemoteAddr())
+			// datagram: a forged relay datagram cannot name a client, and a
+			// copy of one is refused by its relay socket's window.
+			counter, counted, drop := l.proxyTrust.relayDatagram(hdr, data[consumed:], c.remote.Port())
+			if drop == "" && counted && !c.sock.takeCounter(ctx, c.remote, counter) {
+				drop = udpDropReplayed
+			}
+			if drop != "" {
+				h.udpDrops.note(drop, listenerName(l), c.RemoteAddr())
 				ctx.Mu.Lock()
 				pending := ctx.relayPending
 				ctx.Mu.Unlock()

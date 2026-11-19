@@ -73,28 +73,10 @@ func (p *Trust) Keys() [][]byte {
 	return nil
 }
 
-// Verify checks a trusted peer's header h, which arrived in a datagram or
-// on a stream: with keys configured it must name that transport (a signed
-// stream header replayed as a datagram is refused) and carry a valid
-// signature over payload (the datagram after the header; nil for a stream).
-// Without keys every header passes.
-func (p *Trust) Verify(h *proxyproto.Header, payload []byte, datagram bool) error {
-	if p == nil {
-		return nil
-	}
-	keys := p.keys.Load()
-	if keys == nil {
-		return nil
-	}
-	if datagram && !h.TransportProtocol.IsDatagram() || !datagram && !h.TransportProtocol.IsStream() {
-		return fmt.Errorf("%w: its transport protocol is not the connection's", ErrSignatureMalformed)
-	}
-	return Verify(h, *keys, payload, time.Now())
-}
-
 // VerifyFrom checks a trusted peer's header h, which came from the relay
 // socket port relayPort in a datagram or on a stream: with keys configured
-// it must name that transport and carry a valid signature over payload (the
+// it must name that transport (a signed stream header sent again as a
+// datagram is refused) and carry a valid signature over payload (the
 // datagram after the header; nil for a stream), made for that port when it
 // has a counter (version 2). It returns the counter, for the relay socket's
 // ReplayWindow, with counted true; a version 1 signature has none (counted
@@ -174,6 +156,7 @@ const (
 	RefusedMalformed = "malformed" // a header that does not parse, is cut short, or names no stream client
 	RefusedSignature = "signature" // keys are set and the signature is absent or wrong
 	RefusedTimeout   = "timeout"   // the header did not complete in time
+	RefusedReplayed  = "replayed"  // a datagram whose relay socket's counter was taken before, or is too old (ReplayWindow)
 	// NothingSent is not a refusal: the relay closed its connection, or
 	// stayed silent to the limit, without sending a byte (a TCP health
 	// check, a spare connection). Such a connection is closed like any
@@ -185,12 +168,13 @@ const (
 var ErrNotStream = errors.New("proxy protocol: the header names no stream client")
 
 // StreamClient turns what a trusted relay sent at the start of a stream
-// (the result of ReadStreamHeader or ParseStreamStrict) into the client's
-// address. It returns nil and no reason for a LOCAL header (the relay
-// speaks for itself: it is the client), and nil with a reason when the
-// connection is to be closed; cause is then the error behind the reason,
-// for the log (which signature check failed, what the read returned).
-func (p *Trust) StreamClient(hdr *proxyproto.Header, err error) (client *net.TCPAddr, reason string, cause error) {
+// from its port relayPort (the result of ReadStreamHeader or
+// ParseStreamStrict) into the client's address. It returns nil and no
+// reason for a LOCAL header (the relay speaks for itself: it is the
+// client), and nil with a reason when the connection is to be closed; cause
+// is then the error behind the reason, for the log (which signature check
+// failed, what the read returned).
+func (p *Trust) StreamClient(hdr *proxyproto.Header, err error, relayPort uint16) (client *net.TCPAddr, reason string, cause error) {
 	var ne net.Error
 	switch {
 	case err == nil:
@@ -210,7 +194,7 @@ func (p *Trust) StreamClient(hdr *proxyproto.Header, err error) (client *net.TCP
 	if !ok || ta.IP == nil {
 		return nil, RefusedMalformed, ErrNotStream
 	}
-	if verr := p.Verify(hdr, nil, false); verr != nil {
+	if _, _, verr := p.VerifyFrom(hdr, nil, false, relayPort); verr != nil {
 		return nil, RefusedSignature, verr
 	}
 	return ta, "", nil

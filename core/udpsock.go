@@ -74,11 +74,12 @@ type udpListenSock struct {
 	viaInterface bool
 	readTimeout  time.Duration // udpClientReadTimeout of the engine
 
-	mu     sync.Mutex
-	conns  map[netip.AddrPort]*udpConn
-	closed bool
-	done   chan struct{}
-	wg     sync.WaitGroup
+	mu      sync.Mutex
+	conns   map[netip.AddrPort]*udpConn
+	windows relayWindows // the relay sockets' replay windows
+	closed  bool
+	done    chan struct{}
+	wg      sync.WaitGroup
 }
 
 func newUDPListenSock(pc *net.UDPConn, h *ProxyEventHandler, viaInterface bool) *udpListenSock {
@@ -105,6 +106,34 @@ func (s *udpListenSock) forget(c *udpConn) {
 	if s.conns[c.remote] == c {
 		delete(s.conns, c.remote)
 	}
+	s.mu.Unlock()
+}
+
+// takeCounter takes counter, from a counted header of the relay socket at
+// remote, in that socket's replay window, which the session ctx uses from
+// its first such header on: false when the socket sent it before or it is
+// older than the window.
+func (s *udpListenSock) takeCounter(ctx *ConnContext, remote netip.AddrPort, counter uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ctx.win == nil {
+		now := time.Now().UnixNano()
+		ctx.win = s.windows.attach(remote, now)
+		if ctx.winReleased { // a datagram that came as the session ended
+			s.windows.detach(ctx.win, now)
+		}
+	}
+	return ctx.win.Take(counter)
+}
+
+// releaseWindow: the session ctx is over. The window it used stays for the
+// next sessions of its relay socket (relayWindows.detach).
+func (s *udpListenSock) releaseWindow(ctx *ConnContext) {
+	s.mu.Lock()
+	if ctx.win != nil && !ctx.winReleased {
+		s.windows.detach(ctx.win, time.Now().UnixNano())
+	}
+	ctx.winReleased = true
 	s.mu.Unlock()
 }
 

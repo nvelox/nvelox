@@ -30,7 +30,10 @@ import (
 //     answers the relay, which answers the client.
 //   - The relay's address (its socket for that client) is pinned to the
 //     client the header named. A later datagram from it that names another
-//     client is dropped: a relay's socket has one client.
+//     client is dropped: a relay's socket has one client. A header signed
+//     with a counter (accept_proxy_replay_window) is bound to the relay
+//     socket's port, and its counter is checked against that socket's
+//     window, kept with its pin: a copy of a datagram is dropped.
 //   - Requests of a QUIC connection whose peer is a relay are given the
 //     pinned client as their remote address (BindGroup.ServeHTTP), so the
 //     access policy, the limits, the log and X-Forwarded-For see the
@@ -44,7 +47,9 @@ const (
 	// the idle timeout of the quic-go server's connections (30 s), so the
 	// connection a pin served there is gone by then. A connection on the
 	// loops may live longer (the listener's idle timeout): it keeps the
-	// client it began with itself (qconn.relayed).
+	// client it began with itself (qconn.relayed). It is also twice
+	// proxy.SignatureWindow: a pin's window of counters is kept that long,
+	// as long as a header it took can pass its time check.
 	h3RelayPinTTL = 60 * time.Second
 	// h3RelayPinsMax bounds the pins of one socket. Datagrams of a relay
 	// socket that would need one more are dropped.
@@ -66,7 +71,8 @@ var errH3RelayClientChanged = errors.New("the relay's socket named another clien
 
 type h3Pin struct {
 	client netip.AddrPort
-	seen   int64 // unix nanoseconds
+	seen   int64              // unix nanoseconds
+	replay proxy.ReplayWindow // the relay socket's counters
 }
 
 // h3Pins is the pin table of one socket: which client each relay socket
@@ -121,52 +127,57 @@ func (c *h3RelayConn) ReadFrom(p []byte) (int, net.Addr, error) {
 // relayed checks a datagram from the trusted relay socket from and returns
 // what follows its header, or why it is dropped.
 func (c *h3RelayConn) relayed(tr *proxy.Trust, from netip.AddrPort, data []byte) (payload []byte, reason string, cause error) {
-	payload, client, reason, cause := h3RelayHeader(tr, data)
+	payload, client, counter, counted, reason, cause := h3RelayHeader(tr, data, from.Port())
 	if reason != "" {
 		return nil, reason, cause
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if reason, cause = c.pin(from, client, time.Now().UnixNano()); reason != "" {
+	if reason, cause = c.pin(from, client, time.Now().UnixNano(), counter, counted); reason != "" {
 		return nil, reason, cause
 	}
 	return payload, "", nil
 }
 
-// h3RelayHeader checks the header of a datagram from a trusted relay (it
-// must name a datagram client and be signed over what follows it) and
-// returns what follows it and the client it names, or why the datagram is
+// h3RelayHeader checks the header of a datagram from a trusted relay's
+// socket at port relayPort (it must name a datagram client and be signed
+// over what follows it) and returns what follows it, the client it names
+// and the counter it carries (counted false: none), or why the datagram is
 // dropped.
-func h3RelayHeader(tr *proxy.Trust, data []byte) (payload []byte, client netip.AddrPort, reason string, cause error) {
+func h3RelayHeader(tr *proxy.Trust, data []byte, relayPort uint16) (payload []byte, client netip.AddrPort, counter uint64, counted bool, reason string, cause error) {
 	hdr, consumed, err := proxy.ParseDatagramStrict(data)
 	switch {
 	case errors.Is(err, proxy.ErrNoHeader):
-		return nil, client, proxy.RefusedMissing, err
+		return nil, client, 0, false, proxy.RefusedMissing, err
 	case err != nil:
-		return nil, client, proxy.RefusedMalformed, err
+		return nil, client, 0, false, proxy.RefusedMalformed, err
 	}
 	payload = data[consumed:]
 	// Without keys nothing could tell a relay's datagram from one with a
 	// forged source address (the configuration is refused at load; a
 	// reload that drops the key file must not open this).
 	if len(tr.Keys()) == 0 {
-		return nil, client, proxy.RefusedSignature, proxy.ErrSignatureMissing
+		return nil, client, 0, false, proxy.RefusedSignature, proxy.ErrSignatureMissing
 	}
-	if err := tr.Verify(hdr, payload, true); err != nil {
-		return nil, client, proxy.RefusedSignature, err
+	counter, counted, err = tr.VerifyFrom(hdr, payload, true, relayPort)
+	if err != nil {
+		return nil, client, 0, false, proxy.RefusedSignature, err
 	}
 	ua := hdr.SourceAddr.(*net.UDPAddr)
 	ip, ok := netip.AddrFromSlice(ua.IP)
 	if !ok {
-		return nil, client, proxy.RefusedMalformed, proxy.ErrBadHeader
+		return nil, client, 0, false, proxy.RefusedMalformed, proxy.ErrBadHeader
 	}
-	return payload, netip.AddrPortFrom(ip.Unmap(), uint16(ua.Port)), "", nil
+	return payload, netip.AddrPortFrom(ip.Unmap(), uint16(ua.Port)), counter, counted, "", nil
 }
 
 // pin notes, at the time now, that the relay socket from stands for
 // client, or says why its datagram is dropped: the socket named another
-// client less than h3RelayPinTTL ago, or the table is full.
-func (t *h3Pins) pin(from, client netip.AddrPort, now int64) (reason string, cause error) {
+// client less than h3RelayPinTTL ago, the table is full, or the header's
+// counter (counted) was taken from that relay socket before or is older
+// than its window. A pin that has expired keeps its window until it is
+// swept (h3Pins.sweep).
+func (t *h3Pins) pin(from, client netip.AddrPort, now int64, counter uint64, counted bool) (reason string, cause error) {
 	if t.pins == nil {
 		t.pins = make(map[netip.AddrPort]h3Pin)
 	}
@@ -183,7 +194,11 @@ func (t *h3Pins) pin(from, client netip.AddrPort, now int64) (reason string, cau
 			return h3RelayTableFull, nil
 		}
 	}
-	t.pins[from] = h3Pin{client: client, seen: now}
+	if counted && !pin.replay.Take(counter) {
+		return proxy.RefusedReplayed, proxy.ErrReplayed
+	}
+	pin.client, pin.seen = client, now
+	t.pins[from] = pin
 	return "", nil
 }
 
@@ -198,11 +213,13 @@ func trustsAddr(tr *proxy.Trust, a netip.Addr) bool {
 	return tr.TrustsIP(b[:])
 }
 
-// sweep removes the pins unused for h3RelayPinTTL.
+// sweep removes the pins unused for more than h3RelayPinTTL, and their
+// windows with them: by then a header a pin took passes its time check no
+// longer (h3RelayPinTTL is at least twice proxy.SignatureWindow).
 func (t *h3Pins) sweep(now int64) {
 	t.swept = now
 	for k, p := range t.pins {
-		if now-p.seen >= int64(h3RelayPinTTL) {
+		if now-p.seen > int64(h3RelayPinTTL) {
 			delete(t.pins, k)
 		}
 	}

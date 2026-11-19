@@ -51,6 +51,7 @@ const (
 	udpDropNoProxyHeader = "no_proxy_header" // trusted relay datagram without a valid PROXY v2 header
 	udpDropClientChanged = "client_changed"  // trusted relay datagram naming another client than the session's
 	udpDropBadSignature  = "bad_signature"   // trusted relay datagram whose header signature is missing or wrong (accept_proxy_key_file)
+	udpDropReplayed      = "replayed"        // trusted relay datagram whose counter its relay socket sent before, or older than its window (accept_proxy_replay_window)
 	// The backend wants the PROXY v2 header with every datagram
 	// (send_proxy_v2), and a datagram never goes to it without one: where
 	// the backend expects the header, a client could put one of its own
@@ -208,6 +209,7 @@ var udpDropText = map[string]string{
 	udpDropNoProxyHeader: "datagrams from a trusted relay without a valid PROXY v2 header",
 	udpDropClientChanged: "datagrams from a trusted relay naming another client than the session's",
 	udpDropBadSignature:  "datagrams from a trusted relay without a valid header signature",
+	udpDropReplayed:      "datagrams from a trusted relay whose header's counter its socket sent before, or is older than its window (a copy)",
 
 	udpDropNoBackendHeader: "sessions refused: their backend wants the PROXY v2 header (send_proxy_v2), which cannot be built for the client",
 	udpDropHeaderChanged:   "sessions ended: a reload changed send_proxy_v2 of their backend",

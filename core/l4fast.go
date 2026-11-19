@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"time"
 
@@ -168,7 +169,7 @@ func (f *l4FastServer) Target(s *relay.TCPSession) (relay.TCPTarget, bool) {
 		// PROXY v2 to the backend: the source is the client, the
 		// destination the address the client connected to.
 		key := backend.SendProxyKey
-		t.Preface = func(src, dst *net.TCPAddr) ([]byte, error) {
+		t.Preface = func(src, dst *net.TCPAddr, _ netip.AddrPort) ([]byte, error) {
 			header := proxyproto.HeaderProxyFromAddrs(2, src, dst)
 			if len(key) > 0 {
 				if err := proxy.SignHeader(header, key, time.Now()); err != nil {
