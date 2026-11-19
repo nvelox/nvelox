@@ -103,7 +103,7 @@ Every table and chart, latency, CPU and memory of each proxy, the setup and how 
 - **PROXY Protocol v2** — pass client IP to TCP, UDP and HTTP backends in HAProxy format (`send_proxy_v2`; for HTTP, every backend connection serves one client connection); accept it from trusted relays (`accept_proxy_from`) on TCP, UDP, HTTP and HTTPS listeners (HTTP/1.1, HTTP/2 and HTTP/3); a listed relay must send it, and is never taken for the client of what it relays
 - **DNS Service Discovery** — periodic hostname resolution with auto-update
 - **Modular Config** — split configs via `include` glob patterns
-- **Config Validation** — comprehensive validation at load time; keys that are parsed but not implemented (`sni_routes`, `throttle`, `tls.ocsp_stapling`, `routes[].scripts`) are rejected with an error naming the key, and `server.pid_file` / `workers` print a startup warning. Started as root with `server.user` / `group`, nvelox binds its ports and then switches to that user
+- **Config Validation** — comprehensive validation at load time. A key that no setting reads is refused with the file, the line and the nearest real key (`nvelox.yaml:42:5: unknown setting "ip_denylst" in listeners[0] (did you mean "ip_denylist"?)`), in the main file and in every included one, so a misspelled setting cannot start and quietly do nothing. Keys that are parsed but not implemented (`tracing`, `server.workers`, and on a listener `zero_copy`, `grpc`, `tls.auto_cert`, `tls.ocsp_stapling`, `sni_routes`, `throttle`, `buffering.request_body_buffer`, `routes[].scripts`) are rejected with an error naming the key. Started as root with `server.user` / `group`, nvelox binds its ports, writes `server.pid_file` when one is set, and then switches to that user
 
 ## Architecture
 

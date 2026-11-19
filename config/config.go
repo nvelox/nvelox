@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -44,7 +45,8 @@ type AdminConfig struct {
 	APIKey  string `yaml:"api_key"` // Required when enabled (startup error without it); sent as X-API-Key
 }
 
-// TracingConfig defines OpenTelemetry tracing settings.
+// TracingConfig defines OpenTelemetry tracing settings. NOT IMPLEMENTED: a
+// config that sets any of them is rejected at load (no trace would be sent).
 type TracingConfig struct {
 	Enabled  bool   `yaml:"enabled"`
 	Endpoint string `yaml:"endpoint"` // OTLP endpoint
@@ -80,13 +82,18 @@ type RequestIDConfig struct {
 
 type ServerConfig struct {
 	// User and Group: started as root, nvelox switches to them once it has
-	// bound its ports (core/privdrop). PidFile and Workers are accepted for
-	// config compatibility but not implemented: nvelox writes no pid file and
-	// always runs one process; ServerWarnings reports them at startup.
-	User    string `yaml:"user"`
-	Group   string `yaml:"group"`
+	// bound its ports (core/privdrop).
+	User  string `yaml:"user"`
+	Group string `yaml:"group"`
+	// PidFile is where nvelox writes its process ID once every port is
+	// bound, before it switches to User (so the file can live in a
+	// directory only root writes to); a clean stop removes it when the
+	// process still may (core/pidfile). Read at start: a reload does not
+	// move it. Empty (default): no pid file.
 	PidFile string `yaml:"pid_file"`
-	Workers int    `yaml:"workers,omitempty"`
+	// Workers is NOT IMPLEMENTED: a value above 0 is rejected at load
+	// (nvelox runs one process with one event loop per CPU core).
+	Workers int `yaml:"workers,omitempty"`
 	// GatewayID identifies THIS gateway on every HTTP access-log line as
 	// gw=<id>, so a request can be attributed to the gateway that first
 	// received it. Empty (default) → os.Hostname() is used at startup.
@@ -153,9 +160,9 @@ type Listener struct {
 	Name     string `yaml:"name"`
 	Bind     string `yaml:"bind"`     // e.g., ":80" or "*:1024-2048"
 	Protocol string `yaml:"protocol"` // "tcp", "udp", "http", "https"
-	// ZeroCopy is accepted for config compatibility but currently has no
-	// effect: L4 TCP sessions are relayed with a 16 KiB buffered copy per
-	// direction (core/relay.go). Kernel splice is not implemented.
+	// ZeroCopy is NOT IMPLEMENTED: true is rejected at load. L4 TCP sessions
+	// are relayed with a buffered copy per direction; kernel splice does
+	// not exist.
 	ZeroCopy bool `yaml:"zero_copy"`
 
 	// Backend names the upstream pool. For TCP/UDP listeners it's the
@@ -270,7 +277,7 @@ type Listener struct {
 	Root        string            `yaml:"root,omitempty"`        // Document root for static files
 	Buffering   BufferingConfig   `yaml:"buffering,omitempty"`
 	Cache       CacheConfig       `yaml:"cache,omitempty"`
-	GRPC        bool              `yaml:"grpc,omitempty"`       // Enable gRPC-aware proxying
+	GRPC        bool              `yaml:"grpc,omitempty"`       // NOT IMPLEMENTED: rejected at load when true (gRPC is proxied to backend_tls backends without it)
 	Throttle    ThrottleConfig    `yaml:"throttle,omitempty"`   // NOT IMPLEMENTED: rejected at load when set
 	RequestID   RequestIDConfig   `yaml:"request_id,omitempty"` // Edge correlation-id (X-Request-ID)
 
@@ -284,9 +291,10 @@ type Listener struct {
 // own access_log, else on (Load fills that in from logging.access).
 func (l *Listener) AccessLogOn() bool { return l.AccessLog == nil || *l.AccessLog }
 
-// BufferingConfig defines request/response buffer sizes.
+// BufferingConfig defines request/response buffer sizes. RequestBodyBuffer
+// is NOT IMPLEMENTED: a listener that sets it is rejected at load.
 type BufferingConfig struct {
-	RequestBodyBuffer string `yaml:"request_body_buffer,omitempty"` // e.g., "64KB"
+	RequestBodyBuffer string `yaml:"request_body_buffer,omitempty"` // NOT IMPLEMENTED: rejected at load when set
 	ResponseBuffer    string `yaml:"response_buffer,omitempty"`     // e.g., "256KB"
 }
 
@@ -352,11 +360,11 @@ type RateLimitConfig struct {
 // (chosen by SNI), and a request whose Host names a client_auth site on a
 // connection whose SNI selected another site is answered 421. ClientCA is a
 // PEM CA bundle: required by "require", only valid with client_auth set.
-// OCSPStapling is NOT IMPLEMENTED: true is rejected at load.
+// OCSPStapling and AutoCert are NOT IMPLEMENTED: true is rejected at load.
 type TLSConfig struct {
 	Cert         string `yaml:"cert"`
 	Key          string `yaml:"key"`
-	AutoCert     bool   `yaml:"auto_cert"`
+	AutoCert     bool   `yaml:"auto_cert"`               // NOT IMPLEMENTED: rejected at load when true
 	OCSPStapling bool   `yaml:"ocsp_stapling,omitempty"` // NOT IMPLEMENTED: rejected at load when true
 	ClientAuth   string `yaml:"client_auth,omitempty"`   // "require", "request", "none"
 	ClientCA     string `yaml:"client_ca,omitempty"`     // CA cert for client verification
@@ -711,6 +719,12 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
+	// A key no setting reads (a misspelled one, or one written a level off)
+	// is refused: it would be a setting that silently changes nothing
+	// (strict.go).
+	if err := checkKeys(data, path, reflect.TypeOf(cfg)); err != nil {
+		return nil, err
+	}
 
 	// Process Include.
 	//
@@ -734,6 +748,18 @@ func Load(path string) (*Config, error) {
 			var subCfg Config
 			if err := yaml.Unmarshal(subData, &subCfg); err != nil {
 				return nil, fmt.Errorf("failed to parse included config %s: %w", match, err)
+			}
+			// An included file adds listeners and backends, nothing else:
+			// any other setting in it, and any unknown key, is refused
+			// rather than dropped without a word.
+			if err := checkIncludeKeys(subData, match); err != nil {
+				return nil, err
+			}
+			if err := checkKeys(subData, match, reflect.TypeOf(subCfg)); err != nil {
+				return nil, err
+			}
+			if subCfg.Version != "" && subCfg.Version != cfg.Version {
+				return nil, fmt.Errorf("%s: version %q differs from the main config file's %q", match, subCfg.Version, cfg.Version)
 			}
 
 			// Append lists
@@ -850,6 +876,9 @@ func validate(cfg *Config) error {
 		return fmt.Errorf("server.shutdown_timeout: %v", err)
 	}
 	if err := validateHTTP3(cfg.Server.HTTP3); err != nil {
+		return err
+	}
+	if err := rejectUnimplementedServerKeys(cfg); err != nil {
 		return err
 	}
 
@@ -1106,11 +1135,36 @@ func validate(cfg *Config) error {
 	return nil
 }
 
+// rejectUnimplementedServerKeys refuses the top-level and server.* keys
+// that are parsed but have no implementation (tracing, server.workers).
+func rejectUnimplementedServerKeys(cfg *Config) error {
+	if t := cfg.Tracing; t.Enabled || t.Endpoint != "" || t.Service != "" {
+		return fmt.Errorf("tracing is not implemented (no trace would be sent); remove it")
+	}
+	if cfg.Server.Workers > 0 {
+		return fmt.Errorf("server.workers is not implemented (nvelox runs one process with one event loop per CPU core); remove it")
+	}
+	return nil
+}
+
 // rejectUnimplementedListenerKeys refuses listener keys that are parsed but
 // have no implementation (sni_routes, throttle, tls.ocsp_stapling,
+// tls.auto_cert, zero_copy, grpc, buffering.request_body_buffer,
 // routes[].scripts). Each would otherwise be a control that silently does
 // nothing.
 func rejectUnimplementedListenerKeys(l Listener) error {
+	if l.ZeroCopy {
+		return fmt.Errorf("listener %s: zero_copy is not implemented (connections are relayed through a buffer per direction; no kernel splice would happen); remove it", l.Name)
+	}
+	if l.GRPC {
+		return fmt.Errorf("listener %s: grpc is not implemented (it changes nothing: gRPC is proxied to backend_tls backends with or without it); remove it", l.Name)
+	}
+	if l.TLS.AutoCert {
+		return fmt.Errorf("listener %s: tls.auto_cert is not implemented (no certificate would be requested or renewed); remove it and set tls.cert and tls.key", l.Name)
+	}
+	if l.Buffering.RequestBodyBuffer != "" {
+		return fmt.Errorf("listener %s: buffering.request_body_buffer is not implemented (nothing reads it); remove it", l.Name)
+	}
 	if len(l.SNIRoutes) > 0 {
 		return fmt.Errorf("listener %s: sni_routes is not implemented (no TLS passthrough routing by SNI would happen); remove it", l.Name)
 	}
@@ -1279,22 +1333,15 @@ func everyAddress(bind string) bool {
 	return ip != nil && ip.IsUnspecified()
 }
 
-// ServerWarnings returns one warning per server.* key that is set but not
-// implemented: pid_file and workers, and the keys of server.http3 that
-// change nothing on this platform. main prints these at startup. They are
-// warnings, not errors, because deployed configs carry these keys.
+// ServerWarnings returns one warning per key of server.http3 that changes
+// nothing on this platform. main prints these at startup. (A key that
+// changes nothing on every platform is refused at load instead:
+// rejectUnimplementedServerKeys.)
 func ServerWarnings(s ServerConfig) []string { return serverWarnings(s, runtime.GOOS) }
 
 // serverWarnings is ServerWarnings on the platform goos.
 func serverWarnings(s ServerConfig, goos string) []string {
-	var out []string
-	if s.PidFile != "" {
-		out = append(out, fmt.Sprintf("server.pid_file (%q) is set but not implemented: nvelox does not write a pid file", s.PidFile))
-	}
-	if s.Workers > 0 {
-		out = append(out, fmt.Sprintf("server.workers (%d) is set but not implemented: nvelox always runs as one process", s.Workers))
-	}
-	return append(out, http3Warnings(s.HTTP3, goos)...)
+	return http3Warnings(s.HTTP3, goos)
 }
 
 // validateServerName checks a server_names entry. Allows exact hostnames and

@@ -170,11 +170,12 @@ func TestHTTP3_Warnings(t *testing.T) {
 	if w := http3Warnings(HTTP3Config{}, "darwin"); len(w) != 0 {
 		t.Errorf("nothing set: warnings %q", w)
 	}
-	// The startup warnings carry them, behind those of the other keys.
+	// The startup warnings carry them, and nothing for server.pid_file,
+	// which is implemented.
 	got := serverWarnings(ServerConfig{PidFile: "/run/nvelox.pid", HTTP3: all}, "darwin")
-	if len(got) != 5 || !strings.Contains(got[0], "server.pid_file") || !strings.Contains(got[3], "server.http3.max_receive_memory") ||
-		!strings.Contains(got[4], "server.http3.socket_buffer") {
-		t.Errorf("the startup warnings on darwin: %q, want server.pid_file's and the four of server.http3", got)
+	if len(got) != 4 || !strings.Contains(got[2], "server.http3.max_receive_memory") ||
+		!strings.Contains(got[3], "server.http3.socket_buffer") {
+		t.Errorf("the startup warnings on darwin: %q, want the four of server.http3", got)
 	}
 	if got := ServerWarnings(ServerConfig{HTTP3: all}); len(got) != len(http3Warnings(all, runtime.GOOS)) {
 		t.Errorf("ServerWarnings on this platform: %q", got)

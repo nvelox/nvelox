@@ -35,9 +35,6 @@ func TestRun_Full(t *testing.T) {
 	configPath := filepath.Join(tmpDir, "test.yaml")
 	configContent := `
 version: '2'
-server:
-  host: "127.0.0.1"
-  port: 8080
 listeners:
   - name: test-listener
     bind: "127.0.0.1:19876"
@@ -71,9 +68,6 @@ func TestRun_Range(t *testing.T) {
 	configPath := filepath.Join(tmpDir, "range.yaml")
 	configContent := `
 version: '2'
-server:
-  host: "127.0.0.1"
-  port: 8080
 listeners:
   - name: range-listener
     bind: "127.0.0.1:3000-3001"
@@ -103,9 +97,6 @@ func TestRun_InvalidBind(t *testing.T) {
 	configPath := filepath.Join(tmpDir, "invalid.yaml")
 	configContent := `
 version: '2'
-server:
-  host: "127.0.0.1"
-  port: 8080
 listeners:
   - name: invalid-listener
     bind: "invalid"

@@ -3,7 +3,6 @@ listeners:
   - name: "debug-listener"
     bind: ":9000"
     protocol: "tcp"
-    zero_copy: false
     backend: "echo-pool"
 
 backends:

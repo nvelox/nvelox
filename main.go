@@ -13,6 +13,7 @@ import (
 	"nvelox/config"
 	"nvelox/core"
 	"nvelox/core/logging"
+	"nvelox/core/pidfile"
 	"nvelox/core/privdrop"
 	"nvelox/core/procsignal"
 )
@@ -114,6 +115,16 @@ func run(args []string, ctx context.Context, reloadCh <-chan os.Signal) error {
 	// stops here rather than run with rights it was told to drop.
 	select {
 	case <-engine.Ready():
+		// server.pid_file: written now that every port is bound (the ID in
+		// it is of a process that serves) and before the switch below (the
+		// file may live where only root writes).
+		if cfg.Server.PidFile != "" {
+			removePidFile, err := pidfile.Write(cfg.Server.PidFile)
+			if err != nil {
+				return fmt.Errorf("server.pid_file: %w", err)
+			}
+			defer removePidFile()
+		}
 		info, warning, err := privdrop.Switch(cfg.Server.User, cfg.Server.Group, logging.HandOver)
 		if err != nil {
 			return fmt.Errorf("server.user / server.group: %w", err)

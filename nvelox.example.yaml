@@ -18,8 +18,13 @@ server:
   # follow a symbolic link at a log path.
   # user: "nvelox"
   # group: "nvelox"
-  # pid_file / workers are accepted but not implemented (no pid file, one
-  # process); setting them prints a startup WARNING.
+  # pid_file: where nvelox writes its process ID once every port is bound,
+  # before it switches to `user` (so the file may live where only root
+  # writes, e.g. /run/nvelox.pid); a clean stop removes it when the process
+  # still may. Read at start: a reload does not move it.
+  # pid_file: "/run/nvelox.pid"
+  # (workers is not implemented and is rejected: nvelox runs one process
+  # with one event loop per CPU core.)
   # shutdown_timeout: how long a stop (SIGINT or SIGTERM) lets the HTTP
   # requests in flight finish; what is left then is closed. Nothing new is
   # accepted on the HTTP ports meanwhile, so this is also the longest that a
@@ -139,11 +144,15 @@ admin:
 # the new rules; one they would refuse is closed. See
 # examples/32-hot-reload.yaml.
 
-# ─── OpenTelemetry Tracing ─────────────────────────────────
-# tracing:
-#   enabled: true
-#   endpoint: "http://jaeger:4318"
-#   service: "nvelox"
+# ─── Keys nvelox does not read ─────────────────────────────
+# A key that no setting reads is refused at load: the error names the
+# file, the line, the key and, when one is near, the key that was meant
+#   nvelox.yaml:42:5: unknown setting "ip_denylst" in listeners[0] (did you mean "ip_denylist"?)
+# so a misspelled setting cannot start and quietly do nothing. The same
+# holds for a key that is parsed but not implemented yet (`tracing`,
+# `server.workers`, and on a listener `zero_copy`, `grpc`, `tls.auto_cert`,
+# `tls.ocsp_stapling`, `sni_routes`, `throttle`,
+# `buffering.request_body_buffer`, `routes[].scripts`): the error says so.
 
 # ─── Modular Config Includes ──────────────────────────────
 include: "/etc/nvelox/config.d/*.yaml"
@@ -424,12 +433,9 @@ listeners:
   #                      one. Default 5m on plain tcp listeners ("0" =
   #                      never); on tls-terminating tcp listeners only when set.
   #   timeouts.connect — backend dial timeout (default 10s).
-  #   zero_copy        — accepted for compatibility; no effect (L4 TCP uses a
-  #                      16 KiB buffered copy per direction).
   - name: "game-ports"
     bind: ":10000-10100"
     protocol: "tcp"
-    zero_copy: true
     backend: "game-servers"
 
   # ─── Dedicated-port MUX (range → one backend port) ─────
@@ -444,7 +450,6 @@ listeners:
   # - name: "dedicated-mux"
   #   bind: ":17000-17100"          # the dedicated range (grow as needed)
   #   protocol: "tcp"
-  #   zero_copy: true
   #   backend: "port-mux"           # backend MUST specify an explicit port (the mux port)
   #   accept_proxy_from: ["10.50.0.0/16"]   # trust PROXY headers from your relays
   # (and a matching backend, e.g.)

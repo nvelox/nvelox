@@ -93,18 +93,55 @@ func TestValidation_UnimplementedKeysRejected(t *testing.T) {
 		{"route scripts", Listener{Name: "l", Bind: ":80", Protocol: "http", Backend: "be",
 			Routes: []RouteConfig{{Match: RouteMatch{PathPrefix: "/"}, Backend: "be",
 				Scripts: ScriptsConfig{RequestScript: "/etc/nvelox/auth.lua"}}}}, "scripts"},
+		// Accepted and never read until 2.0.0: each was a setting that
+		// promised something and did nothing.
+		{"zero_copy", Listener{Name: "l", Bind: ":80", Protocol: "tcp", Backend: "be", ZeroCopy: true}, "zero_copy"},
+		{"grpc", Listener{Name: "l", Bind: ":80", Protocol: "http", Backend: "be", GRPC: true}, "grpc"},
+		{"auto_cert", Listener{Name: "l", Bind: ":443", Protocol: "https", Backend: "be",
+			TLS: TLSConfig{Cert: cert, Key: key, AutoCert: true}}, "tls.auto_cert"},
+		{"request_body_buffer", Listener{Name: "l", Bind: ":80", Protocol: "http", Backend: "be",
+			Buffering: BufferingConfig{RequestBodyBuffer: "64KB"}}, "buffering.request_body_buffer"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			wantErr(t, validate(baseCfg(c.l)), c.key, "not implemented")
+			wantErr(t, validate(baseCfg(c.l)), "listener l", c.key, "not implemented")
 		})
 	}
 
-	// Explicitly-off values are fine.
-	ok := Listener{Name: "l", Bind: ":443", Protocol: "https", Backend: "be",
-		TLS: TLSConfig{Cert: cert, Key: key, OCSPStapling: false}}
+	// Explicitly-off values are fine, and so is the buffer that is read.
+	ok := Listener{Name: "l", Bind: ":443", Protocol: "https", Backend: "be", ZeroCopy: false, GRPC: false,
+		TLS: TLSConfig{Cert: cert, Key: key, OCSPStapling: false, AutoCert: false}, Buffering: BufferingConfig{ResponseBuffer: "256KB"}}
 	if err := validate(baseCfg(ok)); err != nil {
-		t.Fatalf("ocsp_stapling: false must load: %v", err)
+		t.Fatalf("the keys set to off must load: %v", err)
+	}
+}
+
+// The top-level and server.* keys nothing implements are refused too.
+func TestValidation_UnimplementedServerKeysRejected(t *testing.T) {
+	l := Listener{Name: "l", Bind: ":80", Protocol: "http", Backend: "be"}
+	for name, set := range map[string]func(*Config){
+		"tracing.enabled":  func(c *Config) { c.Tracing.Enabled = true },
+		"tracing.endpoint": func(c *Config) { c.Tracing.Endpoint = "otel:4317" },
+		"tracing.service":  func(c *Config) { c.Tracing.Service = "edge" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := baseCfg(l)
+			set(cfg)
+			wantErr(t, validate(cfg), "tracing is not implemented")
+		})
+	}
+	cfg := baseCfg(l)
+	cfg.Server.Workers = 4
+	wantErr(t, validate(cfg), "server.workers is not implemented")
+
+	// server.pid_file is implemented: it loads, and without a warning.
+	cfg = baseCfg(l)
+	cfg.Server.PidFile = "/run/nvelox.pid"
+	if err := validate(cfg); err != nil {
+		t.Fatalf("server.pid_file must load: %v", err)
+	}
+	if w := ServerWarnings(cfg.Server); len(w) != 0 {
+		t.Fatalf("server.pid_file: no warning, got %q", w)
 	}
 }
 
@@ -336,17 +373,16 @@ func TestValidation_BackendTLSOnL4ListenerRejected(t *testing.T) {
 	}
 }
 
+// A server.* key that does nothing is refused at load
+// (TestValidation_UnimplementedServerKeysRejected), so none of them is left
+// to warn about: what remains are the server.http3 keys that change nothing
+// on a platform (http3_test.go).
 func TestServerWarnings(t *testing.T) {
 	if w := ServerWarnings(ServerConfig{}); len(w) != 0 {
 		t.Fatalf("no server keys set: want no warning, got %q", w)
 	}
-	w := ServerWarnings(ServerConfig{PidFile: "/var/run/nvelox.pid", Workers: 4})
-	joined := strings.Join(w, "\n")
-	if len(w) != 2 || !strings.Contains(joined, "server.pid_file") || !strings.Contains(joined, "server.workers") {
-		t.Fatalf("pid_file + workers: got %q", w)
-	}
-	if !strings.Contains(joined, "not implemented") {
-		t.Errorf("warnings must say the keys are not implemented: %q", w)
+	if w := ServerWarnings(ServerConfig{PidFile: "/var/run/nvelox.pid", User: "nvelox", Group: "nvelox", GatewayID: "gw-1", ShutdownTimeout: "5s"}); len(w) != 0 {
+		t.Fatalf("keys that are all implemented: want no warning, got %q", w)
 	}
 }
 
