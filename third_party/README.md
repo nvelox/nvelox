@@ -10,3 +10,14 @@ module. Its licence is `third_party/gofast/LICENCE`.
 The package's files are as published in v0.8.0, except where a comment
 starting `nvelox:` marks a change. Its tests and its `go.sum` are not
 carried.
+
+Changes from v0.8.0:
+
+- `client.go`, `writeResponse`: when the response head is refused, or
+  writing to the client fails, the rest of the upstream's output is read
+  and dropped, so the request ends. In v0.8.0 the request stayed open until
+  the client went away.
+- `client.go`, `writeResponse`: a `Status` line it cannot read, or a header
+  line without a colon, is answered 500, as v0.8.0 answers the other
+  response heads it refuses. v0.8.0 wrote no status for these two, which
+  net/http sends as an empty 200.

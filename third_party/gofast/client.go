@@ -463,6 +463,18 @@ func (pipes *ResponsePipe) writeError(w io.Writer) (err error) {
 // writeTo writes the given output into http.ResponseWriter
 func (pipes *ResponsePipe) writeResponse(w http.ResponseWriter) (err error) {
 	linebody := bufio.NewReaderSize(pipes.stdOutReader, 1024)
+
+	// nvelox: whatever ends the response early, read the rest of stdout.
+	// The connection's read loop writes stdout into this pipe and reaches
+	// the end of the request only once all of it is read; without this, a
+	// response head refused below kept the request (and WriteTo, waiting on
+	// stderr) open until the client went away.
+	defer func() {
+		if err != nil {
+			io.Copy(io.Discard, linebody)
+		}
+	}()
+
 	headers := make(http.Header)
 	statusCode := 0
 	headerLines := 0
@@ -492,6 +504,7 @@ func (pipes *ResponsePipe) writeResponse(w http.ResponseWriter) (err error) {
 		headerLines++
 		parts := strings.SplitN(string(line), ":", 2)
 		if len(parts) < 2 {
+			w.WriteHeader(http.StatusInternalServerError) // nvelox: as for the other refused heads
 			err = fmt.Errorf("gofast: bogus header line: %s", string(line))
 			return
 		}
@@ -501,12 +514,14 @@ func (pipes *ResponsePipe) writeResponse(w http.ResponseWriter) (err error) {
 		switch {
 		case header == "Status":
 			if len(val) < 3 {
+				w.WriteHeader(http.StatusInternalServerError) // nvelox: as for the other refused heads
 				err = fmt.Errorf("gofast: bogus status (short): %q", val)
 				return
 			}
 			var code int
 			code, err = strconv.Atoi(val[0:3])
 			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError) // nvelox: as for the other refused heads
 				err = fmt.Errorf("gofast: bogus status: %q\nline was %q",
 					val, line)
 				return

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"nvelox/config"
+	"nvelox/core/logging"
 )
 
 // fakeFPM is a FastCGI responder (net/http/fcgi) standing in for PHP-FPM.
@@ -460,6 +461,45 @@ func TestFastCGI_ParamsCannotReplaceScript(t *testing.T) {
 	for k, v := range want {
 		if env[k] != v {
 			t.Errorf("%s = %q, want %q", k, env[k], v)
+		}
+	}
+}
+
+// TestFastCGI_RefusedResponseHead: a response head the FastCGI client
+// refuses (a Status it cannot read, a line without a colon, a line longer
+// than it reads, no header before the blank line, no Content-Type) is
+// answered 500 without the upstream's body, and the request ends once the
+// upstream has answered. gofast v0.8.0
+// kept such a request open until the client went away, and answered the
+// first two with an empty 200.
+func TestFastCGI_RefusedResponseHead(t *testing.T) {
+	if err := logging.Init("error", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = logging.Init("info", "", "") })
+	cfg, current := fakeFCGIUpstream(t)
+	for _, head := range []string{
+		"Status: abc\r\nContent-Type: text/plain\r\n\r\n",
+		"Status: 2\r\nContent-Type: text/plain\r\n\r\n",
+		"Content-Type: text/plain\r\nX: a\r\n b\r\n\r\n",
+		"Content-Type: text/plain\r\nX-Long: " + strings.Repeat("a", 70<<10) + "\r\n\r\n",
+		"\r\n\r\n",
+		"X-A: 1\r\n\r\n",
+	} {
+		current.Store(&fcgiReply{out: []byte(head + "UPSTREAM-BODY")})
+		rec := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			ServeFastCGI(rec, httptest.NewRequest("GET", "/index.php", nil), cfg, nil)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%.80q: the request has not ended 5 s after the upstream answered", head)
+		}
+		if rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), "UPSTREAM-BODY") {
+			t.Errorf("%.80q: answered %d %q, want 500 without the upstream's body", head, rec.Code, rec.Body.String())
 		}
 	}
 }
