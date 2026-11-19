@@ -254,6 +254,7 @@ nvelox hands PHP-FPM only an existing `.php` file inside it — nvelox must see
 the document root at the same path as PHP-FPM. Its `timeouts` are a
 backend's: the dial gives up after `connect` (502), and PHP-FPM has
 `response_header` to start answering once it has the request body (504).
+A response head over 64 KiB is answered 500.
 
 ### Full Production (all features)
 ```yaml

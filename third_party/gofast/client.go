@@ -460,6 +460,10 @@ func (pipes *ResponsePipe) writeError(w io.Writer) (err error) {
 	return
 }
 
+// nvelox: maxResponseHead bounds a response head, each of its lines
+// included: 64 KiB, as nvelox's event loops take from an HTTP backend.
+const maxResponseHead = 64 << 10
+
 // writeTo writes the given output into http.ResponseWriter
 func (pipes *ResponsePipe) writeResponse(w http.ResponseWriter) (err error) {
 	linebody := bufio.NewReaderSize(pipes.stdOutReader, 1024)
@@ -479,14 +483,27 @@ func (pipes *ResponsePipe) writeResponse(w http.ResponseWriter) (err error) {
 	statusCode := 0
 	headerLines := 0
 	sawBlankLine := false
+	headSize := 0 // nvelox: the bytes of the head read so far
 
 	for {
 		var line []byte
 		var isPrefix bool
 		line, isPrefix, err = linebody.ReadLine()
-		if isPrefix {
+		// nvelox: a line longer than the reader's 1 KiB buffer is read in
+		// parts while the head stays within maxResponseHead; v0.8.0
+		// refused any line over 1 KiB.
+		if isPrefix && err == nil {
+			long := append([]byte(nil), line...)
+			for isPrefix && err == nil && headSize+len(long) <= maxResponseHead {
+				line, isPrefix, err = linebody.ReadLine()
+				long = append(long, line...)
+			}
+			line = long
+		}
+		headSize += len(line) + 2
+		if isPrefix || headSize > maxResponseHead {
 			w.WriteHeader(http.StatusInternalServerError)
-			err = fmt.Errorf("gofast: long header line from subprocess")
+			err = fmt.Errorf("gofast: response head over %d bytes", maxResponseHead)
 			return
 		}
 		if err == io.EOF {

@@ -21,3 +21,7 @@ Changes from v0.8.0:
   line without a colon, is answered 500, as v0.8.0 answers the other
   response heads it refuses. v0.8.0 wrote no status for these two, which
   net/http sends as an empty 200.
+- `client.go`, `writeResponse`: a response head of up to 64 KiB is read,
+  however long its lines (a line longer than the reader's 1 KiB buffer is
+  read in parts); a larger head is answered 500. v0.8.0 refused any line
+  over 1 KiB and set no limit on the head as a whole.

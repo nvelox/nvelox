@@ -466,10 +466,10 @@ func TestFastCGI_ParamsCannotReplaceScript(t *testing.T) {
 }
 
 // TestFastCGI_RefusedResponseHead: a response head the FastCGI client
-// refuses (a Status it cannot read, a line without a colon, a line longer
-// than it reads, no header before the blank line, no Content-Type) is
-// answered 500 without the upstream's body, and the request ends once the
-// upstream has answered. gofast v0.8.0
+// refuses (a Status it cannot read, a line without a colon, a line that
+// makes the head longer than 64 KiB, no header before the blank line, no
+// Content-Type) is answered 500 without the upstream's body, and the
+// request ends once the upstream has answered. gofast v0.8.0
 // kept such a request open until the client went away, and answered the
 // first two with an empty 200.
 func TestFastCGI_RefusedResponseHead(t *testing.T) {
@@ -501,6 +501,36 @@ func TestFastCGI_RefusedResponseHead(t *testing.T) {
 		if rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), "UPSTREAM-BODY") {
 			t.Errorf("%.80q: answered %d %q, want 500 without the upstream's body", head, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+// TestFastCGI_LongHeaderLines: a response head of up to 64 KiB is taken
+// whole, however long its lines (gofast v0.8.0 refused any line over 1 KiB:
+// a long Content-Security-Policy got the client a 500); a larger head made
+// of short lines is answered 500 too, and the request ends.
+func TestFastCGI_LongHeaderLines(t *testing.T) {
+	if err := logging.Init("error", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = logging.Init("info", "", "") })
+	cfg, current := fakeFCGIUpstream(t)
+	for _, n := range []int{1030, 8 << 10, 60 << 10} {
+		v := strings.Repeat("a", n)
+		current.Store(&fcgiReply{out: []byte("Content-Type: text/plain\r\nContent-Security-Policy: " + v + "\r\n\r\nok")})
+		rec := serveFCGI(t, cfg, httptest.NewRequest("GET", "/index.php", nil))
+		if got := rec.Header().Get("Content-Security-Policy"); rec.Code != http.StatusOK || rec.Body.String() != "ok" || got != v {
+			t.Errorf("a %d-byte header value: answered %d %q with a value of %d bytes, want 200 with it whole", n, rec.Code, rec.Body.String(), len(got))
+		}
+	}
+	var many strings.Builder
+	many.WriteString("Content-Type: text/plain\r\n")
+	for i := 0; many.Len() <= 64<<10; i++ {
+		fmt.Fprintf(&many, "X-H%d: %s\r\n", i, strings.Repeat("b", 1000))
+	}
+	current.Store(&fcgiReply{out: []byte(many.String() + "\r\nUPSTREAM-BODY")})
+	rec := serveFCGI(t, cfg, httptest.NewRequest("GET", "/index.php", nil))
+	if rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), "UPSTREAM-BODY") {
+		t.Errorf("a head of %d bytes in short lines: answered %d %q, want 500", many.Len(), rec.Code, rec.Body.String())
 	}
 }
 
