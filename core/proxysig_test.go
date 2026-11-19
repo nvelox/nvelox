@@ -167,7 +167,11 @@ func udpTestSignedProxy_Senders(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	hdrCh := make(chan *proxyproto.Header, 1)
+	type tcpHeader struct {
+		h    *proxyproto.Header
+		port uint16 // the port the connection came from
+	}
+	hdrCh := make(chan tcpHeader, 1)
 	go func() {
 		c, err := ln.Accept()
 		if err != nil {
@@ -176,11 +180,11 @@ func udpTestSignedProxy_Senders(t *testing.T) {
 		defer c.Close()
 		h, err := proxyproto.Read(bufio.NewReader(c))
 		if err == nil {
-			hdrCh <- h
+			hdrCh <- tcpHeader{h, uint16(c.RemoteAddr().(*net.TCPAddr).Port)}
 		}
 		io.Copy(io.Discard, c)
 	}()
-	udpBE, udpGot := stUDPBackend(t, nil)
+	udpBE, udpGot := stUDPBackendFrom(t)
 	tcpAddr, udpAddr := stFreeTCPAddr(t), stFreeUDPAddr(t)
 	stStart(t, &config.Config{
 		Listeners: []config.Listener{
@@ -198,33 +202,59 @@ func udpTestSignedProxy_Senders(t *testing.T) {
 	}
 	defer c.Close()
 	c.Write([]byte("payload"))
+	// Signed in version 2: bound to the port of nvelox's connection to the
+	// backend.
 	select {
-	case h := <-hdrCh:
-		if err := proxy.Verify(h, [][]byte{sigKeyA}, nil, time.Now()); err != nil {
-			t.Fatalf("TCP header: %v", err)
+	case th := <-hdrCh:
+		if _, counted, err := proxy.VerifyFrom(th.h, [][]byte{sigKeyA}, nil, time.Now(), th.port); err != nil || !counted {
+			t.Fatalf("TCP header: counted %v, %v", counted, err)
+		}
+		if _, _, err := proxy.VerifyFrom(th.h, [][]byte{sigKeyA}, nil, time.Now(), th.port+1); err == nil {
+			t.Fatal("the TCP header passes for another port")
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("TCP backend got no header")
 	}
-	stUDPExchange("127.0.0.1", udpAddr, []byte("datagram-1"), 30*time.Millisecond)
-	d, ok := stWaitGot(udpGot, time.Second)
-	if !ok {
-		t.Fatal("UDP backend got nothing")
-	}
-	r := bufio.NewReader(bytes.NewReader(d))
-	h, err := proxyproto.Read(r)
+	// UDP: bound to the port of the session's socket to the backend, with
+	// that socket's counter, one more with each datagram.
+	raddr, _ := net.ResolveUDPAddr("udp", udpAddr)
+	client, err := net.DialUDP("udp", nil, raddr)
 	if err != nil {
-		t.Fatalf("UDP datagram without a header: %v", err)
+		t.Fatal(err)
 	}
-	payload, _ := io.ReadAll(r)
-	if string(payload) != "datagram-1" {
-		t.Fatalf("UDP payload %q", payload)
+	defer client.Close()
+	var counters []uint64
+	var from *net.UDPAddr
+	for _, p := range []string{"datagram-1", "datagram-2"} {
+		client.Write([]byte(p))
+		var d stDatagram
+		select {
+		case d = <-udpGot:
+		case <-time.After(time.Second):
+			t.Fatalf("UDP backend got nothing for %q", p)
+		}
+		h, payload := stSignedDatagram(t, d)
+		if string(payload) != p {
+			t.Fatalf("UDP payload %q, want %q", payload, p)
+		}
+		c, counted, err := proxy.VerifyFrom(h, [][]byte{sigKeyA}, payload, time.Now(), uint16(d.from.Port))
+		if err != nil || !counted {
+			t.Fatalf("UDP header: counted %v, %v", counted, err)
+		}
+		if _, _, err := proxy.VerifyFrom(h, [][]byte{sigKeyA}, []byte("other"), time.Now(), uint16(d.from.Port)); err == nil {
+			t.Fatal("UDP signature does not cover the payload")
+		}
+		if from != nil && from.Port != d.from.Port {
+			t.Fatalf("the session's datagrams came from ports %d and %d", from.Port, d.from.Port)
+		}
+		from = d.from
+		counters = append(counters, c)
 	}
-	if err := proxy.Verify(h, [][]byte{sigKeyA}, payload, time.Now()); err != nil {
-		t.Fatalf("UDP header: %v", err)
+	if counters[1] != counters[0]+1 {
+		t.Errorf("counters %v: want one more with each datagram", counters)
 	}
-	if err := proxy.Verify(h, [][]byte{sigKeyA}, []byte("other"), time.Now()); err == nil {
-		t.Fatal("UDP signature does not cover the payload")
+	if now := uint64(time.Now().UnixNano()); counters[0] > now || now-counters[0] > uint64(time.Minute) {
+		t.Errorf("first counter %d: want the clock in nanoseconds when the socket began (now %d)", counters[0], now)
 	}
 }
 
@@ -431,7 +461,7 @@ func TestSignedProxy_UDPSenderUsesTheCurrentKey(t *testing.T) {
 }
 
 func udpTestSignedProxy_UDPSenderUsesTheCurrentKey(t *testing.T) {
-	be, got := stUDPBackend(t, nil)
+	be, got := stUDPBackendFrom(t)
 	addr := stFreeUDPAddr(t)
 	mk := func(key []byte) *config.Config {
 		return &config.Config{Version: "2",
@@ -448,19 +478,16 @@ func udpTestSignedProxy_UDPSenderUsesTheCurrentKey(t *testing.T) {
 	defer c.Close()
 	signedWith := func(payload string) [][]byte {
 		c.Write([]byte(payload))
-		d, ok := stWaitGot(got, 2*time.Second)
-		if !ok {
+		var d stDatagram
+		select {
+		case d = <-got:
+		case <-time.After(2 * time.Second):
 			t.Fatalf("backend got nothing for %q", payload)
 		}
-		r := bufio.NewReader(bytes.NewReader(d))
-		h, err := proxyproto.Read(r)
-		if err != nil {
-			t.Fatal(err)
-		}
-		body, _ := io.ReadAll(r)
+		h, body := stSignedDatagram(t, d)
 		var keys [][]byte
 		for _, k := range [][]byte{sigKeyA, sigKeyB} {
-			if proxy.Verify(h, [][]byte{k}, body, time.Now()) == nil {
+			if _, _, err := proxy.VerifyFrom(h, [][]byte{k}, body, time.Now(), uint16(d.from.Port)); err == nil {
 				keys = append(keys, k)
 			}
 		}

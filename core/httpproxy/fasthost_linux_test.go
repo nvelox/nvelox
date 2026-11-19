@@ -126,7 +126,7 @@ func TestFastSite_FromTheConfiguration(t *testing.T) {
 	client := &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 4321}
 	local := &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 80}
 	plain, err := site.Backends["api"].ProxyHeader(client, local, netip.AddrPort{})
-	want, _ := backendProxyHeader(client, local, nil, time.Time{})
+	want, _ := backendProxyHeader(client, local, nil, time.Time{}, 0)
 	if err != nil || string(plain) != string(want) {
 		t.Errorf("api's PROXY header: %x, %v; want %x", plain, err, want)
 	}
@@ -134,7 +134,10 @@ func TestFastSite_FromTheConfiguration(t *testing.T) {
 	if !signed.ProxyHeaderVaries {
 		t.Error("a signed header does not vary")
 	}
-	if h, err := signed.ProxyHeader(client, local, netip.AddrPort{}); err != nil || len(h) <= len(want) {
+	if _, err := signed.ProxyHeader(client, local, netip.AddrPort{}); err == nil {
+		t.Error("a signed header was made without the address of the connection it is for")
+	}
+	if h, err := signed.ProxyHeader(client, local, netip.MustParseAddrPort("192.0.2.1:40100")); err != nil || len(h) <= len(want) {
 		t.Errorf("the signed header: %d bytes, %v; want more than the %d of an unsigned one", len(h), err, len(want))
 	}
 	if !site.Backends["sticky"].Slow {

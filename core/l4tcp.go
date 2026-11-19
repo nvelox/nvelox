@@ -239,7 +239,7 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 	if backend != nil && backend.SendProxyV2 {
 		header := proxyproto.HeaderProxyFromAddrs(2, src, clientConn.LocalAddr())
 		if len(backend.SendProxyKey) > 0 {
-			if err := proxy.SignHeader(header, backend.SendProxyKey, time.Now()); err != nil {
+			if err := proxy.SignHeaderFrom(header, backend.SendProxyKey, time.Now(), uint16(portOf(backendConn.LocalAddr()))); err != nil {
 				logging.Error("Failed to sign PROXY v2 header: %v", err)
 				sessErr = err
 				return

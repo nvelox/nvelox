@@ -93,6 +93,7 @@ type udpFastSess struct {
 	onConnect bool // balancer.OnConnect was called
 
 	proxyHdr []byte       // prepended to every datagram to the backend (send_proxy_v2)
+	sent     uint64       // the counter of the last header signed to the backend; 0: none yet
 	keyView  *backendView // the backend view key and hdrWanted were read from
 	key      []byte       // the backend's send_proxy_key_file key
 	// hdrWanted: the backend wants the PROXY v2 header (send_proxy_v2).
@@ -483,7 +484,21 @@ func (u *udpFast) Outgoing(s *relay.UDPSession, data []byte) ([]byte, bool) {
 		return nil, false
 	}
 	if len(hdr) > 0 && len(key) > 0 {
-		signed, err := proxy.SignedHeaderBytes(hdr, key, data, time.Now())
+		// Signed for the session's socket to the backend: its port, and
+		// its counter (proxy.NextCounter's rule; the session is its
+		// socket's only user, on one loop).
+		from := s.ServerLocal()
+		if !from.IsValid() {
+			logging.Error("[DATA] Write failed: the address of the socket to the backend is not known")
+			return nil, false
+		}
+		now := time.Now()
+		if d.sent == 0 {
+			d.sent = uint64(now.UnixNano())
+		} else {
+			d.sent++
+		}
+		signed, err := proxy.SignedHeaderBytesFrom(hdr, key, data, now, from.Port(), d.sent)
 		if err != nil {
 			logging.Error("[DATA] Write failed: %v", err)
 			return nil, false

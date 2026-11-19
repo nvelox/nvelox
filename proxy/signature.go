@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -335,6 +336,23 @@ func writeHeaderParts(m io.Writer, h *proxyproto.Header) error {
 	binary.BigEndian.PutUint16(b[:], dstPort)
 	m.Write(b[:])
 	return nil
+}
+
+// NextCounter returns the counter of the next header a relay socket signs
+// in version 2, kept in c (zero: the socket has signed none): the clock in
+// nanoseconds (now) for its first header, one more for each after it.
+// Safe for concurrent use.
+func NextCounter(c *atomic.Uint64, now time.Time) uint64 {
+	for {
+		n := c.Load()
+		next := n + 1
+		if n == 0 {
+			next = uint64(now.UnixNano())
+		}
+		if c.CompareAndSwap(n, next) {
+			return next
+		}
+	}
 }
 
 // ReplayWindow is what a receiver keeps of one relay socket's counters

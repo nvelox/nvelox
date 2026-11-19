@@ -1457,7 +1457,7 @@ func (e *Engine) handleTLSConn(rawConn net.Conn, tlsConfig *tls.Config, l *Liste
 	if backend != nil && backend.SendProxyV2 {
 		header := proxyproto.HeaderProxyFromAddrs(2, client, rawConn.LocalAddr())
 		if len(backend.SendProxyKey) > 0 {
-			if err := proxy.SignHeader(header, backend.SendProxyKey, time.Now()); err != nil {
+			if err := proxy.SignHeaderFrom(header, backend.SendProxyKey, time.Now(), uint16(portOf(backendConn.LocalAddr()))); err != nil {
 				logging.Error("Failed to sign PROXY v2 header on TLS conn: %v", err)
 				return
 			}

@@ -7,6 +7,10 @@ package core
 // signature; with "required" a header without a counter is refused.
 
 import (
+	"bufio"
+	"bytes"
+	"crypto/tls"
+	"io"
 	"net"
 	"net/netip"
 	"testing"
@@ -44,6 +48,51 @@ func stRelaySocket(t *testing.T, addr string) (*net.UDPConn, uint16) {
 	}
 	t.Cleanup(func() { c.Close() })
 	return c, uint16(c.LocalAddr().(*net.UDPAddr).Port)
+}
+
+// stDatagram is a datagram a backend got, and the address it came from.
+type stDatagram struct {
+	data []byte
+	from *net.UDPAddr
+}
+
+// stUDPBackendFrom is stUDPBackend without answers, and with the address
+// of each datagram.
+func stUDPBackendFrom(t *testing.T) (addr string, got chan stDatagram) {
+	t.Helper()
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	got = make(chan stDatagram, 1024)
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, from, err := c.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			select {
+			case got <- stDatagram{append([]byte(nil), buf[:n]...), from}:
+			default:
+			}
+		}
+	}()
+	return c.LocalAddr().String(), got
+}
+
+// stSignedDatagram splits a datagram nvelox sent with a header into the
+// header and the payload.
+func stSignedDatagram(t *testing.T, d stDatagram) (*proxyproto.Header, []byte) {
+	t.Helper()
+	r := bufio.NewReader(bytes.NewReader(d.data))
+	h, err := proxyproto.Read(r)
+	if err != nil {
+		t.Fatalf("a datagram without a header: %v", err)
+	}
+	payload, _ := io.ReadAll(r)
+	return h, payload
 }
 
 func stSend(t *testing.T, c *net.UDPConn, d []byte) {
@@ -193,6 +242,99 @@ func udpTestReplayWindow_ReloadToRequired(t *testing.T) {
 	}
 }
 
+// stHeader is the PROXY header a backend read at the start of a
+// connection, and the port the connection came from.
+type stHeader struct {
+	h    *proxyproto.Header
+	port uint16
+}
+
+// stHeaderBackend is a TCP backend that reads the header of each
+// connection.
+func stHeaderBackend(t *testing.T) (string, chan stHeader) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	got := make(chan stHeader, 8)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				h, err := proxyproto.Read(bufio.NewReader(c))
+				if err == nil {
+					got <- stHeader{h, uint16(c.RemoteAddr().(*net.TCPAddr).Port)}
+				}
+				io.Copy(io.Discard, c)
+			}()
+		}
+	}()
+	return ln.Addr().String(), got
+}
+
+// What the goroutine paths send is signed in version 2 too, for the port
+// of nvelox's connection to the backend: a relay's connection passed on,
+// and a TLS listener's.
+func TestSignedProxy_SendersBehindRelayAndTLS(t *testing.T) {
+	pki := newSTPKI(t, "sigsend")
+	be, got := stHeaderBackend(t)
+	relayAddr, tlsAddr := stFreeTCPAddr(t), stFreeTCPAddr(t)
+	stStart(t, &config.Config{
+		Listeners: []config.Listener{
+			{Name: "relayed-in", Bind: relayAddr, Protocol: "tcp", Backend: "be",
+				AcceptProxyFrom: []string{"127.0.0.0/8"}, AcceptProxyKeys: [][]byte{sigKeyB}},
+			{Name: "tls-in", Bind: tlsAddr, Protocol: "tcp", Backend: "be",
+				TLS: config.TLSConfig{Cert: pki.srvCert, Key: pki.srvKey}},
+		},
+		Backends: []config.Backend{{Name: "be", Servers: []string{be}, SendProxyV2: true, SendProxyKey: sigKeyA}},
+	}, nil)
+	check := func(what, client string) {
+		t.Helper()
+		select {
+		case sh := <-got:
+			if _, counted, err := proxy.VerifyFrom(sh.h, [][]byte{sigKeyA}, nil, time.Now(), sh.port); err != nil || !counted {
+				t.Fatalf("%s: counted %v, %v", what, counted, err)
+			}
+			if _, _, err := proxy.VerifyFrom(sh.h, [][]byte{sigKeyA}, nil, time.Now(), sh.port+1); err == nil {
+				t.Fatalf("%s: the header passes for another port", what)
+			}
+			if client != "" && sh.h.SourceAddr.String() != client {
+				t.Errorf("%s: names %v, want %s", what, sh.h.SourceAddr, client)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s: the backend got no header", what)
+		}
+	}
+
+	c, err := net.Dial("tcp", relayAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	signedTCPHeaderV2(t, c, sigKeyB, "198.51.100.80:4000", uint16(c.LocalAddr().(*net.TCPAddr).Port))
+	c.Write([]byte("hello"))
+	check("a relay's connection", "198.51.100.80:4000")
+
+	raw, err := net.Dial("tcp", tlsAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	tc := tls.Client(raw, &tls.Config{RootCAs: pki.caPool, ServerName: "localhost"})
+	tc.SetDeadline(time.Now().Add(3 * time.Second))
+	if err := tc.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	tc.Write([]byte("hello"))
+	check("a TLS listener's connection", "")
+}
+
 // signedTCPHeaderV2 writes a header naming client, signed with key in
 // version 2 for the relay connection's port port.
 func signedTCPHeaderV2(t *testing.T, c net.Conn, key []byte, client string, port uint16) {
@@ -334,23 +476,30 @@ func TestRelayWindows(t *testing.T) {
 	}
 
 	// Removal is bounded per call, oldest first.
+	if relayWindowExpireMax < 1 || relayWindowExpireMax > 256 {
+		t.Fatalf("one call removes up to %d windows: want a few, so that no datagram waits for many", relayWindowExpireMax)
+	}
+	const made = 192
+	peer := func(i int) netip.AddrPort {
+		return netip.AddrPortFrom(netip.MustParseAddr("198.51.100.1"), uint16(i+1))
+	}
 	var many relayWindows
-	for i := range 3 * relayWindowExpireMax {
-		x := many.attach(netip.AddrPortFrom(netip.MustParseAddr("198.51.100.1"), uint16(i+1)), 0)
-		many.detach(x, int64(i))
+	for i := range made {
+		many.detach(many.attach(peer(i), 0), int64(i))
 	}
 	late := 10 * keep
-	many.attach(netip.MustParseAddrPort("198.51.100.2:1"), late)
-	if n := len(many.m); n != 2*relayWindowExpireMax+1 {
-		t.Fatalf("%d windows left after one call, want %d", n, 2*relayWindowExpireMax+1)
+	z := netip.MustParseAddrPort("198.51.100.2:1")
+	many.attach(z, late)
+	if want := made + 1 - min(made, relayWindowExpireMax); len(many.m) != want {
+		t.Fatalf("%d windows left after one call, want %d", len(many.m), want)
 	}
-	if _, ok := many.m[netip.AddrPortFrom(netip.MustParseAddr("198.51.100.1"), 1)]; ok {
+	if _, ok := many.m[peer(0)]; ok {
 		t.Error("the oldest window was not the first removed")
 	}
-	for range 2 {
-		many.attach(netip.MustParseAddrPort("198.51.100.2:1"), late)
+	for range made {
+		many.attach(z, late)
 	}
 	if n := len(many.m); n != 1 {
-		t.Errorf("%d windows left after three calls, want 1", n)
+		t.Errorf("%d windows left, want 1", n)
 	}
 }

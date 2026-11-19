@@ -113,8 +113,14 @@ func (b *proxyBackend) serve(c net.Conn) {
 		rec.src, rec.dst = hdr.SourceAddr.String(), hdr.DestinationAddr.String()
 		rec.stream = hdr.TransportProtocol.IsStream()
 		if b.key != nil {
-			if err := proxy.Verify(hdr, [][]byte{b.key}, nil, time.Now()); err != nil {
-				b.refuse(c, "signature: "+err.Error())
+			// Signed in version 2, for the port of nvelox's connection.
+			port := uint16(c.RemoteAddr().(*net.TCPAddr).Port)
+			if _, counted, err := proxy.VerifyFrom(hdr, [][]byte{b.key}, nil, time.Now(), port); err != nil || !counted {
+				why := "not signed for its connection's port"
+				if err != nil {
+					why = err.Error()
+				}
+				b.refuse(c, "signature: "+why)
 				return
 			}
 		}
@@ -827,7 +833,7 @@ func TestBackendProxyHeader(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			raw, err := backendProxyHeader(tc.src, tc.dst, nil, time.Time{})
+			raw, err := backendProxyHeader(tc.src, tc.dst, nil, time.Time{}, 0)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("a header was made: %x", raw)
@@ -850,9 +856,10 @@ func TestBackendProxyHeader(t *testing.T) {
 			}
 		})
 	}
-	// Signed: the receiver's check passes with the key, fails with another.
+	// Signed: the receiver's check passes with the key for the connection's
+	// port, fails with another key or another port.
 	key := []byte("0123456789abcdef0123456789abcdef")
-	raw, err := backendProxyHeader(tcp("198.51.100.7:5000"), tcp("[2001:db8::1]:443"), key, time.Now())
+	raw, err := backendProxyHeader(tcp("198.51.100.7:5000"), tcp("[2001:db8::1]:443"), key, time.Now(), 40100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -860,10 +867,13 @@ func TestBackendProxyHeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := proxy.Verify(h, [][]byte{key}, nil, time.Now()); err != nil {
-		t.Errorf("signature: %v", err)
+	if _, counted, err := proxy.VerifyFrom(h, [][]byte{key}, nil, time.Now(), 40100); err != nil || !counted {
+		t.Errorf("signature: counted %v, %v", counted, err)
 	}
-	if err := proxy.Verify(h, [][]byte{[]byte("another key of thirty-two bytes!")}, nil, time.Now()); err == nil {
+	if _, _, err := proxy.VerifyFrom(h, [][]byte{key}, nil, time.Now(), 40101); err == nil {
+		t.Errorf("the signature passed for another port")
+	}
+	if _, _, err := proxy.VerifyFrom(h, [][]byte{[]byte("another key of thirty-two bytes!")}, nil, time.Now(), 40100); err == nil {
 		t.Errorf("the signature passed with another key")
 	}
 }

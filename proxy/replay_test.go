@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"net"
+	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -95,6 +98,38 @@ func TestSignatureV2_BoundToPortAndCounter(t *testing.T) {
 	}
 	if _, _, err := VerifyFrom(ph, keys, nil, now, 40003); !errors.Is(err, ErrSignatureInvalid) {
 		t.Errorf("a stream header on another connection: %v, want ErrSignatureInvalid", err)
+	}
+}
+
+// NextCounter: a socket's first counter is the clock in nanoseconds, then
+// one more for each, also from several goroutines at once.
+func TestNextCounter(t *testing.T) {
+	var c atomic.Uint64
+	now := time.Unix(1_800_000_000, 123)
+	first := uint64(now.UnixNano())
+	if got := NextCounter(&c, now); got != first {
+		t.Fatalf("first counter %d, want the clock in nanoseconds %d", got, first)
+	}
+	if got := NextCounter(&c, now.Add(time.Hour)); got != first+1 {
+		t.Fatalf("second counter %d, want %d", got, first+1)
+	}
+	var wg sync.WaitGroup
+	got := make([]uint64, 8*100)
+	for g := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range 100 {
+				got[g*100+i] = NextCounter(&c, now)
+			}
+		}()
+	}
+	wg.Wait()
+	slices.Sort(got)
+	for i, n := range got {
+		if want := first + 2 + uint64(i); n != want {
+			t.Fatalf("from several goroutines: %d in place %d, want %d: each counter once, none left out", n, i, want)
+		}
 	}
 }
 

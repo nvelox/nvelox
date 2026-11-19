@@ -214,7 +214,7 @@ func (h fastHost) Read(c net.Conn) (*net.TCPAddr, bool) {
 		return nil, true
 	}
 	hdr, err := proxy.ReadStreamHeader(c)
-	client, reason, cause := proxyClient(tr, hdr, err, remotePort(remote))
+	client, reason, cause := proxyClient(tr, hdr, err, tcpPort(remote))
 	if reason != "" {
 		h.g.proxyRejected(remote, reason, cause)
 		return nil, false
@@ -343,11 +343,16 @@ func (s *HTTPServer) fastBackend(name string) *web.Backend {
 	}
 	if sendsProxy(be) {
 		b.ProxyHeaderVaries = len(be.SendProxyKey) > 0 // a signed header carries its time
-		b.ProxyHeader = func(client, local net.Addr, _ netip.AddrPort) ([]byte, error) {
+		b.ProxyHeader = func(client, local net.Addr, from netip.AddrPort) ([]byte, error) {
 			if key := be.SendProxyKey; len(key) > 0 {
-				return backendProxyHeader(client, local, key, time.Now())
+				// from: the connection to the server, which a signed
+				// header is bound to by its port (ProxyHeaderVaries).
+				if !from.IsValid() {
+					return nil, errProxyAddr
+				}
+				return backendProxyHeader(client, local, key, time.Now(), from.Port())
 			}
-			return backendProxyHeader(client, local, nil, time.Time{})
+			return backendProxyHeader(client, local, nil, time.Time{}, 0)
 		}
 	}
 	return b

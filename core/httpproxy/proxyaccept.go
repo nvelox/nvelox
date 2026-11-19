@@ -60,9 +60,8 @@ func proxyClient(tr *proxy.Trust, hdr *proxyproto.Header, err error, relayPort u
 	return tr.StreamClient(hdr, err, relayPort)
 }
 
-// remotePort is the port of a connection's remote address (TCP); 0 for any
-// other.
-func remotePort(a net.Addr) uint16 {
+// tcpPort is the port of a TCP address; 0 for any other.
+func tcpPort(a net.Addr) uint16 {
 	if ta, ok := a.(*net.TCPAddr); ok {
 		return uint16(ta.Port)
 	}
@@ -131,7 +130,7 @@ func (c *proxyHdrConn) header() {
 			c.Conn.SetReadDeadline(time.Now().Add(c.timeout))
 		}
 		hdr, err := proxy.ReadStreamHeader(c.Conn)
-		client, reason, cause := proxyClient(c.trust, hdr, err, remotePort(c.Conn.RemoteAddr()))
+		client, reason, cause := proxyClient(c.trust, hdr, err, tcpPort(c.Conn.RemoteAddr()))
 		if reason != "" {
 			c.g.proxyRejected(c.Conn.RemoteAddr(), reason, cause)
 			c.err = errors.New("proxy protocol: connection refused (" + reason + ")")
