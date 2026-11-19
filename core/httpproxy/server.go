@@ -787,7 +787,12 @@ dispatch:
 			if routeHeaders != nil {
 				applyRequestHeaders(r, routeHeaders)
 			}
-			ServeFastCGI(newExpiresWriter(w, routeResult.Expires), r, routeResult.FastCGI, s.serveError)
+			fcgi := routeResult.FastCGI
+			if fcgi.Timeouts.Connect == "" {
+				// As for an HTTP backend: the route's, else the listener's.
+				fcgi.Timeouts.Connect = s.Listener.Timeouts.Connect
+			}
+			ServeFastCGI(newExpiresWriter(w, routeResult.Expires), r, fcgi, s.serveError)
 			return
 		}
 

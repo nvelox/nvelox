@@ -405,6 +405,10 @@ type FastCGIConfig struct {
 	SplitPathInfo string            `yaml:"split_path_info,omitempty"` // Regex to split PATH_INFO (like fastcgi_split_path_info)
 	Params        map[string]string `yaml:"params,omitempty"`          // Extra FastCGI params
 	Index         string            `yaml:"index,omitempty"`           // Default script (e.g., "index.php")
+	// Timeouts are an HTTP backend's connect (the dial: else the listener's,
+	// else 10s; 502 when it fails) and response_header (the time the upstream
+	// gets to start answering once it has the request: 60s, then 504).
+	Timeouts TimeoutConfig `yaml:"timeouts,omitempty"`
 }
 
 // StaticConfig defines static file serving.
@@ -600,6 +604,27 @@ func validateBackendTimeouts(b Backend) error {
 	} {
 		if err := validateTimeout(f.val); err != nil {
 			return fmt.Errorf("backend %s has invalid %s timeout %q: %v", b.Name, f.name, f.val, err)
+		}
+	}
+	return nil
+}
+
+// validateFastCGITimeouts checks a fastcgi route's timeouts: connect and
+// response_header, as on an HTTP backend; the others would do nothing on a
+// fastcgi route and are refused.
+func validateFastCGITimeouts(t TimeoutConfig) error {
+	for _, f := range []struct{ name, val string }{
+		{"read", t.Read}, {"write", t.Write}, {"idle", t.Idle}, {"read_header", t.ReadHeader},
+	} {
+		if f.val != "" {
+			return fmt.Errorf("timeouts.%s does nothing on a fastcgi route; it takes connect and response_header", f.name)
+		}
+	}
+	for _, f := range []struct{ name, val string }{
+		{"connect", t.Connect}, {"response_header", t.ResponseHeader},
+	} {
+		if err := validateTimeout(f.val); err != nil {
+			return fmt.Errorf("timeouts.%s %q: %v", f.name, f.val, err)
 		}
 	}
 	return nil
@@ -1687,6 +1712,9 @@ func validateFastCGI(f FastCGIConfig) error {
 		if fastCGIReservedParams[strings.ToUpper(strings.TrimSpace(k))] {
 			return fmt.Errorf("params: %s is set by nvelox (the script it checked under document_root) and cannot be overridden", k)
 		}
+	}
+	if err := validateFastCGITimeouts(f.Timeouts); err != nil {
+		return err
 	}
 	if f.ScriptName != "" {
 		if strings.ContainsAny(f.ScriptName, "\\\x00") {

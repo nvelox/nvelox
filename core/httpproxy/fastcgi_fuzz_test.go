@@ -17,12 +17,14 @@ import (
 
 // fcgiReply is what the fake FastCGI upstream answers: the CGI output
 // (headers, a blank line, the body) in STDOUT records, or, raw, the bytes
-// it writes in place of any record. Before the STDOUT records it can send
-// stderr, in a STDERR record, and then wait for wait to close (at most 5 s).
+// it writes in place of any record. Before out it can send stderr (in a
+// STDERR record) and a first part of the output, head, and then wait for
+// wait to close (at most 5 s).
 type fcgiReply struct {
 	raw    bool
 	out    []byte
 	stderr []byte
+	head   []byte
 	wait   <-chan struct{}
 }
 
@@ -69,6 +71,9 @@ func serveFakeFCGI(ln net.Listener, current *atomic.Pointer[fcgiReply]) {
 				return
 			}
 			if r.stderr != nil && writeFCGIRecord(c, 7, id, r.stderr) != nil {
+				return
+			}
+			if r.head != nil && writeFCGIRecord(c, 6, id, r.head) != nil {
 				return
 			}
 			if r.wait != nil {

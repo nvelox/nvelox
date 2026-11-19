@@ -82,7 +82,7 @@ Every table and chart, latency, CPU and memory of each proxy, the setup and how 
 - **Passive Health Checks** — mark down after N consecutive failures
 - **Retries / Failover** — retry on connect failure, 502, 503; skip failed servers
 - **Circuit Breaker** — closed/open/half-open state machine per backend
-- **Configurable Timeouts** — per listener: `read_header`, `idle`, and `read` / `write`, which limit how long a client may stall, not how long a transfer may take (a quiet event stream, or a long upload or download that keeps moving, is never cut); applied per request after Host-based routing, so sites sharing a bind port can differ. Per backend: `connect`, `response_header` (time to start answering, else 504) and `read` (longest silence once answering)
+- **Configurable Timeouts** — per listener: `read_header`, `idle`, and `read` / `write`, which limit how long a client may stall, not how long a transfer may take (a quiet event stream, or a long upload or download that keeps moving, is never cut); applied per request after Host-based routing, so sites sharing a bind port can differ. Per backend: `connect`, `response_header` (time to start answering, else 504) and `read` (longest silence once answering); per `fastcgi` route: `connect` and `response_header`, as on a backend
 - **Graceful Shutdown** — on `SIGINT` or `SIGTERM` nvelox accepts nothing new and answers the HTTP requests in flight (HTTP/1.1, HTTP/2 and HTTP/3) before it exits; `server.shutdown_timeout` sets how long it waits for them (default 10 s)
 
 ### Response Processing
@@ -231,6 +231,9 @@ listeners:
           pass: "127.0.0.1:9000"
           document_root: "/var/www/html"
           split_path_info: "^(.+\\.php)(/.*)$"
+          timeouts:
+            connect: 5s           # unset: the listener's timeouts.connect, else 10s
+            response_header: 60s  # unset: 60s
 
       - match:
           path_prefix: "/"
@@ -248,7 +251,9 @@ string as `QUERY_STRING`) goes through the ACL and the routes again and lands
 on the PHP route. Static routes never serve `.php`, `.phtml`
 or `.phar` files as files. A `fastcgi` route needs `document_root`, and
 nvelox hands PHP-FPM only an existing `.php` file inside it — nvelox must see
-the document root at the same path as PHP-FPM.
+the document root at the same path as PHP-FPM. Its `timeouts` are a
+backend's: the dial gives up after `connect` (502), and PHP-FPM has
+`response_header` to start answering once it has the request body (504).
 
 ### Full Production (all features)
 ```yaml
