@@ -15,6 +15,7 @@ import (
 	"nvelox/core/httppath"
 	"nvelox/core/httpproxy/errorhtml"
 	"nvelox/core/logging"
+	"nvelox/core/metrics"
 	"nvelox/proxy"
 )
 
@@ -23,17 +24,31 @@ import (
 // answer with nvelox's error pages and within server.http3's limits.
 func init() {
 	web.SetHooks(web.Hooks{
-		Errorf:        logging.Error,
-		Warnf:         logging.Warn,
-		Debugf:        logging.Debug,
-		AccessHead:    logging.AppendAccessHTTPHead,
-		AccessMid:     logging.AppendAccessHTTPMid,
-		AccessTail:    logging.AppendAccessHTTPTail,
-		WriteAccess:   logging.WriteAccess,
-		CanonicalPath: httppath.Canonical,
-		ErrorPage:     errorhtml.DefaultErrorPage,
-		H3Limits:      fastH3Limits,
+		Errorf:             logging.Error,
+		Warnf:              logging.Warn,
+		Debugf:             logging.Debug,
+		AccessHead:         logging.AppendAccessHTTPHead,
+		AccessMid:          logging.AppendAccessHTTPMid,
+		AccessTail:         logging.AppendAccessHTTPTail,
+		WriteAccess:        logging.WriteAccess,
+		CanonicalPath:      httppath.Canonical,
+		ErrorPage:          errorhtml.DefaultErrorPage,
+		H3Limits:           fastH3Limits,
+		H3HandshakeRefused: h3HandshakeRefused,
 	})
+}
+
+// h3RefusedPerSource counts the first packets of QUIC clients the event
+// loops dropped because their address had server.http3.handshakes_per_source
+// handshakes running.
+var h3RefusedPerSource = metrics.Default.GetCounter("nvelox_h3_handshakes_refused_total", map[string]string{"reason": "per_source"})
+
+// h3HandshakeRefused counts a QUIC client's first packet an event loop
+// dropped, by the reason the loop gives (Hooks.H3HandshakeRefused).
+func h3HandshakeRefused(reason string) {
+	if reason == "per_source" {
+		h3RefusedPerSource.Inc()
+	}
 }
 
 // This file is a bind group's side of its server on the event loops (the

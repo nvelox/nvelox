@@ -39,11 +39,12 @@ server:
   # ends nvelox at once.
   # shutdown_timeout: "10s"
   # http3: the limits of HTTP/3 connections, for every listener with
-  # `http3: true`. Each is a size: a whole number with B, KB, MB or GB
-  # (KB is 1024 bytes). Zero is not taken. Not set, each has the default
-  # shown. A reload applies them: the two totals at once, socket_buffer to
-  # the bind addresses started after it, the others to the connections
-  # opened after it.
+  # `http3: true`. Each is a size, a whole number with B, KB, MB or GB
+  # (KB is 1024 bytes), but for handshakes_per_source, a count. A size of
+  # zero is not taken. Not set, each has the default shown. A reload
+  # applies them: the two totals and handshakes_per_source at once,
+  # socket_buffer to the bind addresses started after it, the others to
+  # the connections opened after it.
   # http3:
   #   # The largest header section a request may have; a larger one is
   #   # answered 431. A connection may have 100 requests open, and so hold
@@ -83,10 +84,19 @@ server:
   #   # a process started with CAP_NET_ADMIN. A listener whose sockets got
   #   # less says so in a startup WARNING. 64KB to 64MB.
   #   socket_buffer: "4MB"
-  #   # max_send_buffer, the two totals and socket_buffer belong to the
-  #   # QUIC transport nvelox runs on Linux. On other platforms they change
-  #   # nothing (a startup WARNING says so) and the other three are read
-  #   # when a bind address starts.
+  #   # How many QUIC handshakes one client address (an IPv4 address, an
+  #   # IPv6 /64; behind a trusted relay, the client it names) may have
+  #   # running at once on each event loop. A handshake costs a good part
+  #   # of a millisecond of CPU and holds TLS state for up to 10 s: without
+  #   # this, one address could take every place of a loop. The first
+  #   # packets of its further clients are dropped (they send them again)
+  #   # and counted in nvelox_h3_handshakes_refused_total. Clients behind
+  #   # one address (a company's NAT) share it. 0 (no limit) to 4096.
+  #   handshakes_per_source: 32
+  #   # max_send_buffer, the two totals, socket_buffer and
+  #   # handshakes_per_source belong to the QUIC transport nvelox runs on
+  #   # Linux. On other platforms they change nothing (a startup WARNING
+  #   # says so) and the other three are read when a bind address starts.
 
 # ─── Logging ───────────────────────────────────────────────
 # Log files are created 0640 in 0750 directories (an existing file is

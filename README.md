@@ -317,7 +317,7 @@ backends:
 
 ### HTTP/3 limits
 
-The limits of HTTP/3 connections are settings under `server.http3`, for every listener with `http3: true`. Each is a size (`64KB`, `16MB`, `2GB`); the values below are the defaults.
+The limits of HTTP/3 connections are settings under `server.http3`, for every listener with `http3: true`. Each is a size (`64KB`, `16MB`, `2GB`), but for `handshakes_per_source`, a count; the values below are the defaults.
 
 ```yaml
 server:
@@ -329,9 +329,10 @@ server:
     # max_send_memory: "2GB"               # all connections together: what they hold to send
     # max_receive_memory: "2GB"            # all connections together: upload windows beyond the first
     socket_buffer: "4MB"                   # asked for each UDP socket (one per event loop), to receive and to send
+    handshakes_per_source: 32              # QUIC handshakes one client address may have running on each loop; 0: no limit
 ```
 
-The two totals default to an eighth of the memory nvelox may use (64 MiB at the least). A reload applies all seven: the totals at once, `socket_buffer` to bind addresses started after it, the others to connections opened after it. `nvelox.example.yaml` says what each one costs and gains.
+The two totals default to an eighth of the memory nvelox may use (64 MiB at the least). `handshakes_per_source` counts an IPv4 address, or an IPv6 /64, and behind a trusted relay the client it names: the first packets of further clients are dropped (they send them again) and counted in `nvelox_h3_handshakes_refused_total{reason="per_source"}`, and clients behind one address, a company's NAT say, share it. A reload applies all eight: the totals and `handshakes_per_source` at once, `socket_buffer` to bind addresses started after it, the others to connections opened after it. `nvelox.example.yaml` says what each one costs and gains.
 
 The kernel grants a socket buffer up to `net.core.rmem_max` and `net.core.wmem_max` (208 KiB each by default), and all of it to a process started with `CAP_NET_ADMIN`. With a small receive buffer a fast upload loses datagrams before nvelox reads them. A listener whose sockets got less than `socket_buffer` says so in a startup warning; raising the two kernel limits to the value of `socket_buffer` or more settles it.
 

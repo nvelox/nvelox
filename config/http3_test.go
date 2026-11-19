@@ -14,7 +14,7 @@ func TestHTTP3_Defaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := HTTP3Limits{MaxHeaderSize: 64 << 10, MaxSendBuffer: 16 << 20, MaxStreamReceiveWindow: 6 << 20, MaxConnectionReceiveWindow: 15 << 20,
-		SocketBuffer: 4 << 20}
+		SocketBuffer: 4 << 20, HandshakesPerSource: 32}
 	if got := cfg.Server.HTTP3.Resolve(); got != want {
 		t.Errorf("nothing set: %+v, want %+v (the two totals 0: a share of the memory)", got, want)
 	}
@@ -38,12 +38,14 @@ func TestHTTP3_EveryKey(t *testing.T) {
     max_send_memory: "512MB"
     max_receive_memory: "3GB"
     socket_buffer: "1MB"
+    handshakes_per_source: 8
 `)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := HTTP3Limits{MaxHeaderSize: 32 << 10, MaxSendBuffer: 8 << 20, MaxStreamReceiveWindow: 2 << 20,
-		MaxConnectionReceiveWindow: 4 << 20, MaxSendMemory: 512 << 20, MaxReceiveMemory: 3 << 30, SocketBuffer: 1 << 20}
+		MaxConnectionReceiveWindow: 4 << 20, MaxSendMemory: 512 << 20, MaxReceiveMemory: 3 << 30, SocketBuffer: 1 << 20,
+		HandshakesPerSource: 8}
 	if got := cfg.Server.HTTP3.Resolve(); got != want {
 		t.Errorf("resolved to %+v, want %+v", got, want)
 	}
@@ -52,7 +54,7 @@ func TestHTTP3_EveryKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	want = HTTP3Limits{MaxHeaderSize: 64 << 10, MaxSendBuffer: 4 << 20, MaxStreamReceiveWindow: 6 << 20, MaxConnectionReceiveWindow: 15 << 20,
-		SocketBuffer: 4 << 20}
+		SocketBuffer: 4 << 20, HandshakesPerSource: 32}
 	if got := cfg.Server.HTTP3.Resolve(); got != want {
 		t.Errorf("one key set: %+v, want %+v", got, want)
 	}
@@ -170,6 +172,13 @@ func TestHTTP3_Warnings(t *testing.T) {
 	if w := http3Warnings(HTTP3Config{}, "darwin"); len(w) != 0 {
 		t.Errorf("nothing set: warnings %q", w)
 	}
+	per := 8
+	if w := http3Warnings(HTTP3Config{HandshakesPerSource: &per}, "darwin"); len(w) != 1 || !strings.Contains(w[0], "server.http3.handshakes_per_source ") {
+		t.Errorf("handshakes_per_source set on darwin: warnings %q, want one naming it", w)
+	}
+	if w := http3Warnings(HTTP3Config{HandshakesPerSource: &per}, "linux"); len(w) != 0 {
+		t.Errorf("handshakes_per_source set on Linux: warnings %q", w)
+	}
 	// The startup warnings carry them, and nothing for server.pid_file,
 	// which is implemented.
 	got := serverWarnings(ServerConfig{PidFile: "/run/nvelox.pid", HTTP3: all}, "darwin", 8)
@@ -179,5 +188,43 @@ func TestHTTP3_Warnings(t *testing.T) {
 	}
 	if got := ServerWarnings(ServerConfig{HTTP3: all}); len(got) != len(http3Warnings(all, runtime.GOOS)) {
 		t.Errorf("ServerWarnings on this platform: %q", got)
+	}
+}
+
+// server.http3.handshakes_per_source is a count: 32 when it is not set, 0
+// for no limit, refused below 0, above 4096 (all of a loop's handshakes)
+// and when it is not a whole number.
+func TestHTTP3_HandshakesPerSource(t *testing.T) {
+	for _, c := range []struct {
+		val  string
+		want int
+		err  string
+	}{
+		{"", 32, ""},
+		{"0", 0, ""},
+		{"8", 8, ""},
+		{"4096", 4096, ""},
+		{"-1", 0, "server.http3.handshakes_per_source: -1 is outside 0 (no limit) to 4096"},
+		{"4097", 0, "server.http3.handshakes_per_source: 4097 is outside 0 (no limit) to 4096"},
+		{"\"32KB\"", 0, "cannot unmarshal"}, // the loader names the line, as for any whole-number setting
+	} {
+		server := ""
+		if c.val != "" {
+			server = "server:\n  http3:\n    handshakes_per_source: " + c.val + "\n"
+		}
+		cfg, err := loadWithServer(t, server)
+		if c.err != "" {
+			if err == nil || !strings.Contains(err.Error(), c.err) {
+				t.Errorf("handshakes_per_source %s: %v, want an error naming %q", c.val, err, c.err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("handshakes_per_source %s: %v", c.val, err)
+			continue
+		}
+		if got := cfg.Server.HTTP3.Resolve().HandshakesPerSource; got != c.want {
+			t.Errorf("handshakes_per_source %q: resolved to %d, want %d", c.val, got, c.want)
+		}
 	}
 }

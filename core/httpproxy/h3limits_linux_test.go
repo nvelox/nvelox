@@ -158,10 +158,11 @@ func TestHTTP3Limits_QuicGoServer(t *testing.T) {
 }
 
 // server.http3 reaches the loops as it is configured: each of its sizes, in
-// the form they take them; the two totals apply at once; and they are told
+// the form they take them, and handshakes_per_source; the two totals apply at once; and they are told
 // by the pointer that the limits changed, never when they did not.
 func TestHTTP3Limits_ReachTheLoops(t *testing.T) {
-	defaults := web.H3Limits{MaxHeaderSize: 64 << 10, MaxSendBuffer: 16 << 20, MaxStreamReceiveWindow: 6 << 20, MaxConnectionReceiveWindow: 15 << 20, SocketBuffer: 4 << 20}
+	defaults := web.H3Limits{MaxHeaderSize: 64 << 10, MaxSendBuffer: 16 << 20, MaxStreamReceiveWindow: 6 << 20, MaxConnectionReceiveWindow: 15 << 20, SocketBuffer: 4 << 20,
+		HandshakesPerSource: 32}
 	if got := *fastH3Limits(); got != defaults {
 		t.Errorf("with nothing configured the loops are given %+v, want %+v", got, defaults)
 	}
@@ -169,10 +170,13 @@ func TestHTTP3Limits_ReachTheLoops(t *testing.T) {
 	if fastH3Limits() != first {
 		t.Error("limits that did not change are another pointer the second time: every connection would take them for new ones")
 	}
+	perSource := 5
 	useHTTP3Limits(t, config.HTTP3Config{MaxHeaderSize: "8KB", MaxSendBuffer: "1MB", MaxStreamReceiveWindow: "2MB",
-		MaxConnectionReceiveWindow: "3MB", MaxSendMemory: "128MB", MaxReceiveMemory: "256MB", SocketBuffer: "128KB"})
+		MaxConnectionReceiveWindow: "3MB", MaxSendMemory: "128MB", MaxReceiveMemory: "256MB", SocketBuffer: "128KB",
+		HandshakesPerSource: &perSource})
 	want := web.H3Limits{MaxHeaderSize: 8 << 10, MaxSendBuffer: 1 << 20, MaxStreamReceiveWindow: 2 << 20,
-		MaxConnectionReceiveWindow: 3 << 20, MaxSendMemory: 128 << 20, MaxReceiveMemory: 256 << 20, SocketBuffer: 128 << 10}
+		MaxConnectionReceiveWindow: 3 << 20, MaxSendMemory: 128 << 20, MaxReceiveMemory: 256 << 20, SocketBuffer: 128 << 10,
+		HandshakesPerSource: 5}
 	if got := *fastH3Limits(); got != want {
 		t.Errorf("the loops are given %+v, want %+v", got, want)
 	}

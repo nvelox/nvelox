@@ -47,18 +47,19 @@ func TestEngine_HTTP3Limits(t *testing.T) {
 		t.Fatal("engine did not start")
 	}
 	want := config.HTTP3Limits{MaxHeaderSize: 32 << 10, MaxSendBuffer: 16 << 20, MaxStreamReceiveWindow: 6 << 20,
-		MaxConnectionReceiveWindow: 15 << 20, MaxSendMemory: 128 << 20, SocketBuffer: 4 << 20}
+		MaxConnectionReceiveWindow: 15 << 20, MaxSendMemory: 128 << 20, SocketBuffer: 4 << 20, HandshakesPerSource: 32}
 	if got := httpproxy.HTTP3Limits(); got != want {
 		t.Errorf("after the start the limits in use are %+v, want %+v", got, want)
 	}
 
+	perSource := 8
 	cfg.Server.HTTP3 = config.HTTP3Config{MaxSendBuffer: "4MB", MaxStreamReceiveWindow: "1MB", MaxConnectionReceiveWindow: "2MB", MaxReceiveMemory: "64MB",
-		SocketBuffer: "1MB"}
+		SocketBuffer: "1MB", HandshakesPerSource: &perSource}
 	if err := e.Reload(&cfg); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	want = config.HTTP3Limits{MaxHeaderSize: 64 << 10, MaxSendBuffer: 4 << 20, MaxStreamReceiveWindow: 1 << 20,
-		MaxConnectionReceiveWindow: 2 << 20, MaxReceiveMemory: 64 << 20, SocketBuffer: 1 << 20}
+		MaxConnectionReceiveWindow: 2 << 20, MaxReceiveMemory: 64 << 20, SocketBuffer: 1 << 20, HandshakesPerSource: 8}
 	if got := httpproxy.HTTP3Limits(); got != want {
 		t.Errorf("after the reload the limits in use are %+v, want %+v", got, want)
 	}
