@@ -84,7 +84,10 @@ type Engine struct {
 	// udpClientReadTimeout ends a session of a listener socket whose client
 	// has sent nothing for this long (udpsock.go).
 	udpClientReadTimeout time.Duration
-	l4Handler            *ProxyEventHandler // set by Start (under reloadMu)
+	// tcpIdleDefault is a tcp listener's timeouts.idle when it sets none,
+	// with tls or without (defaultL4IdleTimeout; tests lower it).
+	tcpIdleDefault time.Duration
+	l4Handler      *ProxyEventHandler // set by Start (under reloadMu)
 }
 
 type ListenerConfig struct {
@@ -183,6 +186,7 @@ func NewEngine(cfg *config.Config) *Engine {
 		udpMaxSessionsPerIP:  maxUDPSessionsPerIP,
 		udpNoReplyTimeout:    udpNoReplyTimeout,
 		udpClientReadTimeout: udpClientReadTimeout,
+		tcpIdleDefault:       defaultL4IdleTimeout,
 	}
 	if cfg != nil {
 		e.shutdownTimeout.Store(int64(cfg.Server.ResolveShutdownTimeout()))
@@ -1472,9 +1476,9 @@ func (e *Engine) handleTLSConn(rawConn net.Conn, tlsConfig *tls.Config, l *Liste
 	// Bidirectional relay with half-close semantics (relay.go): a backend that
 	// closes first gets its whole response delivered followed by close_notify
 	// + FIN; a client that half-closes still gets the backend's answer. The
-	// idle timeout applies only when timeouts.idle is set — this path never
-	// had a default one.
-	res := relayL4(clientConn, backendConn, l.Timeouts.ParseIdle())
+	// idle timeout is a plain tcp listener's: timeouts.idle, else 5 minutes
+	// (this path had none until 2.0.0).
+	res := relayL4(clientConn, backendConn, e.tcpIdleTimeout(l))
 	if res.Err != nil {
 		logging.Debug("[CONN] TLS %s ended with error: %v", client, res.Err)
 	}

@@ -744,11 +744,11 @@ type TimeoutConfig struct {
 	Write string `yaml:"write,omitempty"`
 	// How long a connection may stay idle on a listener: on http and https
 	// a kept-alive connection between requests (default 120s; the
-	// listeners on one bind address share the largest they set); on tcp a
-	// connection with no traffic either way (default 5m; with tls, no limit
-	// unless set). A udp session ends after 60 seconds without a datagram
-	// from its client, whatever this says. "0": no limit. Refused on a
-	// backend and on a fastcgi route.
+	// listeners on one bind address share the largest they set); on tcp, with
+	// tls or without, a connection with no traffic either way (default 5m).
+	// A udp session ends after 60 seconds without a datagram from its
+	// client, whatever this says. "0": no limit. Refused on a backend and
+	// on a fastcgi route.
 	Idle string `yaml:"idle,omitempty"`
 	// On a backend, or a fastcgi route: how long a server may take to
 	// start answering once it has the request. Default 60s, then 504.

@@ -54,7 +54,7 @@ type l4FastSess struct {
 // serve gate opens.
 func (e *Engine) startL4Fast(ln net.Listener, l *ListenerConfig, h *ProxyEventHandler) error {
 	f := &l4FastServer{e: e, h: h, l: l}
-	t, err := relay.NewTCP(relay.TCPConfig{Listener: ln, IdleTimeout: l4IdleTimeout(l), Context: e.runCtx, Host: f})
+	t, err := relay.NewTCP(relay.TCPConfig{Listener: ln, IdleTimeout: e.tcpIdleTimeout(l), Context: e.runCtx, Host: f})
 	if err != nil {
 		return fmt.Errorf("TCP listener %s: %v", l.Name, err)
 	}

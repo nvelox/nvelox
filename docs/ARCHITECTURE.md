@@ -356,7 +356,7 @@ Command line: `-config` (default `nvelox.yaml`), `-check` (check that file and e
 | `accept_proxy_from` | L4 trust for an inbound PROXY v2 header. Empty means trust nobody. CIDRs are validated at load (`config/config.go:663-670`) |
 | `rate_limit`, `ip_rate_limit` | Token buckets: per listener (connections on L4, requests on L7) and per client IP on L7 (`core/engine.go:128-135`, `core/httpproxy/server.go:439-452`) |
 | `ip_allowlist`, `ip_denylist`, `acl`, `max_body_size` | Static controls. The IP lists and ACL apply to HTTP requests and to TCP, TLS and UDP sessions; on tcp/udp listeners an ACL rule may match `source_ip` only. Entries must be valid IPs/CIDRs, ACL actions are `allow` or `deny` with `status` 100-599, and `path_regex` must compile (`config/config.go`) |
-| `timeouts` | `connect`: the default dial timeout of the listener's backends, L4 and HTTP (10 s). On HTTP: `read_header` (10 s), `idle` (120 s), and `read` / `write` (60 s each): how long the client may stall sending its body or taking the response, armed only while a read or write waits (a quiet stream or a transfer that keeps moving is never cut) (`core/httpproxy/stall.go`). `idle` on L4 TCP (5 min) (`core/relay.go:54-62`). `response_header` is refused here: it is a backend setting |
+| `timeouts` | `connect`: the default dial timeout of the listener's backends, L4 and HTTP (10 s). On HTTP: `read_header` (10 s), `idle` (120 s), and `read` / `write` (60 s each): how long the client may stall sending its body or taking the response, armed only while a read or write waits (a quiet stream or a transfer that keeps moving is never cut) (`core/httpproxy/stall.go`). `idle` on L4 TCP, with TLS or without (5 min) (`core/relay.go`). `response_header` is refused here: it is a backend setting |
 | `request_id.enabled`, `trust_inbound` | Mint or keep `X-Request-ID`. Inbound ids must be hex or dash and at most 128 chars (`core/httpproxy/requestid.go:42-85`) |
 | `routes[]` | `match` on `host`, `path_prefix` or `path_regex`, then `backend`, `redirect`, `rewrite`, `headers`, `static`, `try_files`, `fastcgi`, `expires` (`config/config.go:278-331`) |
 | `backends[].balance`, `servers` | `roundrobin` (default), `leastconn` or `random`. At least one server (`config/config.go:593-627`) |
@@ -392,7 +392,7 @@ Every HTTP response gets exactly one line, written when the request ends (for a 
 | Limit | Value | Code |
 |---|---|---|
 | L4 dial | 10 s default | `config/config.go:362-371` |
-| L4 TCP idle (no bytes either way) | 5 min default, `0` disables | `core/relay.go:54-62` |
+| L4 TCP idle (no bytes either way), with TLS or without | 5 min default, `0` disables | `core/relay.go` |
 | Inbound PROXY header wait, trusted peer | 5 s on plain TCP, 10 s on TLS L4 | `core/l4tcp.go:25`, `core/engine.go:962-966` |
 | UDP sessions | 16,384 per process, 512 per client IP; a session ends 60 s after the client's last datagram, and apart from that 10 s after its backend socket opened if the backend never answered, else 60 s after the backend's last reply; 1 MiB of datagrams kept while a backend's host name is looked up. Refusals count in `nvelox_udp_dropped_total{reason}` | `core/udpsession.go`, `core/handler.go` |
 | L4 TLS handshake | 10 s, completed before the backend is dialed; trusted PROXY header wait 10 s | `core/engine.go` |

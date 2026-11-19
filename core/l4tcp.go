@@ -258,6 +258,6 @@ func (h *ProxyEventHandler) serveTCP(clientConn net.Conn, l *ListenerConfig) {
 	balancer.OnConnect(target)
 	defer balancer.OnDisconnect(target)
 
-	res := relayL4(clientConn, backendConn, l4IdleTimeout(l))
+	res := relayL4(clientConn, backendConn, e.tcpIdleTimeout(l))
 	sessErr = res.Err
 }
