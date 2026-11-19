@@ -263,7 +263,9 @@ type Listener struct {
 	RateLimit RateLimitConfig `yaml:"rate_limit,omitempty"`
 
 	// How long the listener waits for its clients, and how long it gives
-	// a backend to accept a connection.
+	// a backend to accept a connection. Refused on a udp listener: a udp
+	// session ends after 60 seconds without a datagram from its client, or
+	// 10 seconds without a reply from its backend.
 	Timeouts TimeoutConfig `yaml:"timeouts,omitempty"`
 
 	// The certificate an https listener, or a tcp listener that ends TLS,
@@ -286,10 +288,12 @@ type Listener struct {
 	// Addresses and ranges refused, with the same client as ip_allowlist.
 	IPDenylist []string `yaml:"ip_denylist,omitempty"`
 	// The largest request body an http or https listener takes, such as
-	// "10MB"; a larger one is answered 413. Empty: no limit.
+	// "10MB"; a larger one is answered 413. Empty: no limit. Refused on tcp
+	// and udp listeners.
 	MaxBodySize string `yaml:"max_body_size,omitempty"`
 	// A limit of requests a second for each client address, on http and
-	// https listeners: past it a request is answered 429.
+	// https listeners: past it a request is answered 429. Refused on tcp
+	// and udp listeners.
 	IPRateLimit IPRateLimitConfig `yaml:"ip_rate_limit,omitempty"`
 	// Rules that allow or refuse requests by their client, method, path
 	// and headers, checked in order: the first that matches decides, and
@@ -306,7 +310,8 @@ type Listener struct {
 	// address. Empty: nobody is trusted. List only the proxies themselves:
 	// behind a Kubernetes Service with externalTrafficPolicy: Cluster, every
 	// packet comes from a node's address, so a range of node addresses
-	// would trust every client.
+	// would trust every client. Refused on tcp and udp listeners, which
+	// learn the client from a relay's header (accept_proxy_from).
 	//
 	// TrustedProxies: CIDRs whose X-Forwarded-For / X-Real-IP / X-Forwarded-Proto
 	// headers are trusted and extended. Requests from any other source have
@@ -396,23 +401,28 @@ type Listener struct {
 	HTTP3 bool `yaml:"http3,omitempty"`
 	// Rules that pick, for each request of an http or https listener, the
 	// backend, the files or the FastCGI server that answers it, checked in
-	// order: the first route that matches takes the request.
+	// order: the first route that matches takes the request. Refused on tcp
+	// and udp listeners.
 	Routes []RouteConfig `yaml:"routes,omitempty"`
 	// Request and response headers added, set or removed for every request
-	// of the listener.
+	// of an http or https listener. Refused on tcp and udp listeners.
 	Headers HeadersConfig `yaml:"headers,omitempty"`
-	// Compresses responses with gzip, for the clients that accept it.
+	// Compresses responses with gzip, for the clients that accept it, on
+	// http and https listeners. Refused on tcp and udp listeners.
 	Compression CompressionConfig `yaml:"compression,omitempty"`
 	// Pages of your own for error answers, by status code, such as
 	// 404: "/etc/nvelox/404.html": a file read at start and at each reload
 	// (one that cannot be read is logged, and the built-in page is used).
+	// Refused on tcp and udp listeners.
 	ErrorPages map[int]string `yaml:"error_pages,omitempty"`
 	// Not built for a listener: a listener that sets it is refused at load.
 	// A route's static.root serves files.
 	Root string `yaml:"root,omitempty"`
-	// The size of the buffer response bodies are copied through.
+	// The size of the buffer response bodies are copied through. Refused
+	// on tcp and udp listeners.
 	Buffering BufferingConfig `yaml:"buffering,omitempty"`
-	// A cache of responses in memory.
+	// A cache of responses in memory, on http and https listeners. Refused
+	// on tcp and udp listeners.
 	Cache CacheConfig `yaml:"cache,omitempty"`
 	// Not built yet: a listener that sets it to true is refused at load.
 	// gRPC is proxied to backends with backend_tls without it.
@@ -421,7 +431,8 @@ type Listener struct {
 	Throttle ThrottleConfig `yaml:"throttle,omitempty"`
 	// A request ID (X-Request-ID) for every request: kept from the client
 	// when it is trusted, else made, passed to the backend, returned to the
-	// client and written in the access log.
+	// client and written in the access log. Refused on tcp and udp
+	// listeners.
 	RequestID RequestIDConfig `yaml:"request_id,omitempty"`
 
 	// Turns this listener's access-log lines on or off, whatever
@@ -746,9 +757,7 @@ type TimeoutConfig struct {
 	// a kept-alive connection between requests (default 120s; the
 	// listeners on one bind address share the largest they set); on tcp, with
 	// tls or without, a connection with no traffic either way (default 5m).
-	// A udp session ends after 60 seconds without a datagram from its
-	// client, whatever this says. "0": no limit. Refused on a backend and
-	// on a fastcgi route.
+	// "0": no limit. Refused on a backend and on a fastcgi route.
 	Idle string `yaml:"idle,omitempty"`
 	// On a backend, or a fastcgi route: how long a server may take to
 	// start answering once it has the request. Default 60s, then 504.
@@ -1431,6 +1440,9 @@ func validate(cfg *Config) error {
 				return fmt.Errorf("listener %s: backend %s sets timeouts.%s, which only http/https listeners use; give this %s listener a backend without it",
 					l.Name, l.Backend, f, proto)
 			}
+			if err := rejectHTTPOnlyKeys(l, proto); err != nil {
+				return err
+			}
 		}
 
 		// Validate listener timeouts. response_header is a backend setting.
@@ -1538,6 +1550,43 @@ func rejectUnimplementedServerKeys(cfg *Config) error {
 	}
 	if w := cfg.Server.Workers; w < 0 || w > MaxWorkers {
 		return fmt.Errorf("server.workers: %d is not a number of event loops (1 to %d; leave it out for one per CPU core)", w, MaxWorkers)
+	}
+	return nil
+}
+
+// rejectHTTPOnlyKeys refuses, on a tcp or udp listener (proto), the
+// settings that only http and https listeners read, and on a udp listener
+// its timeouts, which no udp session reads (a session ends after
+// udpIdleTimeout without a datagram, or udpNoReplyTimeout without a reply,
+// in core). Each would otherwise be a control that silently does nothing
+// there: ip_rate_limit on a tcp listener reads like a limit and is none.
+func rejectHTTPOnlyKeys(l Listener, proto string) error {
+	h := l.Headers
+	var set []string
+	for _, k := range []struct {
+		name string
+		on   bool
+	}{
+		{"routes", len(l.Routes) > 0},
+		{"headers", len(h.RequestAdd)+len(h.RequestSet)+len(h.RequestRemove)+len(h.ResponseAdd)+len(h.ResponseSet)+len(h.ResponseRemove) > 0},
+		{"compression", l.Compression.Enabled || len(l.Compression.Types) > 0 || l.Compression.MinLength != 0},
+		{"cache", l.Cache.Enabled || l.Cache.MaxSize != "" || l.Cache.DefaultTTL != "" || len(l.Cache.Methods) > 0},
+		{"error_pages", len(l.ErrorPages) > 0},
+		{"buffering", l.Buffering.ResponseBuffer != ""},
+		{"max_body_size", l.MaxBodySize != ""},
+		{"ip_rate_limit", l.IPRateLimit != (IPRateLimitConfig{})},
+		{"request_id", l.RequestID != (RequestIDConfig{})},
+		{"trusted_proxies", len(l.TrustedProxies) > 0},
+	} {
+		if k.on {
+			set = append(set, k.name)
+		}
+	}
+	if len(set) > 0 {
+		return fmt.Errorf("listener %s: %s: only http and https listeners read these, a %s listener would ignore them; remove them", l.Name, strings.Join(set, ", "), proto)
+	}
+	if proto == "udp" && l.Timeouts != (TimeoutConfig{}) {
+		return fmt.Errorf("listener %s: timeouts do nothing on a udp listener (a session ends after 60s without a datagram from its client, or 10s without a reply from its backend); remove them", l.Name)
 	}
 	return nil
 }
