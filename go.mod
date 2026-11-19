@@ -22,3 +22,6 @@ require (
 	golang.org/x/text v0.44.0 // indirect
 	golang.org/x/tools/godoc v0.1.0-deprecated // indirect
 )
+
+// The FastCGI client is built from a copy that carries fixes: third_party/README.md.
+replace github.com/yookoala/gofast => ./third_party/gofast

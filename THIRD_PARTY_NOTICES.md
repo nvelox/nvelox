@@ -269,6 +269,8 @@ SOFTWARE.
 
 ## github.com/yookoala/gofast v0.8.0
 
+Built from the copy in `third_party/gofast`, with the changes listed in `third_party/README.md`.
+
 `LICENCE`:
 
 ```

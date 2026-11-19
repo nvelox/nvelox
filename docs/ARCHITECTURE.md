@@ -11,7 +11,7 @@ nvelox is a single-binary L4/L7 proxy and load balancer written in Go. It listen
 | Entrypoint | `main.go:25`: parse `-config`, `config.Load`, start `core.Engine`, handle SIGHUP and SIGUSR1 (`main.go:40-121`, `core/procsignal`) |
 | Listeners | Declared in config: `tcp`, `udp`, `http`, `https`, single port or range (`config/config.go:103-195`, `core/engine.go:588-655`). HTTP/3 over QUIC on `https` binds with `http3: true` (`core/httpproxy/bindgroup.go:358-379`). Admin REST API on `admin.bind`, loopback `127.0.0.1:9091` when empty (`core/admin/api.go:121-155`), Prometheus text on `metrics.bind`, loopback `127.0.0.1:9090` when empty (`core/engine.go:152-167`, `core/controlplane.go`) |
 | State | In memory only: runtime denylist, balancer and health status, sticky sessions, UDP sessions, rate-limit buckets, response cache. Nothing is persisted |
-| Main dependencies | `pires/go-proxyproto`, `quic-go/quic-go` (HTTP/3 where event loops are not supported, and its HTTP/3 client in the tests), `yookoala/gofast` (FastCGI), `gopkg.in/yaml.v3` (`go.mod:5-12`). No database, Redis or queue client |
+| Main dependencies | `pires/go-proxyproto`, `quic-go/quic-go` (HTTP/3 where event loops are not supported, and its HTTP/3 client in the tests), `yookoala/gofast` (FastCGI, built from the copy in `third_party/gofast`), `gopkg.in/yaml.v3` (`go.mod:5-12`). No database, Redis or queue client |
 
 ## Context
 
