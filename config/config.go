@@ -284,7 +284,7 @@ type Listener struct {
 	Headers     HeadersConfig     `yaml:"headers,omitempty"`
 	Compression CompressionConfig `yaml:"compression,omitempty"`
 	ErrorPages  map[int]string    `yaml:"error_pages,omitempty"` // status code -> file path
-	Root        string            `yaml:"root,omitempty"`        // Document root for static files
+	Root        string            `yaml:"root,omitempty"`        // NOT IMPLEMENTED: rejected at load when set (a route's static.root serves files)
 	Buffering   BufferingConfig   `yaml:"buffering,omitempty"`
 	Cache       CacheConfig       `yaml:"cache,omitempty"`
 	GRPC        bool              `yaml:"grpc,omitempty"`       // NOT IMPLEMENTED: rejected at load when true (gRPC is proxied to backend_tls backends without it)
@@ -1200,9 +1200,12 @@ func rejectUnimplementedServerKeys(cfg *Config) error {
 // rejectUnimplementedListenerKeys refuses listener keys that are parsed but
 // have no implementation (sni_routes, throttle, tls.ocsp_stapling,
 // tls.auto_cert, zero_copy, grpc, buffering.request_body_buffer,
-// routes[].scripts). Each would otherwise be a control that silently does
-// nothing.
+// routes[].scripts, root). Each would otherwise be a control that silently
+// does nothing.
 func rejectUnimplementedListenerKeys(l Listener) error {
+	if l.Root != "" {
+		return fmt.Errorf("listener %s: root is not implemented for a listener (nothing reads it); remove it, and serve files from a route with static.root", l.Name)
+	}
 	if l.ZeroCopy {
 		return fmt.Errorf("listener %s: zero_copy is not implemented (connections are relayed through a buffer per direction; no kernel splice would happen); remove it", l.Name)
 	}

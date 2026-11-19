@@ -39,7 +39,6 @@ listeners:
   - name: "php-app"
     bind: ":9080"
     protocol: "http"
-    root: "/var/www/html"
     routes:
       # Static assets — serve directly with long cache
       - match:

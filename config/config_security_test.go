@@ -101,6 +101,9 @@ func TestValidation_UnimplementedKeysRejected(t *testing.T) {
 			TLS: TLSConfig{Cert: cert, Key: key, AutoCert: true}}, "tls.auto_cert"},
 		{"request_body_buffer", Listener{Name: "l", Bind: ":80", Protocol: "http", Backend: "be",
 			Buffering: BufferingConfig{RequestBodyBuffer: "64KB"}}, "buffering.request_body_buffer"},
+		// Accepted and never read until 2.0.0 too: a route's static.root
+		// serves files, the listener's did nothing.
+		{"root", Listener{Name: "l", Bind: ":80", Protocol: "http", Backend: "be", Root: "/var/www/html"}, "root"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
