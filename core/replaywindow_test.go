@@ -503,3 +503,48 @@ func TestRelayWindows(t *testing.T) {
 		t.Errorf("%d windows left, want 1", n)
 	}
 }
+
+// A flood of sessions through one relay socket that are refused at once
+// (each ends as it begins): the list of windows to expire holds one entry
+// for the window, not one per session, and the window still goes
+// relayWindowKeep after the last session ended. Before, every end added an
+// entry kept for relayWindowKeep: memory followed the session rate.
+func TestRelayWindows_OneEntryPerWindow(t *testing.T) {
+	var ws relayWindows
+	keep := int64(relayWindowKeep)
+	a := netip.MustParseAddrPort("192.0.2.1:4000")
+	now := 1_000 * int64(time.Second)
+	const sessions = 100_000
+	for i := range int64(sessions) {
+		ws.detach(ws.attach(a, now+i), now+i)
+	}
+	if n := len(ws.idle); n != 1 {
+		t.Fatalf("%d entries in the list after %d sessions of one relay socket, want 1", n, sessions)
+	}
+	last := now + sessions - 1
+	ws.attach(netip.MustParseAddrPort("192.0.2.9:1"), last+keep)
+	if _, ok := ws.m[a]; !ok {
+		t.Fatal("the window was removed less than relayWindowKeep after its last session ended")
+	}
+	ws.attach(netip.MustParseAddrPort("192.0.2.9:2"), last+keep+1)
+	if _, ok := ws.m[a]; ok {
+		t.Fatal("the window was not removed relayWindowKeep after its last session ended")
+	}
+
+	// A window in use when its entry comes up stays, and is queued again
+	// when its last session ends.
+	b := netip.MustParseAddrPort("192.0.2.1:4001")
+	t0 := 10_000 * int64(time.Second)
+	wb := ws.attach(b, t0)
+	ws.detach(wb, t0)
+	wb = ws.attach(b, t0+1)
+	ws.attach(netip.MustParseAddrPort("192.0.2.9:3"), t0+keep+1)
+	if ws.m[b] != wb {
+		t.Fatal("a window in use was removed when its entry came up")
+	}
+	ws.detach(wb, t0+keep+2)
+	ws.attach(netip.MustParseAddrPort("192.0.2.9:4"), t0+2*keep+3)
+	if _, ok := ws.m[b]; ok {
+		t.Fatal("a window whose entry came up while in use was never removed after its last session ended")
+	}
+}

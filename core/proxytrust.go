@@ -68,6 +68,7 @@ type relayWindow struct {
 	peer     netip.AddrPort
 	sessions int   // the sessions that use it
 	ended    int64 // when the last of them ended (unix nanoseconds)
+	queued   bool  // it has an entry in relayWindows.idle
 }
 
 // relayWindows holds the windows of the relay sockets one event loop, or
@@ -79,9 +80,12 @@ type relayWindow struct {
 // that has the key adds one. Not safe for concurrent use.
 type relayWindows struct {
 	m map[netip.AddrPort]*relayWindow
-	// idle: the windows whose sessions all ended, in the order the last
-	// one did (one entry for each such end; a window used again since is
-	// passed over when its entry comes up).
+	// idle: the windows whose sessions all ended, about in the order the
+	// last one did. A window has one entry at most, however many sessions
+	// end: the list grows with the relay sockets, not with the sessions
+	// (a flood of sessions that are refused at once ends one each). A window
+	// used again since its entry was made is put back, at its later end,
+	// when the entry comes up.
 	idle []idleWindow
 }
 
@@ -115,7 +119,8 @@ func (t *relayWindows) attach(peer netip.AddrPort, now int64) *relayWindow {
 func (t *relayWindows) detach(w *relayWindow, now int64) {
 	w.sessions--
 	w.ended = now
-	if w.sessions == 0 {
+	if w.sessions == 0 && !w.queued {
+		w.queued = true
 		t.idle = append(t.idle, idleWindow{w, now})
 	}
 	t.expire(now)
@@ -130,11 +135,22 @@ func (t *relayWindows) expire(now int64) {
 		if now-e.ended <= int64(relayWindowKeep) {
 			return
 		}
-		if e.w.sessions == 0 && e.w.ended == e.ended && t.m[e.w.peer] == e.w {
-			delete(t.m, e.w.peer)
-		}
 		t.idle[0] = idleWindow{}
 		t.idle = t.idle[1:]
+		w := e.w
+		w.queued = false
+		switch {
+		case w.sessions > 0:
+			// In use: queued again when its last session ends.
+		case w.ended != e.ended:
+			// Used again since, and idle again from a later end: put
+			// back at that end (behind entries that may be older; a
+			// window goes at most relayWindowKeep late, never early).
+			w.queued = true
+			t.idle = append(t.idle, idleWindow{w, w.ended})
+		case t.m[w.peer] == w:
+			delete(t.m, w.peer)
+		}
 	}
 }
 
