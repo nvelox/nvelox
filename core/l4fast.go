@@ -169,18 +169,18 @@ func (f *l4FastServer) Target(s *relay.TCPSession) (relay.TCPTarget, bool) {
 	if backend != nil && backend.SendProxyV2 {
 		// PROXY v2 to the backend: the source is the client, the
 		// destination the address the client connected to.
-		// A signed header is bound to the connection to the backend by
-		// its port (from).
+		// A signed header is bound to the connection to the backend: the
+		// address it leaves from (from) and the backend's (to).
 		key := backend.SendProxyKey
 		t.PrefaceFrom = len(key) > 0
-		t.Preface = func(src, dst *net.TCPAddr, from netip.AddrPort) ([]byte, error) {
+		t.Preface = func(src, dst *net.TCPAddr, from, to netip.AddrPort) ([]byte, error) {
 			header := proxyproto.HeaderProxyFromAddrs(2, src, dst)
 			if len(key) > 0 {
-				if !from.IsValid() {
-					logging.Error("Failed to sign PROXY v2 header: the address of the connection to the backend is not known")
+				if !from.IsValid() || !to.IsValid() {
+					logging.Error("Failed to sign PROXY v2 header: the addresses of the connection to the backend are not known")
 					return nil, errNoSendAddr
 				}
-				if err := proxy.SignHeaderFrom(header, key, time.Now(), from.Port()); err != nil {
+				if err := proxy.SignHeaderFrom(header, key, time.Now(), proxy.Ends{Relay: from, Receiver: to}); err != nil {
 					logging.Error("Failed to sign PROXY v2 header: %v", err)
 					return nil, err
 				}

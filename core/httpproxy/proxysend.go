@@ -47,8 +47,9 @@ var errProxyAddr = errors.New("proxy protocol: the client's connection has no TC
 func sendsProxy(be *config.Backend) bool { return be != nil && be.SendProxyV2 }
 
 // backendProxyHeader returns the header of a connection opened for the
-// client at src, which connected to dst, signed with key when there is one.
-func backendProxyHeader(src, dst net.Addr, key []byte, now time.Time, from uint16) ([]byte, error) {
+// client at src, which connected to dst, signed with key when there is one
+// for the connection to the backend, whose ends are ends.
+func backendProxyHeader(src, dst net.Addr, key []byte, now time.Time, ends proxy.Ends) ([]byte, error) {
 	s, d := streamAddr(src), streamAddr(dst)
 	if s == nil || d == nil {
 		return nil, errProxyAddr
@@ -73,7 +74,7 @@ func backendProxyHeader(src, dst net.Addr, key []byte, now time.Time, from uint1
 		h.TransportProtocol = proxyproto.TCPv6
 	}
 	if len(key) > 0 {
-		if err := proxy.SignHeaderFrom(h, key, now, from); err != nil {
+		if err := proxy.SignHeaderFrom(h, key, now, ends); err != nil {
 			return nil, err
 		}
 	}
@@ -297,7 +298,7 @@ const proxyHeaderWriteTimeout = 10 * time.Second
 // writeBackendProxyHeader writes the header for the client at src (which
 // connected to dst) on c, a connection just opened to a backend.
 func writeBackendProxyHeader(ctx context.Context, c net.Conn, src, dst net.Addr, key []byte) error {
-	hdr, err := backendProxyHeader(src, dst, key, time.Now(), tcpPort(c.LocalAddr()))
+	hdr, err := backendProxyHeader(src, dst, key, time.Now(), proxy.RelayEnds(c.LocalAddr(), c.RemoteAddr()))
 	if err != nil {
 		return err
 	}

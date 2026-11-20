@@ -392,7 +392,7 @@ func (h *ProxyEventHandler) OnData(c *udpConn, data []byte) {
 			// With accept_proxy_key_file the header must be signed over this
 			// datagram: a forged relay datagram cannot name a client, and a
 			// copy of one is refused by its relay socket's window.
-			counter, counted, drop := l.proxyTrust.relayDatagram(hdr, data[consumed:], c.remote.Port())
+			counter, counted, drop := l.proxyTrust.relayDatagram(hdr, data[consumed:], proxy.Ends{Relay: c.remote, Receiver: c.dest})
 			if drop == "" && counted && !c.sock.takeCounter(ctx, c.remote, counter) {
 				drop = udpDropReplayed
 			}
@@ -857,7 +857,7 @@ func (h *ProxyEventHandler) sendKey(l *ListenerConfig) []byte {
 
 // writeWithProxy writes data to peer, optionally prepending a PROXY v2
 // header, signed over data when key is set (send_proxy_key_file) for peer's
-// port with the next counter of sent, peer's. When hdr is empty this is a
+// two ends with the next counter of sent, peer's. When hdr is empty this is a
 // plain peer.Write(data) — the hot path for backends without send_proxy_v2.
 func writeWithProxy(peer net.Conn, hdr, key, data []byte, sent *atomic.Uint64) (int, error) {
 	if len(hdr) == 0 {
@@ -868,7 +868,7 @@ func writeWithProxy(peer net.Conn, hdr, key, data []byte, sent *atomic.Uint64) (
 			sent = new(atomic.Uint64)
 		}
 		now := time.Now()
-		signed, err := proxy.SignedHeaderBytesFrom(hdr, key, data, now, uint16(portOf(peer.LocalAddr())), proxy.NextCounter(sent, now))
+		signed, err := proxy.SignedHeaderBytesFrom(hdr, key, data, now, proxy.RelayEnds(peer.LocalAddr(), peer.RemoteAddr()), proxy.NextCounter(sent, now))
 		if err != nil {
 			return 0, err
 		}

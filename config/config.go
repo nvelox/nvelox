@@ -375,9 +375,13 @@ type Listener struct {
 	// (proxy/signature.go.)
 	AcceptProxyKeyFile string `yaml:"accept_proxy_key_file,omitempty"`
 	// AcceptProxyReplayWindow is what a signed header must carry. A header
-	// signed with a counter (signature version 2) is bound to the relay
-	// socket that sent it and refused when its counter was taken before or
-	// is older than that socket's last 64: a copy of it does not pass.
+	// signed with a counter (signature version 2) is bound to both ends of
+	// its connection or datagram (the relay's address and port, and the
+	// address and port it was sent to) and refused when its counter was
+	// taken before, is older than that relay socket's last 64, or is ahead
+	// of the header's time: a copy of it, sent again, from another address
+	// or port, or to another, does not pass. Both sides must see the same
+	// addresses: no address translation between a relay and nvelox.
 	// "when_present" (the default) also takes a header signed without one
 	// (version 1, from a relay not updated yet); "required" takes only
 	// headers with a counter, once every relay sends them. Needs
@@ -982,9 +986,11 @@ type Backend struct {
 	SendProxyV2 bool `yaml:"send_proxy_v2"`
 	// Signs that header with the first key of this file (as a listener's
 	// accept_proxy_key_file holds them), for a receiver that checks it.
-	// Signed in version 2: nvelox 1.3.0 and older, and 2.0.0-rc.3 and
-	// older, refuse it, so upgrade the receivers first. Needs
-	// send_proxy_v2.
+	// Signed in version 2, bound to both ends of the connection or
+	// datagram: the receiver must see the addresses nvelox sends from and
+	// to, with no address translation between them. nvelox 1.3.0 and
+	// older, and 2.0.0-rc.3 and older, refuse it, so upgrade the receivers
+	// first. Needs send_proxy_v2.
 	SendProxyKeyFile string `yaml:"send_proxy_key_file,omitempty"`
 	// SendProxyKey is loaded from SendProxyKeyFile by Load.
 	SendProxyKey []byte `yaml:"-"`

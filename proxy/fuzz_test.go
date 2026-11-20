@@ -164,8 +164,8 @@ func FuzzParseDatagram(f *testing.F) {
 		if ua, ok := h.SourceAddr.(*net.UDPAddr); !ok || ua.IP == nil || h.Command != proxyproto.PROXY || !h.TransportProtocol.IsDatagram() {
 			t.Fatalf("%x: accepted %+v", data, h)
 		}
-		_, _, _ = trust.VerifyFrom(h, data[n:], true, 40001)
-		_, _, _ = trust.VerifyFrom(h, data[n:], false, 40001)
+		_, _, _ = trust.VerifyFrom(h, data[n:], true, testEnds)
+		_, _, _ = trust.VerifyFrom(h, data[n:], false, testEnds)
 	})
 }
 

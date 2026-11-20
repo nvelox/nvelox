@@ -550,7 +550,11 @@ func (e *Engine) startUDPSockets(plan *udpInterfacePlan, handler *ProxyEventHand
 		if err != nil {
 			return err
 		}
-		socks = append(socks, newUDPListenSock(pc, handler, viaInterface))
+		dests := false
+		if l := handler.findListenerForAddr(pc.LocalAddr()); l != nil {
+			dests = l.proxyTrust.enabled()
+		}
+		socks = append(socks, newUDPListenSock(pc, handler, viaInterface, dests))
 		return nil
 	}
 	closeAll := func() {
@@ -1461,7 +1465,7 @@ func (e *Engine) handleTLSConn(rawConn net.Conn, tlsConfig *tls.Config, l *Liste
 	if backend != nil && backend.SendProxyV2 {
 		header := proxyproto.HeaderProxyFromAddrs(2, client, rawConn.LocalAddr())
 		if len(backend.SendProxyKey) > 0 {
-			if err := proxy.SignHeaderFrom(header, backend.SendProxyKey, time.Now(), uint16(portOf(backendConn.LocalAddr()))); err != nil {
+			if err := proxy.SignHeaderFrom(header, backend.SendProxyKey, time.Now(), proxy.RelayEnds(backendConn.LocalAddr(), backendConn.RemoteAddr())); err != nil {
 				logging.Error("Failed to sign PROXY v2 header on TLS conn: %v", err)
 				return
 			}

@@ -31,9 +31,10 @@ import (
 //   - The relay's address (its socket for that client) is pinned to the
 //     client the header named. A later datagram from it that names another
 //     client is dropped: a relay's socket has one client. A header signed
-//     with a counter (accept_proxy_replay_window) is bound to the relay
-//     socket's port, and its counter is checked against that socket's
-//     window, kept with its pin: a copy of a datagram is dropped.
+//     with a counter (accept_proxy_replay_window) is bound to both ends of
+//     its datagram (the relay's socket, and the address and port it was
+//     sent to), and its counter is checked against that socket's window,
+//     kept with its pin: a copy of a datagram is dropped.
 //   - Requests of a QUIC connection whose peer is a relay are given the
 //     pinned client as their remote address (BindGroup.ServeHTTP), so the
 //     access policy, the limits, the log and X-Forwarded-For see the
@@ -92,6 +93,9 @@ type h3Pins struct {
 type h3RelayConn struct {
 	uc *net.UDPConn
 	g  *BindGroup
+	// rd reads the socket with where each datagram was sent, which a
+	// relay's signed header is bound to.
+	rd *proxy.DestReader
 
 	// buf is ReadFrom's scratch. quic-go reads a socket from one goroutine.
 	buf []byte
@@ -101,12 +105,16 @@ type h3RelayConn struct {
 }
 
 func newH3RelayConn(uc *net.UDPConn, g *BindGroup) *h3RelayConn {
-	return &h3RelayConn{uc: uc, g: g, buf: make([]byte, h3RelayDatagramMax)}
+	c := &h3RelayConn{uc: uc, g: g, buf: make([]byte, h3RelayDatagramMax)}
+	if uc != nil { // (the tests of the pins have no socket)
+		c.rd = proxy.NewDestReader(uc, true)
+	}
+	return c
 }
 
 func (c *h3RelayConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	for {
-		n, from, err := c.uc.ReadFromUDPAddrPort(c.buf)
+		n, from, to, err := c.rd.ReadFrom(c.buf)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -115,7 +123,7 @@ func (c *h3RelayConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		if !trustsAddr(tr, from.Addr()) {
 			return copy(p, c.buf[:n]), net.UDPAddrFromAddrPort(from), nil
 		}
-		payload, reason, cause := c.relayed(tr, from, c.buf[:n])
+		payload, reason, cause := c.relayed(tr, from, to, c.buf[:n])
 		if reason != "" {
 			c.g.proxyRejected(net.UDPAddrFromAddrPort(from), reason, cause)
 			continue
@@ -124,10 +132,10 @@ func (c *h3RelayConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	}
 }
 
-// relayed checks a datagram from the trusted relay socket from and returns
-// what follows its header, or why it is dropped.
-func (c *h3RelayConn) relayed(tr *proxy.Trust, from netip.AddrPort, data []byte) (payload []byte, reason string, cause error) {
-	payload, client, counter, counted, reason, cause := h3RelayHeader(tr, data, from.Port())
+// relayed checks a datagram from the trusted relay socket from, sent to to,
+// and returns what follows its header, or why it is dropped.
+func (c *h3RelayConn) relayed(tr *proxy.Trust, from, to netip.AddrPort, data []byte) (payload []byte, reason string, cause error) {
+	payload, client, counter, counted, reason, cause := h3RelayHeader(tr, data, proxy.Ends{Relay: from, Receiver: to})
 	if reason != "" {
 		return nil, reason, cause
 	}
@@ -140,11 +148,11 @@ func (c *h3RelayConn) relayed(tr *proxy.Trust, from netip.AddrPort, data []byte)
 }
 
 // h3RelayHeader checks the header of a datagram from a trusted relay's
-// socket at port relayPort (it must name a datagram client and be signed
-// over what follows it) and returns what follows it, the client it names
-// and the counter it carries (counted false: none), or why the datagram is
-// dropped.
-func h3RelayHeader(tr *proxy.Trust, data []byte, relayPort uint16) (payload []byte, client netip.AddrPort, counter uint64, counted bool, reason string, cause error) {
+// socket, with the ends ends (it must name a datagram client and be signed
+// over what follows it, for those ends) and returns what follows it, the
+// client it names and the counter it carries (counted false: none), or why
+// the datagram is dropped.
+func h3RelayHeader(tr *proxy.Trust, data []byte, ends proxy.Ends) (payload []byte, client netip.AddrPort, counter uint64, counted bool, reason string, cause error) {
 	hdr, consumed, err := proxy.ParseDatagramStrict(data)
 	switch {
 	case errors.Is(err, proxy.ErrNoHeader):
@@ -159,7 +167,7 @@ func h3RelayHeader(tr *proxy.Trust, data []byte, relayPort uint16) (payload []by
 	if len(tr.Keys()) == 0 {
 		return nil, client, 0, false, proxy.RefusedSignature, proxy.ErrSignatureMissing
 	}
-	counter, counted, err = tr.VerifyFrom(hdr, payload, true, relayPort)
+	counter, counted, err = tr.VerifyFrom(hdr, payload, true, ends)
 	if err != nil {
 		return nil, client, 0, false, proxy.RefusedSignature, err
 	}

@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"nvelox/proxy"
 )
 
 // The UDP listener sockets where the event loops are not supported
@@ -35,6 +37,10 @@ type udpConn struct {
 	remote netip.AddrPort
 	raddr  *net.UDPAddr
 	last   atomic.Int64 // when the client's last datagram came (UnixNano)
+	// dest is where the datagram being handed on (OnData) was sent: what a
+	// relay's signed header is bound to. The socket's reader alone writes
+	// and reads it.
+	dest netip.AddrPort
 }
 
 // LocalAddr is the address of the listener socket the client sent to.
@@ -67,6 +73,7 @@ func (c *udpConn) close(err error) {
 // udpListenSock is one UDP listener socket and the sessions of its clients.
 type udpListenSock struct {
 	pc      *net.UDPConn
+	rd      *proxy.DestReader
 	laddr   net.Addr
 	handler *ProxyEventHandler
 	// viaInterface: the socket is bound to one of its listener's
@@ -82,8 +89,11 @@ type udpListenSock struct {
 	wg      sync.WaitGroup
 }
 
-func newUDPListenSock(pc *net.UDPConn, h *ProxyEventHandler, viaInterface bool) *udpListenSock {
-	s := &udpListenSock{pc: pc, laddr: pc.LocalAddr(), handler: h, viaInterface: viaInterface,
+// newUDPListenSock serves pc for h. dests: the listener trusts relays, whose
+// signed headers are bound to where each datagram was sent (on a socket
+// bound to every address, the system tells it).
+func newUDPListenSock(pc *net.UDPConn, h *ProxyEventHandler, viaInterface, dests bool) *udpListenSock {
+	s := &udpListenSock{pc: pc, rd: proxy.NewDestReader(pc, dests), laddr: pc.LocalAddr(), handler: h, viaInterface: viaInterface,
 		readTimeout: udpClientReadTimeout,
 		conns:       make(map[netip.AddrPort]*udpConn), done: make(chan struct{})}
 	if h != nil && h.engine != nil && h.engine.udpClientReadTimeout > 0 {
@@ -144,7 +154,7 @@ func (s *udpListenSock) read() {
 	defer s.wg.Done()
 	buf := make([]byte, udpMaxDatagram)
 	for {
-		n, from, err := s.pc.ReadFromUDPAddrPort(buf)
+		n, from, to, err := s.rd.ReadFrom(buf)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
@@ -184,6 +194,7 @@ func (s *udpListenSock) read() {
 			s.handler.onOpen(c, s.viaInterface)
 		}
 		if n > 0 {
+			c.dest = to
 			s.handler.OnData(c, buf[:n])
 		}
 	}

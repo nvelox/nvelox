@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"time"
 
@@ -43,24 +44,26 @@ const (
 
 var signatureDomain = []byte("nvelox PROXY v2 signature v1")
 
-// Version 2 (accept_proxy_replay_window) binds a header to the relay socket
-// that sent it and numbers that socket's headers, so that a copy of one is
-// refused:
+// Version 2 (accept_proxy_replay_window) binds a header to the connection, or
+// the datagram, that carries it, and numbers a relay socket's headers, so
+// that a copy of one is refused:
 //
 //	type   0xE4, as version 1
 //	value  version (1 byte, 2) | unix time in seconds (8 bytes) |
 //	       counter (8 bytes) | HMAC-SHA256 (32 bytes)
 //
 // The HMAC covers the string "nvelox PROXY v2 signature v2", the time, the
-// counter, the relay socket's port as the receiver sees it (2 bytes: the
-// source port of the datagram, or of the connection, that carries the
-// header), and then what version 1 covers. Numbers are big-endian. The
-// counter is the relay socket's: it starts at the relay's clock in
-// nanoseconds when the socket opens and goes up by one with every header,
-// so that a relay that opens a socket on the same port again counts on above
-// its last header. A receiver keeps a ReplayWindow per relay socket. A
-// stream has one header, bound to its connection by the port: its counter
-// is 0 and not looked at.
+// counter, the two ends of the connection or datagram that carries the
+// header (Ends: the relay's address and port, then the receiver's; 16 bytes
+// each address, IPv4 in IPv4-mapped form, and 2 each port), and then what
+// version 1 covers. Numbers are big-endian. Both sides must see the same
+// ends: no address translation between them. The counter is the relay
+// socket's: it starts at the relay's clock in nanoseconds when the socket
+// opens and goes up by one with every header, so that a relay that opens a
+// socket on the same port again counts on above its last header; it may not
+// be ahead of the header's time by more than SignatureWindow. A receiver
+// keeps a ReplayWindow per relay socket. A stream has one header, bound to
+// its connection by the ends: its counter is 0 and not looked at.
 const (
 	signatureV2    = 2
 	signatureV2Len = 1 + 8 + 8 + sha256.Size
@@ -81,7 +84,52 @@ var (
 	// ErrReplayed: the relay socket's counter was taken before, or is older
 	// than its window (ReplayWindow).
 	ErrReplayed = errors.New("PROXY header counter was taken from this relay socket before, or is older than its window")
+	// ErrCounterAhead: a version 2 counter ahead of its header's time by
+	// more than SignatureWindow, which no relay's clock gives.
+	ErrCounterAhead = errors.New("PROXY header counter is ahead of the header's time")
+	// ErrEndsUnknown: the addresses of the connection or datagram a version
+	// 2 signature is bound to are not known.
+	ErrEndsUnknown = errors.New("PROXY header signature: the addresses of its connection are not known")
 )
+
+// Ends are the two ends of the connection, or of the datagram, that carries
+// a header, as each side sees them: the relay's socket and the receiver's
+// (the address and port the relay sends to). A version 2 signature is bound
+// to them.
+type Ends struct {
+	Relay, Receiver netip.AddrPort
+}
+
+// valid reports whether both ends are known.
+func (e Ends) valid() bool { return e.Relay.IsValid() && e.Receiver.IsValid() }
+
+// addrPortOf returns the address and port of a TCP or UDP address; zero
+// (an end that is not known) for any other.
+func addrPortOf(a net.Addr) netip.AddrPort {
+	switch v := a.(type) {
+	case *net.TCPAddr:
+		if v != nil {
+			return v.AddrPort()
+		}
+	case *net.UDPAddr:
+		if v != nil {
+			return v.AddrPort()
+		}
+	}
+	return netip.AddrPort{}
+}
+
+// RelayEnds returns the ends of a connection (or connected socket) the relay
+// opened to the receiver: its own address is the relay's.
+func RelayEnds(local, remote net.Addr) Ends {
+	return Ends{Relay: addrPortOf(local), Receiver: addrPortOf(remote)}
+}
+
+// ReceiverEnds returns the ends of a connection the receiver accepted from
+// the relay: its peer is the relay.
+func ReceiverEnds(local, remote net.Addr) Ends {
+	return Ends{Relay: addrPortOf(remote), Receiver: addrPortOf(local)}
+}
 
 // Sign returns the signature TLV for header h (as the receiver will parse it)
 // and payload (nil for a stream), made with key at now.
@@ -100,11 +148,14 @@ func Sign(key []byte, h *proxyproto.Header, payload []byte, now time.Time) (prox
 
 // SignFrom returns the version 2 signature TLV for header h (as the receiver
 // will parse it) and payload (nil for a stream), made with key at now for
-// the relay socket that sends from port relayPort, as its header number
-// counter.
-func SignFrom(key []byte, h *proxyproto.Header, payload []byte, now time.Time, relayPort uint16, counter uint64) (proxyproto.TLV, error) {
+// the connection or datagram with the ends ends, as its relay socket's
+// header number counter.
+func SignFrom(key []byte, h *proxyproto.Header, payload []byte, now time.Time, ends Ends, counter uint64) (proxyproto.TLV, error) {
+	if !ends.valid() {
+		return proxyproto.TLV{}, ErrEndsUnknown
+	}
 	ts := uint64(now.Unix())
-	mac, err := signatureMACv2(key, h, ts, counter, relayPort, payload)
+	mac, err := signatureMACv2(key, h, ts, counter, ends, payload)
 	if err != nil {
 		return proxyproto.TLV{}, err
 	}
@@ -132,11 +183,11 @@ func Verify(h *proxyproto.Header, keys [][]byte, payload []byte, now time.Time) 
 
 // VerifyFrom checks that h carries a signature made at most SignatureWindow
 // from now with one of keys over h and payload (nil for a stream). A version
-// 2 signature must have been made for the relay socket port relayPort, the
-// port the header came from: its counter is returned, with counted true. A
-// version 1 signature has no counter and is bound to no port: counted
-// false.
-func VerifyFrom(h *proxyproto.Header, keys [][]byte, payload []byte, now time.Time, relayPort uint16) (counter uint64, counted bool, err error) {
+// 2 signature must have been made for ends, the ends of the connection or
+// datagram the header came in, and its counter may not be ahead of its time:
+// the counter is returned, with counted true. A version 1 signature has no
+// counter and is bound to no connection: counted false.
+func VerifyFrom(h *proxyproto.Header, keys [][]byte, payload []byte, now time.Time, ends Ends) (counter uint64, counted bool, err error) {
 	v, err := signatureValue(h)
 	if err != nil {
 		return 0, false, err
@@ -152,12 +203,22 @@ func VerifyFrom(h *proxyproto.Header, keys [][]byte, payload []byte, now time.Ti
 	if expired(ts, now) {
 		return 0, false, ErrSignatureExpired
 	}
+	if !ends.valid() {
+		return 0, false, ErrEndsUnknown
+	}
 	for _, k := range keys {
-		mac, err := signatureMACv2(k, h, ts, counter, relayPort, payload)
+		mac, err := signatureMACv2(k, h, ts, counter, ends, payload)
 		if err != nil {
 			return 0, false, fmt.Errorf("%w: %v", ErrSignatureMalformed, err)
 		}
 		if hmac.Equal(mac, v[17:]) {
+			// A relay's counter starts at its clock in nanoseconds and goes
+			// up by one a header: it cannot pass that clock, which signed
+			// ts. One that does would hold its socket's window above every
+			// counter the relay sends next.
+			if counter > (ts+uint64(SignatureWindow/time.Second))*uint64(time.Second) {
+				return 0, false, ErrCounterAhead
+			}
 			return counter, true, nil
 		}
 	}
@@ -210,11 +271,11 @@ func SignHeader(h *proxyproto.Header, key []byte, now time.Time) error {
 }
 
 // SignHeaderFrom adds a version 2 stream signature TLV to h, computed over h
-// as the receiver will parse it, for the connection that leaves from port
-// relayPort (its counter is 0: a stream has one header).
-func SignHeaderFrom(h *proxyproto.Header, key []byte, now time.Time, relayPort uint16) error {
+// as the receiver will parse it, for the connection with the ends ends (its
+// counter is 0: a stream has one header).
+func SignHeaderFrom(h *proxyproto.Header, key []byte, now time.Time, ends Ends) error {
 	return signHeader(h, func(parsed *proxyproto.Header) (proxyproto.TLV, error) {
-		return SignFrom(key, parsed, nil, now, relayPort, 0)
+		return SignFrom(key, parsed, nil, now, ends, 0)
 	})
 }
 
@@ -254,14 +315,14 @@ func SignedHeaderBytes(header []byte, key []byte, payload []byte, now time.Time)
 }
 
 // SignedHeaderBytesFrom is SignedHeaderBytes with a version 2 signature, for
-// the relay socket that sends from port relayPort, as its header number
+// the datagram with the ends ends, as its relay socket's header number
 // counter.
-func SignedHeaderBytesFrom(header []byte, key []byte, payload []byte, now time.Time, relayPort uint16, counter uint64) ([]byte, error) {
+func SignedHeaderBytesFrom(header []byte, key []byte, payload []byte, now time.Time, ends Ends, counter uint64) ([]byte, error) {
 	h, err := proxyproto.Read(bufioReader(header))
 	if err != nil {
 		return nil, fmt.Errorf("parse own PROXY header: %w", err)
 	}
-	t, err := SignFrom(key, h, payload, now, relayPort, counter)
+	t, err := SignFrom(key, h, payload, now, ends, counter)
 	if err != nil {
 		return nil, err
 	}
@@ -298,21 +359,29 @@ func signatureMAC(key []byte, h *proxyproto.Header, ts uint64, payload []byte) (
 	return m.Sum(nil), nil
 }
 
-func signatureMACv2(key []byte, h *proxyproto.Header, ts, counter uint64, relayPort uint16, payload []byte) ([]byte, error) {
+func signatureMACv2(key []byte, h *proxyproto.Header, ts, counter uint64, ends Ends, payload []byte) ([]byte, error) {
 	m := hmac.New(sha256.New, key)
 	m.Write(signatureDomainV2)
-	var b [8]byte
-	binary.BigEndian.PutUint64(b[:], ts)
-	m.Write(b[:])
-	binary.BigEndian.PutUint64(b[:], counter)
-	m.Write(b[:])
-	binary.BigEndian.PutUint16(b[:2], relayPort)
-	m.Write(b[:2])
+	var b [16 + 2 + 16 + 2]byte
+	binary.BigEndian.PutUint64(b[:8], ts)
+	m.Write(b[:8])
+	binary.BigEndian.PutUint64(b[:8], counter)
+	m.Write(b[:8])
+	m.Write(appendEnd(appendEnd(b[:0], ends.Relay), ends.Receiver))
 	if err := writeHeaderParts(m, h); err != nil {
 		return nil, err
 	}
 	m.Write(payload)
 	return m.Sum(nil), nil
+}
+
+// appendEnd appends what a signature covers of one end: its address in 16
+// bytes (IPv4 in IPv4-mapped form, whichever form it came in; no zone) and
+// its port.
+func appendEnd(dst []byte, e netip.AddrPort) []byte {
+	a := e.Addr().Unmap().As16()
+	dst = append(dst, a[:]...)
+	return binary.BigEndian.AppendUint16(dst, e.Port())
 }
 
 // writeHeaderParts writes what a signature covers of h: the transport

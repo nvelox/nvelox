@@ -70,7 +70,7 @@ Every table and chart, latency, CPU and memory of each proxy, the setup and how 
 - **Client Certificate Auth (mTLS)** — `client_auth: require` / `request` with `client_ca` verification on TLS-terminating TCP, HTTPS and HTTP/3 listeners; per site (by SNI) when sites share a port
 - **ACLs** — match by source IP/CIDR, HTTP method, path, headers; allow/deny actions (TCP/UDP listeners: source IP only)
 - **IP Allowlist/Denylist** — CIDR-based per-listener filtering on HTTP, TCP and UDP listeners (behind a trusted PROXY v2 relay, on the client it names)
-- **Signed PROXY v2 headers** — relays and receivers share a key so a forged header (a spoofed UDP source) cannot name a client; each header is bound to the relay socket that sent it and numbered, so a copy of a datagram is dropped (`accept_proxy_replay_window`); keys rotate on reload
+- **Signed PROXY v2 headers** — relays and receivers share a key so a forged header (a spoofed UDP source) cannot name a client; each header is bound to both ends of its connection or datagram and numbered, so a copy of a datagram, or a header sent from or to another address, is dropped (`accept_proxy_replay_window`; no address translation between a relay and nvelox); keys rotate on reload
 - **Interface-bound relay trust** — for UDP relays that cannot sign: trust their PROXY headers only on datagrams that arrived on chosen network interfaces (`accept_proxy_interfaces`, Linux)
 - **Per-IP Rate Limiting** — token bucket per client IP with LRU cleanup
 - **Per-Listener Rate Limiting** — global connection rate limit

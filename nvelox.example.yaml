@@ -287,16 +287,21 @@ listeners:
     #   restart: add the new key on the receivers (SIGHUP), put it first on
     #   the senders (SIGHUP), then remove the old key from the receivers.
     # accept_proxy_replay_window: required
-    #   What a signed header must carry. nvelox signs with a counter and its
-    #   own socket's port (signature version 2): a header is bound to the
-    #   relay socket that sent it, and a copy of a datagram is dropped.
+    #   What a signed header must carry. nvelox signs with a counter
+    #   (signature version 2), bound to both ends of the connection or
+    #   datagram: the relay's address and port, and the address and port it
+    #   sends to. A copy sent again, from another address or port, or to
+    #   another address or port of this host, is dropped, so a relay must
+    #   reach nvelox with its addresses unchanged: no address translation
+    #   (NAT, a load balancer's address) between them.
     #   "when_present" (the default) also takes headers signed without one
     #   (version 1: nvelox 1.x, 2.0.0-rc.3 and older, or another relay);
     #   "required" takes only headers with a counter. Needs
     #   accept_proxy_key_file. nvelox 1.3.0 and older, and 2.0.0-rc.3 and
     #   older, refuse version 2: upgrade the receivers before the senders,
-    #   then set required. A copy sent to another receiver with the same key
-    #   is new there: give receivers their own keys where that matters.
+    #   then set required. Another receiver at the same address and port (an
+    #   anycast address) would take a copy as new: give such receivers their
+    #   own keys.
     # accept_proxy_interfaces: ["eth1"]
     #   (udp listeners, Linux) A trusted peer's PROXY header counts only on
     #   datagrams that arrived on one of these network interfaces — e.g. a

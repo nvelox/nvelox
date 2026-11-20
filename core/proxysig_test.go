@@ -169,7 +169,7 @@ func udpTestSignedProxy_Senders(t *testing.T) {
 	defer ln.Close()
 	type tcpHeader struct {
 		h    *proxyproto.Header
-		port uint16 // the port the connection came from
+		ends proxy.Ends // the connection's, as the backend saw them
 	}
 	hdrCh := make(chan tcpHeader, 1)
 	go func() {
@@ -180,7 +180,7 @@ func udpTestSignedProxy_Senders(t *testing.T) {
 		defer c.Close()
 		h, err := proxyproto.Read(bufio.NewReader(c))
 		if err == nil {
-			hdrCh <- tcpHeader{h, uint16(c.RemoteAddr().(*net.TCPAddr).Port)}
+			hdrCh <- tcpHeader{h, proxy.ReceiverEnds(c.LocalAddr(), c.RemoteAddr())}
 		}
 		io.Copy(io.Discard, c)
 	}()
@@ -202,21 +202,21 @@ func udpTestSignedProxy_Senders(t *testing.T) {
 	}
 	defer c.Close()
 	c.Write([]byte("payload"))
-	// Signed in version 2: bound to the port of nvelox's connection to the
-	// backend.
+	// Signed in version 2: bound to nvelox's connection to the backend, its
+	// two ends.
 	select {
 	case th := <-hdrCh:
-		if _, counted, err := proxy.VerifyFrom(th.h, [][]byte{sigKeyA}, nil, time.Now(), th.port); err != nil || !counted {
+		if _, counted, err := proxy.VerifyFrom(th.h, [][]byte{sigKeyA}, nil, time.Now(), th.ends); err != nil || !counted {
 			t.Fatalf("TCP header: counted %v, %v", counted, err)
 		}
-		if _, _, err := proxy.VerifyFrom(th.h, [][]byte{sigKeyA}, nil, time.Now(), th.port+1); err == nil {
+		if _, _, err := proxy.VerifyFrom(th.h, [][]byte{sigKeyA}, nil, time.Now(), stOtherRelayPort(th.ends)); err == nil {
 			t.Fatal("the TCP header passes for another port")
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("TCP backend got no header")
 	}
-	// UDP: bound to the port of the session's socket to the backend, with
-	// that socket's counter, one more with each datagram.
+	// UDP: bound to the session's socket to the backend and the backend's,
+	// with that socket's counter, one more with each datagram.
 	raddr, _ := net.ResolveUDPAddr("udp", udpAddr)
 	client, err := net.DialUDP("udp", nil, raddr)
 	if err != nil {
@@ -237,11 +237,11 @@ func udpTestSignedProxy_Senders(t *testing.T) {
 		if string(payload) != p {
 			t.Fatalf("UDP payload %q, want %q", payload, p)
 		}
-		c, counted, err := proxy.VerifyFrom(h, [][]byte{sigKeyA}, payload, time.Now(), uint16(d.from.Port))
+		c, counted, err := proxy.VerifyFrom(h, [][]byte{sigKeyA}, payload, time.Now(), stDatagramEnds(d, udpBE))
 		if err != nil || !counted {
 			t.Fatalf("UDP header: counted %v, %v", counted, err)
 		}
-		if _, _, err := proxy.VerifyFrom(h, [][]byte{sigKeyA}, []byte("other"), time.Now(), uint16(d.from.Port)); err == nil {
+		if _, _, err := proxy.VerifyFrom(h, [][]byte{sigKeyA}, []byte("other"), time.Now(), stDatagramEnds(d, udpBE)); err == nil {
 			t.Fatal("UDP signature does not cover the payload")
 		}
 		if from != nil && from.Port != d.from.Port {
@@ -487,7 +487,7 @@ func udpTestSignedProxy_UDPSenderUsesTheCurrentKey(t *testing.T) {
 		h, body := stSignedDatagram(t, d)
 		var keys [][]byte
 		for _, k := range [][]byte{sigKeyA, sigKeyB} {
-			if _, _, err := proxy.VerifyFrom(h, [][]byte{k}, body, time.Now(), uint16(d.from.Port)); err == nil {
+			if _, _, err := proxy.VerifyFrom(h, [][]byte{k}, body, time.Now(), stDatagramEnds(d, be)); err == nil {
 				keys = append(keys, k)
 			}
 		}

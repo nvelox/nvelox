@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"net"
+	"net/netip"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -13,13 +14,17 @@ import (
 	"github.com/pires/go-proxyproto"
 )
 
+// testEnds are the ends of a relay's datagram, or connection, in the tests:
+// the relay's socket and the receiver's.
+var testEnds = Ends{Relay: netip.MustParseAddrPort("192.0.2.50:40001"), Receiver: netip.MustParseAddrPort("198.51.100.10:9000")}
+
 // relayed builds a UDP header naming client for dst, signed in version 2
-// for payload by the relay socket at port relayPort as its header counter,
-// and returns it as the receiver parses it.
-func relayed(t testing.TB, key, payload []byte, now time.Time, relayPort uint16, counter uint64) *proxyproto.Header {
+// for payload, for a datagram with the ends ends, as its relay socket's
+// header counter, and returns it as the receiver parses it.
+func relayed(t testing.TB, key, payload []byte, now time.Time, ends Ends, counter uint64) *proxyproto.Header {
 	t.Helper()
 	hdr := formatV2(proxyproto.PROXY, proxyproto.UDPv4, &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 5000}, &net.UDPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 53})
-	signed, err := SignedHeaderBytesFrom(hdr, key, payload, now, relayPort, counter)
+	signed, err := SignedHeaderBytesFrom(hdr, key, payload, now, ends, counter)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,28 +35,48 @@ func relayed(t testing.TB, key, payload []byte, now time.Time, relayPort uint16,
 	return h
 }
 
-// A version 2 signature holds for the relay socket's port it was made for
-// and gives back its counter; a copy from another port, or with another
-// counter, another payload or another time, does not pass. A version 1
-// signature passes uncounted, from any port; a version 1 receiver (Verify)
+// A version 2 signature holds for the two ends it was made for and gives
+// back its counter, whichever form an IPv4 end comes in; a copy from
+// another address or port of a relay, or to another address or port of the
+// receiver, or with another counter, another payload or another time, does
+// not pass, and ends that are not known pass nothing. A version 1 signature
+// passes uncounted, whatever the ends; a version 1 receiver (Verify)
 // refuses version 2.
-func TestSignatureV2_BoundToPortAndCounter(t *testing.T) {
+func TestSignatureV2_BoundToBothEndsAndCounter(t *testing.T) {
 	key := bytes.Repeat([]byte("k"), 32)
 	payload := []byte("a datagram")
 	now := time.Unix(1_800_000_000, 0)
-	h := relayed(t, key, payload, now, 40001, 812)
+	h := relayed(t, key, payload, now, testEnds, 812)
 	keys := [][]byte{[]byte("another key, not the one used!!!"), key}
 
-	if c, counted, err := VerifyFrom(h, keys, payload, now, 40001); err != nil || !counted || c != 812 {
-		t.Fatalf("from its own port: counter %d counted %v, %v; want 812, true, nil", c, counted, err)
+	if c, counted, err := VerifyFrom(h, keys, payload, now, testEnds); err != nil || !counted || c != 812 {
+		t.Fatalf("with its own ends: counter %d counted %v, %v; want 812, true, nil", c, counted, err)
 	}
-	if _, _, err := VerifyFrom(h, keys, payload, now, 50123); !errors.Is(err, ErrSignatureInvalid) {
-		t.Errorf("a copy from another port: %v, want ErrSignatureInvalid", err)
+	mapped := Ends{Relay: netip.MustParseAddrPort("[::ffff:192.0.2.50]:40001"), Receiver: netip.MustParseAddrPort("[::ffff:198.51.100.10]:9000")}
+	if c, _, err := VerifyFrom(h, keys, payload, now, mapped); err != nil || c != 812 {
+		t.Errorf("its ends in their IPv4-mapped form: %d, %v; want 812, nil", c, err)
 	}
-	if _, _, err := VerifyFrom(h, keys, []byte("another one"), now, 40001); !errors.Is(err, ErrSignatureInvalid) {
+	for what, e := range map[string]Ends{
+		"from another port of the relay":        {Relay: netip.MustParseAddrPort("192.0.2.50:50123"), Receiver: testEnds.Receiver},
+		"from another trusted address":          {Relay: netip.MustParseAddrPort("192.0.2.51:40001"), Receiver: testEnds.Receiver},
+		"to another port of the receiver":       {Relay: testEnds.Relay, Receiver: netip.MustParseAddrPort("198.51.100.10:9001")},
+		"to another address of the receiver":    {Relay: testEnds.Relay, Receiver: netip.MustParseAddrPort("198.51.100.11:9000")},
+		"with the two ends the other way round": {Relay: testEnds.Receiver, Receiver: testEnds.Relay},
+	} {
+		if _, _, err := VerifyFrom(h, keys, payload, now, e); !errors.Is(err, ErrSignatureInvalid) {
+			t.Errorf("a copy %s: %v, want ErrSignatureInvalid", what, err)
+		}
+	}
+	if _, _, err := VerifyFrom(h, keys, payload, now, Ends{Relay: testEnds.Relay}); !errors.Is(err, ErrEndsUnknown) {
+		t.Errorf("the receiver's end not known: %v, want ErrEndsUnknown", err)
+	}
+	if _, err := SignFrom(key, h, payload, now, Ends{Receiver: testEnds.Receiver}, 1); !errors.Is(err, ErrEndsUnknown) {
+		t.Errorf("signed without the relay's end: %v, want ErrEndsUnknown", err)
+	}
+	if _, _, err := VerifyFrom(h, keys, []byte("another one"), now, testEnds); !errors.Is(err, ErrSignatureInvalid) {
 		t.Errorf("another payload: %v, want ErrSignatureInvalid", err)
 	}
-	if _, _, err := VerifyFrom(h, keys, payload, now.Add(SignatureWindow+time.Second), 40001); !errors.Is(err, ErrSignatureExpired) {
+	if _, _, err := VerifyFrom(h, keys, payload, now.Add(SignatureWindow+time.Second), testEnds); !errors.Is(err, ErrSignatureExpired) {
 		t.Errorf("31 s later: %v, want ErrSignatureExpired", err)
 	}
 	if err := Verify(h, keys, payload, now); !errors.Is(err, ErrSignatureMalformed) {
@@ -69,23 +94,23 @@ func TestSignatureV2_BoundToPortAndCounter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := VerifyFrom(th, keys, payload, now, 40001); !errors.Is(err, ErrSignatureInvalid) {
+	if _, _, err := VerifyFrom(th, keys, payload, now, testEnds); !errors.Is(err, ErrSignatureInvalid) {
 		t.Errorf("another counter in the header: %v, want ErrSignatureInvalid", err)
 	}
 
-	// Version 1: no counter, no port.
+	// Version 1: no counter, no ends.
 	hdr := formatV2(proxyproto.PROXY, proxyproto.UDPv4, &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 5000}, &net.UDPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 53})
 	signed, _ := SignedHeaderBytes(hdr, key, payload, now)
 	h1, _, _ := ParseDatagramStrict(append(signed, payload...))
-	for _, port := range []uint16{40001, 50123} {
-		if c, counted, err := VerifyFrom(h1, keys, payload, now, port); err != nil || counted || c != 0 {
-			t.Errorf("version 1 from port %d: %d %v %v, want 0, false, nil", port, c, counted, err)
+	for _, e := range []Ends{testEnds, {Relay: netip.MustParseAddrPort("192.0.2.51:50123"), Receiver: testEnds.Receiver}, {}} {
+		if c, counted, err := VerifyFrom(h1, keys, payload, now, e); err != nil || counted || c != 0 {
+			t.Errorf("version 1 with the ends %v: %d %v %v, want 0, false, nil", e, c, counted, err)
 		}
 	}
 
-	// A stream header is bound to its connection's port; its counter is 0.
+	// A stream header is bound to its connection's ends; its counter is 0.
 	sh := proxyproto.HeaderProxyFromAddrs(2, &net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 5000}, &net.TCPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 443})
-	if err := SignHeaderFrom(sh, key, now, 40002); err != nil {
+	if err := SignHeaderFrom(sh, key, now, testEnds); err != nil {
 		t.Fatal(err)
 	}
 	sraw, _ := sh.Format()
@@ -93,11 +118,43 @@ func TestSignatureV2_BoundToPortAndCounter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c, counted, err := VerifyFrom(ph, keys, nil, now, 40002); err != nil || !counted || c != 0 {
+	if c, counted, err := VerifyFrom(ph, keys, nil, now, testEnds); err != nil || !counted || c != 0 {
 		t.Errorf("a stream header on its connection: %d %v %v, want 0, true, nil", c, counted, err)
 	}
-	if _, _, err := VerifyFrom(ph, keys, nil, now, 40003); !errors.Is(err, ErrSignatureInvalid) {
-		t.Errorf("a stream header on another connection: %v, want ErrSignatureInvalid", err)
+	for what, e := range map[string]Ends{
+		"another connection of the relay's": {Relay: netip.MustParseAddrPort("192.0.2.50:40002"), Receiver: testEnds.Receiver},
+		"a connection of another relay's":   {Relay: netip.MustParseAddrPort("192.0.2.51:40001"), Receiver: testEnds.Receiver},
+		"a connection to another listener":  {Relay: testEnds.Relay, Receiver: netip.MustParseAddrPort("198.51.100.10:9443")},
+		"a connection to another address":   {Relay: testEnds.Relay, Receiver: netip.MustParseAddrPort("198.51.100.12:9000")},
+	} {
+		if _, _, err := VerifyFrom(ph, keys, nil, now, e); !errors.Is(err, ErrSignatureInvalid) {
+			t.Errorf("a stream header on %s: %v, want ErrSignatureInvalid", what, err)
+		}
+	}
+}
+
+// A version 2 counter may not be ahead of its header's time by more than
+// SignatureWindow: a relay's counter starts at its clock in nanoseconds
+// and goes up by one a header. One that is would hold its relay socket's
+// window above every counter that socket sends next.
+func TestSignatureV2_CounterFitsItsTime(t *testing.T) {
+	key := bytes.Repeat([]byte("k"), 32)
+	keys := [][]byte{key}
+	payload := []byte("a datagram")
+	now := time.Unix(1_800_000_000, 0)
+	limit := uint64(now.Add(SignatureWindow).UnixNano())
+	for _, c := range []struct {
+		counter uint64
+		ok      bool
+	}{{1, true}, {uint64(now.UnixNano()), true}, {limit, true}, {limit + 1, false}, {1<<64 - 1, false}} {
+		h := relayed(t, key, payload, now, testEnds, c.counter)
+		got, _, err := VerifyFrom(h, keys, payload, now, testEnds)
+		switch {
+		case c.ok && (err != nil || got != c.counter):
+			t.Errorf("counter %d: %d, %v; want it taken", c.counter, got, err)
+		case !c.ok && !errors.Is(err, ErrCounterAhead):
+			t.Errorf("counter %d, %d ns after the header's time: %v, want ErrCounterAhead", c.counter, c.counter-uint64(now.UnixNano()), err)
+		}
 	}
 }
 
@@ -192,32 +249,32 @@ func TestTrust_ReplayWindowRequired(t *testing.T) {
 	key := bytes.Repeat([]byte("k"), 32)
 	payload := []byte("a datagram")
 	now := time.Now()
-	v2 := relayed(t, key, payload, now, 40001, 7)
+	v2 := relayed(t, key, payload, now, testEnds, 7)
 	hdr := formatV2(proxyproto.PROXY, proxyproto.UDPv4, &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 5000}, &net.UDPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 53})
 	signed, _ := SignedHeaderBytes(hdr, key, payload, now)
 	v1, _, _ := ParseDatagramStrict(append(signed, payload...))
 
 	tr := NewTrust([]string{"0.0.0.0/0"}, [][]byte{key})
-	if c, counted, err := tr.VerifyFrom(v2, payload, true, 40001); err != nil || !counted || c != 7 {
+	if c, counted, err := tr.VerifyFrom(v2, payload, true, testEnds); err != nil || !counted || c != 7 {
 		t.Errorf("when_present, version 2: %d %v %v", c, counted, err)
 	}
-	if _, counted, err := tr.VerifyFrom(v1, payload, true, 40001); err != nil || counted {
+	if _, counted, err := tr.VerifyFrom(v1, payload, true, testEnds); err != nil || counted {
 		t.Errorf("when_present, version 1: counted %v, %v; want it taken uncounted", counted, err)
 	}
 	tr.SetReplayWindow(true)
 	if !tr.ReplayWindowRequired() {
 		t.Error("required is not reported")
 	}
-	if _, _, err := tr.VerifyFrom(v1, payload, true, 40001); !errors.Is(err, ErrSignatureUncounted) {
+	if _, _, err := tr.VerifyFrom(v1, payload, true, testEnds); !errors.Is(err, ErrSignatureUncounted) {
 		t.Errorf("required, version 1: %v, want ErrSignatureUncounted", err)
 	}
-	if c, counted, err := tr.VerifyFrom(v2, payload, true, 40001); err != nil || !counted || c != 7 {
+	if c, counted, err := tr.VerifyFrom(v2, payload, true, testEnds); err != nil || !counted || c != 7 {
 		t.Errorf("required, version 2: %d %v %v", c, counted, err)
 	}
-	if _, _, err := tr.VerifyFrom(v2, payload, false, 40001); !errors.Is(err, ErrSignatureMalformed) {
+	if _, _, err := tr.VerifyFrom(v2, payload, false, testEnds); !errors.Is(err, ErrSignatureMalformed) {
 		t.Errorf("a datagram header on a stream: %v, want ErrSignatureMalformed", err)
 	}
-	if _, counted, err := NewTrust([]string{"0.0.0.0/0"}, nil).VerifyFrom(v1, payload, true, 1); err != nil || counted {
+	if _, counted, err := NewTrust([]string{"0.0.0.0/0"}, nil).VerifyFrom(v1, payload, true, Ends{}); err != nil || counted {
 		t.Errorf("without keys: counted %v, %v; want every header taken", counted, err)
 	}
 }

@@ -136,7 +136,11 @@ func (e *Engine) startUDPFast(plan *udpInterfacePlan, h *ProxyEventHandler) erro
 		if reuse {
 			probes = append(probes, l.Addr)
 		}
-		binds = append(binds, relay.UDPBind{Addr: l.Addr, PerLoop: perLoop, ReusePort: reuse, Loop: l.rangeIndex % n, Data: l})
+		// A listener with relays is told where each datagram was sent: a
+		// signed header is bound to it (on an address that is every one of
+		// the machine's, the one the datagram named).
+		binds = append(binds, relay.UDPBind{Addr: l.Addr, PerLoop: perLoop, ReusePort: reuse, Loop: l.rangeIndex % n, Data: l,
+			Destinations: l.proxyTrust.enabled()})
 	}
 	for _, a := range plan.deviceAddrs {
 		_, portStr, err := net.SplitHostPort(a)
@@ -147,7 +151,8 @@ func (e *Engine) startUDPFast(plan *udpInterfacePlan, h *ProxyEventHandler) erro
 		if l == nil {
 			return fmt.Errorf("no udp listener for interface address %s", a)
 		}
-		binds = append(binds, relay.UDPBind{Addr: a, Device: plan.deviceOf[a], PerLoop: true, ReusePort: true, Data: l})
+		binds = append(binds, relay.UDPBind{Addr: a, Device: plan.deviceOf[a], PerLoop: true, ReusePort: true, Data: l,
+			Destinations: l.proxyTrust.enabled()})
 	}
 	// A port shared through SO_REUSEPORT would also be shared with another
 	// nvelox started by the same user, which would then take a part of the
@@ -322,7 +327,7 @@ func (u *udpFast) Arrived(s *relay.UDPSession, data []byte) ([]byte, bool) {
 		// With accept_proxy_key_file the header must be signed over this
 		// datagram: a forged relay datagram cannot name a client, and a
 		// copy of one is refused by its relay socket's window.
-		counter, counted, drop := l.proxyTrust.relayDatagram(hdr, data[consumed:], s.Peer().Port())
+		counter, counted, drop := l.proxyTrust.relayDatagram(hdr, data[consumed:], proxy.Ends{Relay: s.Peer(), Receiver: s.Dest()})
 		if drop == "" && counted {
 			if d.win == nil {
 				d.win = u.windows[s.Loop()].attach(s.Peer(), time.Now().UnixNano())
@@ -484,12 +489,12 @@ func (u *udpFast) Outgoing(s *relay.UDPSession, data []byte) ([]byte, bool) {
 		return nil, false
 	}
 	if len(hdr) > 0 && len(key) > 0 {
-		// Signed for the session's socket to the backend: its port, and
-		// its counter (proxy.NextCounter's rule; the session is its
-		// socket's only user, on one loop).
+		// Signed for the session's socket to the backend: its address and
+		// the backend's, and its counter (proxy.NextCounter's rule; the
+		// session is its socket's only user, on one loop).
 		from := s.ServerLocal()
-		if !from.IsValid() {
-			logging.Error("[DATA] Write failed: the address of the socket to the backend is not known")
+		if !from.IsValid() || !s.Server().IsValid() {
+			logging.Error("[DATA] Write failed: the addresses of the socket to the backend are not known")
 			return nil, false
 		}
 		now := time.Now()
@@ -498,7 +503,7 @@ func (u *udpFast) Outgoing(s *relay.UDPSession, data []byte) ([]byte, bool) {
 		} else {
 			d.sent++
 		}
-		signed, err := proxy.SignedHeaderBytesFrom(hdr, key, data, now, from.Port(), d.sent)
+		signed, err := proxy.SignedHeaderBytesFrom(hdr, key, data, now, proxy.Ends{Relay: from, Receiver: s.Server()}, d.sent)
 		if err != nil {
 			logging.Error("[DATA] Write failed: %v", err)
 			return nil, false

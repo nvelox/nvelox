@@ -22,21 +22,22 @@ import (
 	"nvelox/proxy"
 )
 
-// signedUDPDatagramV2 is a datagram of the relay socket at relayPort: a
-// header naming client for dst, signed with key in version 2 with counter,
-// then payload.
-func signedUDPDatagramV2(t *testing.T, key []byte, client, dst string, payload []byte, relayPort uint16, counter uint64) []byte {
+// signedUDPDatagramV2 is a datagram with the ends ends (a relay socket's,
+// stRelaySocket): a header naming client for dst, signed with key in
+// version 2 with counter, then payload.
+func signedUDPDatagramV2(t *testing.T, key []byte, client, dst string, payload []byte, ends proxy.Ends, counter uint64) []byte {
 	t.Helper()
 	plain := stUDPDatagramWithProxy(t, client, dst, nil)
-	signed, err := proxy.SignedHeaderBytesFrom(plain, key, payload, time.Now(), relayPort, counter)
+	signed, err := proxy.SignedHeaderBytesFrom(plain, key, payload, time.Now(), ends, counter)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return append(signed, payload...)
 }
 
-// stRelaySocket is a socket of a relay sending to addr, and its port.
-func stRelaySocket(t *testing.T, addr string) (*net.UDPConn, uint16) {
+// stRelaySocket is a socket of a relay sending to addr, and the ends of its
+// datagrams.
+func stRelaySocket(t *testing.T, addr string) (*net.UDPConn, proxy.Ends) {
 	t.Helper()
 	ra, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -47,7 +48,19 @@ func stRelaySocket(t *testing.T, addr string) (*net.UDPConn, uint16) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { c.Close() })
-	return c, uint16(c.LocalAddr().(*net.UDPAddr).Port)
+	return c, proxy.RelayEnds(c.LocalAddr(), c.RemoteAddr())
+}
+
+// stDatagramEnds are the ends of datagram d as the backend at to saw it.
+func stDatagramEnds(d stDatagram, to string) proxy.Ends {
+	return proxy.Ends{Relay: d.from.AddrPort(), Receiver: netip.MustParseAddrPort(to)}
+}
+
+// stOtherRelayPort is e from the next port of the relay: the ends of a copy
+// sent from another of its sockets.
+func stOtherRelayPort(e proxy.Ends) proxy.Ends {
+	e.Relay = netip.AddrPortFrom(e.Relay.Addr(), e.Relay.Port()+1)
+	return e
 }
 
 // stDatagram is a datagram a backend got, and the address it came from.
@@ -122,8 +135,8 @@ func udpTestReplayWindow_UDP(t *testing.T) {
 		}
 	}
 
-	relay, port := stRelaySocket(t, addr)
-	first := signedUDPDatagramV2(t, sigKeyA, "198.51.100.50:4000", addr, []byte("first"), port, 1000)
+	relay, ends := stRelaySocket(t, addr)
+	first := signedUDPDatagramV2(t, sigKeyA, "198.51.100.50:4000", addr, []byte("first"), ends, 1000)
 	stSend(t, relay, first)
 	if b, ok := stWaitGot(got, time.Second); !ok || string(b) != "first" {
 		t.Fatalf("the relay's datagram: backend got %q (ok=%v)", b, ok)
@@ -155,7 +168,7 @@ func udpTestReplayWindow_UDP(t *testing.T) {
 		counter uint64
 		payload string
 	}{{1002, "third"}, {1001, "second"}} {
-		stSend(t, relay, signedUDPDatagramV2(t, sigKeyA, "198.51.100.50:4000", addr, []byte(c.payload), port, c.counter))
+		stSend(t, relay, signedUDPDatagramV2(t, sigKeyA, "198.51.100.50:4000", addr, []byte(c.payload), ends, c.counter))
 		if b, ok := stWaitGot(got, time.Second); !ok || string(b) != c.payload {
 			t.Fatalf("counter %d: backend got %q (ok=%v), want %q", c.counter, b, ok, c.payload)
 		}
@@ -185,8 +198,8 @@ func udpTestReplayWindow_RequiredUDP(t *testing.T) {
 		t.Fatalf("a header without a counter was forwarded: %q", b)
 	}
 	waitFor(t, "the header without a counter counted as bad_signature", func() bool { return badSig.Get() == before+1 })
-	v2, port := stRelaySocket(t, addr)
-	stSend(t, v2, signedUDPDatagramV2(t, sigKeyA, "198.51.100.51:4000", addr, []byte("version 2"), port, 7))
+	v2, ends := stRelaySocket(t, addr)
+	stSend(t, v2, signedUDPDatagramV2(t, sigKeyA, "198.51.100.51:4000", addr, []byte("version 2"), ends, 7))
 	if b, ok := stWaitGot(got, time.Second); !ok || string(b) != "version 2" {
 		t.Fatalf("a header with a counter: backend got %q (ok=%v)", b, ok)
 	}
@@ -229,8 +242,8 @@ func udpTestReplayWindow_ReloadToRequired(t *testing.T) {
 	if v1("198.51.100.61:4000", "required") {
 		t.Fatal("after a reload to required: a header without a counter was forwarded")
 	}
-	sock, port := stRelaySocket(t, addr)
-	stSend(t, sock, signedUDPDatagramV2(t, sigKeyA, "198.51.100.62:4000", addr, []byte("counted"), port, 9))
+	sock, ends := stRelaySocket(t, addr)
+	stSend(t, sock, signedUDPDatagramV2(t, sigKeyA, "198.51.100.62:4000", addr, []byte("counted"), ends, 9))
 	if b, ok := stWaitGot(got, time.Second); !ok || string(b) != "counted" {
 		t.Fatalf("after a reload to required: a header with a counter: backend got %q (ok=%v)", b, ok)
 	}
@@ -243,10 +256,10 @@ func udpTestReplayWindow_ReloadToRequired(t *testing.T) {
 }
 
 // stHeader is the PROXY header a backend read at the start of a
-// connection, and the port the connection came from.
+// connection, and the connection's ends as the backend saw them.
 type stHeader struct {
 	h    *proxyproto.Header
-	port uint16
+	ends proxy.Ends
 }
 
 // stHeaderBackend is a TCP backend that reads the header of each
@@ -269,7 +282,7 @@ func stHeaderBackend(t *testing.T) (string, chan stHeader) {
 				defer c.Close()
 				h, err := proxyproto.Read(bufio.NewReader(c))
 				if err == nil {
-					got <- stHeader{h, uint16(c.RemoteAddr().(*net.TCPAddr).Port)}
+					got <- stHeader{h, proxy.ReceiverEnds(c.LocalAddr(), c.RemoteAddr())}
 				}
 				io.Copy(io.Discard, c)
 			}()
@@ -298,10 +311,10 @@ func TestSignedProxy_SendersBehindRelayAndTLS(t *testing.T) {
 		t.Helper()
 		select {
 		case sh := <-got:
-			if _, counted, err := proxy.VerifyFrom(sh.h, [][]byte{sigKeyA}, nil, time.Now(), sh.port); err != nil || !counted {
+			if _, counted, err := proxy.VerifyFrom(sh.h, [][]byte{sigKeyA}, nil, time.Now(), sh.ends); err != nil || !counted {
 				t.Fatalf("%s: counted %v, %v", what, counted, err)
 			}
-			if _, _, err := proxy.VerifyFrom(sh.h, [][]byte{sigKeyA}, nil, time.Now(), sh.port+1); err == nil {
+			if _, _, err := proxy.VerifyFrom(sh.h, [][]byte{sigKeyA}, nil, time.Now(), stOtherRelayPort(sh.ends)); err == nil {
 				t.Fatalf("%s: the header passes for another port", what)
 			}
 			if client != "" && sh.h.SourceAddr.String() != client {
@@ -317,7 +330,7 @@ func TestSignedProxy_SendersBehindRelayAndTLS(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	signedTCPHeaderV2(t, c, sigKeyB, "198.51.100.80:4000", uint16(c.LocalAddr().(*net.TCPAddr).Port))
+	signedTCPHeaderV2(t, c, sigKeyB, "198.51.100.80:4000", proxy.RelayEnds(c.LocalAddr(), c.RemoteAddr()))
 	c.Write([]byte("hello"))
 	check("a relay's connection", "198.51.100.80:4000")
 
@@ -336,15 +349,15 @@ func TestSignedProxy_SendersBehindRelayAndTLS(t *testing.T) {
 }
 
 // signedTCPHeaderV2 writes a header naming client, signed with key in
-// version 2 for the relay connection's port port.
-func signedTCPHeaderV2(t *testing.T, c net.Conn, key []byte, client string, port uint16) {
+// version 2 for a relay connection with the ends ends.
+func signedTCPHeaderV2(t *testing.T, c net.Conn, key []byte, client string, ends proxy.Ends) {
 	t.Helper()
 	src, err := net.ResolveTCPAddr("tcp", client)
 	if err != nil {
 		t.Fatal(err)
 	}
 	h := proxyproto.HeaderProxyFromAddrs(2, src, c.RemoteAddr())
-	if err := proxy.SignHeaderFrom(h, key, time.Now(), port); err != nil {
+	if err := proxy.SignHeaderFrom(h, key, time.Now(), ends); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.WriteTo(c); err != nil {
@@ -376,16 +389,16 @@ func replayWindowTCP(t *testing.T, required bool) {
 		t.Cleanup(func() { c.Close() })
 		return c
 	}
-	portOfConn := func(c net.Conn) uint16 { return uint16(c.LocalAddr().(*net.TCPAddr).Port) }
+	endsOf := func(c net.Conn) proxy.Ends { return proxy.RelayEnds(c.LocalAddr(), c.RemoteAddr()) }
 
 	ok := dial()
-	signedTCPHeaderV2(t, ok, sigKeyA, "198.51.100.52:4000", portOfConn(ok))
+	signedTCPHeaderV2(t, ok, sigKeyA, "198.51.100.52:4000", endsOf(ok))
 	if err := stEcho(ok, "hello"); err != nil {
 		t.Fatalf("required %v: a version 2 header for the connection's port: %v", required, err)
 	}
 	before := accepted.Load()
 	wrong := dial()
-	signedTCPHeaderV2(t, wrong, sigKeyA, "198.51.100.53:4000", portOfConn(wrong)+1)
+	signedTCPHeaderV2(t, wrong, sigKeyA, "198.51.100.53:4000", stOtherRelayPort(endsOf(wrong)))
 	stRefused(t, wrong, "hello")
 	if n := accepted.Load(); n != before {
 		t.Fatalf("required %v: a header signed for another port reached the backend", required)

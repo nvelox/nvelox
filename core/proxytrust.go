@@ -36,11 +36,11 @@ func (p *proxyTrust) shared() *proxy.Trust {
 func (p *proxyTrust) setKeys(keys [][]byte) { p.Trust.SetKeys(keys) }
 
 // relayDatagram checks the header of a datagram from a trusted relay's
-// socket at port relayPort (proxy.Trust.VerifyFrom): the counter it
+// socket, with the ends ends (proxy.Trust.VerifyFrom): the counter it
 // carries (counted false: none), for the window of that relay socket
 // (relayWindows), or the reason the datagram is dropped.
-func (p *proxyTrust) relayDatagram(h *proxyproto.Header, payload []byte, relayPort uint16) (counter uint64, counted bool, drop string) {
-	counter, counted, err := p.shared().VerifyFrom(h, payload, true, relayPort)
+func (p *proxyTrust) relayDatagram(h *proxyproto.Header, payload []byte, ends proxy.Ends) (counter uint64, counted bool, drop string) {
+	counter, counted, err := p.shared().VerifyFrom(h, payload, true, ends)
 	if err != nil {
 		return 0, false, udpDropBadSignature
 	}
@@ -182,7 +182,7 @@ func (p *proxyTrust) relayClient(c net.Conn, wait time.Duration) (client net.Add
 	c.SetReadDeadline(time.Now().Add(wait))
 	hdr, err := proxy.ReadStreamHeader(c)
 	c.SetReadDeadline(time.Time{})
-	named, reason, cause := p.shared().StreamClient(hdr, err, uint16(portOf(c.RemoteAddr())))
+	named, reason, cause := p.shared().StreamClient(hdr, err, proxy.ReceiverEnds(c.LocalAddr(), c.RemoteAddr()))
 	if reason != "" {
 		return nil, reason, cause
 	}

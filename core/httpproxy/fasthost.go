@@ -179,12 +179,12 @@ func (h fastHost) Trusted(peer net.IP) bool { return h.g.proxyTrust().TrustsIP(p
 // Header parses the PROXY v2 header at the start of a trusted relay's
 // plain-HTTP connection; one that does not pass (malformed, a bad
 // signature) is counted and the connection closed.
-func (h fastHost) Header(relay netip.AddrPort, data []byte) (int, *net.TCPAddr) {
+func (h fastHost) Header(relay, local netip.AddrPort, data []byte) (int, *net.TCPAddr) {
 	done, hdr, consumed, perr := proxy.ParseStreamStrict(data)
 	if !done {
 		return 0, nil
 	}
-	client, reason, cause := proxyClient(h.g.proxyTrust(), hdr, perr, relay.Port())
+	client, reason, cause := proxyClient(h.g.proxyTrust(), hdr, perr, proxy.Ends{Relay: relay, Receiver: local})
 	if reason != "" {
 		h.g.proxyRejected(net.TCPAddrFromAddrPort(relay), reason, cause)
 		return -1, nil
@@ -214,7 +214,7 @@ func (h fastHost) Read(c net.Conn) (*net.TCPAddr, bool) {
 		return nil, true
 	}
 	hdr, err := proxy.ReadStreamHeader(c)
-	client, reason, cause := proxyClient(tr, hdr, err, tcpPort(remote))
+	client, reason, cause := proxyClient(tr, hdr, err, proxy.ReceiverEnds(c.LocalAddr(), remote))
 	if reason != "" {
 		h.g.proxyRejected(remote, reason, cause)
 		return nil, false
@@ -228,12 +228,12 @@ func (h fastHost) Read(c net.Conn) (*net.TCPAddr, bool) {
 // and counted. The relays are the ones the group trusts now: a reload that
 // changes them applies at once. state holds the socket's pins: the client
 // each relay socket that sends to it stands for.
-func (h fastHost) Datagram(state *any, from netip.AddrPort, d []byte, now int64) ([]byte, netip.AddrPort, bool) {
+func (h fastHost) Datagram(state *any, from netip.AddrPort, to web.Dest, d []byte, now int64) ([]byte, netip.AddrPort, bool) {
 	tr := h.g.proxyTrust()
 	if !tr.Enabled() || !trustsAddr(tr, from.Addr()) {
 		return d, netip.AddrPort{}, true
 	}
-	payload, client, counter, counted, reason, cause := h3RelayHeader(tr, d, from.Port())
+	payload, client, counter, counted, reason, cause := h3RelayHeader(tr, d, proxy.Ends{Relay: from, Receiver: to.AddrPort()})
 	if reason == "" {
 		pins, _ := (*state).(*h3Pins)
 		if pins == nil {
@@ -343,16 +343,16 @@ func (s *HTTPServer) fastBackend(name string) *web.Backend {
 	}
 	if sendsProxy(be) {
 		b.ProxyHeaderVaries = len(be.SendProxyKey) > 0 // a signed header carries its time
-		b.ProxyHeader = func(client, local net.Addr, from netip.AddrPort) ([]byte, error) {
+		b.ProxyHeader = func(client, local net.Addr, from, to netip.AddrPort) ([]byte, error) {
 			if key := be.SendProxyKey; len(key) > 0 {
-				// from: the connection to the server, which a signed
-				// header is bound to by its port (ProxyHeaderVaries).
-				if !from.IsValid() {
+				// from and to: the connection to the server, which a
+				// signed header is bound to (ProxyHeaderVaries).
+				if !from.IsValid() || !to.IsValid() {
 					return nil, errProxyAddr
 				}
-				return backendProxyHeader(client, local, key, time.Now(), from.Port())
+				return backendProxyHeader(client, local, key, time.Now(), proxy.Ends{Relay: from, Receiver: to})
 			}
-			return backendProxyHeader(client, local, nil, time.Time{}, 0)
+			return backendProxyHeader(client, local, nil, time.Time{}, proxy.Ends{})
 		}
 	}
 	return b
