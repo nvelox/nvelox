@@ -97,6 +97,11 @@ func TestSanitizeLogField(t *testing.T) {
 		{"/path\x7f", "/path?"},                              // DEL → ?
 		{"normal text with space", "normal text with space"}, // space preserved
 		{"unicode ☃ éclair", "unicode ☃ éclair"},             // multibyte UTF-8 preserved
+		{"/a\u0085b", "/a?b"},                                // NEL (C1) → ?
+		{"/a\u009b2Jb", "/a?2Jb"},                            // CSI (C1) → ?
+		{"/a\u2028b\u2029c", "/a?b?c"},                       // line and paragraph separators → ?
+		{"/a\x9b[2Jb", "/a?[2Jb"},                            // a bare C1 byte → ?
+		{"Āġ 中文 😀 \xff", "Āġ 中文 😀 \xff"},                     // continuation bytes 0x80-0x9F inside whole characters, and a non-UTF-8 byte, kept
 	}
 	for _, c := range cases {
 		got := SanitizeLogField(c.in)
@@ -204,5 +209,22 @@ func TestLogLevelFiltering(t *testing.T) {
 	}
 	if !strings.Contains(s, "should appear") {
 		t.Error("log missing error message")
+	}
+}
+
+// The access log's quoted fields (path, User-Agent) go through
+// appendQuotedField a character at a time: a C1 control or a separator
+// there is two or three bytes, and goes too; whole characters stay.
+func TestAppendQuotedField_UnicodeControls(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"/a\u0085b", "/a?b"},
+		{"/a\u2028b", "/a?b"},
+		{"/a\x9bb", "/a?b"},
+		{"/Āġ/😀\"x", `/Āġ/😀\x22x`},
+	}
+	for _, c := range cases {
+		if got := string(appendQuotedField(nil, c.in)); got != c.want {
+			t.Errorf("appendQuotedField(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }

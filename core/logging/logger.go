@@ -253,7 +253,10 @@ func Access(format string, v ...interface{}) {
 // SanitizeLogField strips CR/LF/tab and other control characters from strings
 // that may contain user-controlled input (request path, method, headers, …)
 // before they are written to a log line. Without this an attacker can inject
-// fake log lines via %0A in the URL path and fool SIEM/monitoring.
+// fake log lines via %0A in the URL path and fool SIEM/monitoring. The C1
+// controls (U+0080 to U+009F, as UTF-8 or as bare bytes) and the Unicode
+// line and paragraph separators (U+2028, U+2029) go too: some tools take
+// them for line breaks, and a terminal for the start of a command.
 func SanitizeLogField(s string) string {
 	if s == "" {
 		return s
@@ -267,27 +270,32 @@ func SanitizeLogField(s string) string {
 			needs = true
 			break
 		}
+		if c >= 0x80 {
+			n, bad := logRuneAt(s, i)
+			if bad {
+				needs = true
+				break
+			}
+			i += n - 1
+		}
 	}
 	if !needs {
 		return s
 	}
-	b := make([]byte, 0, len(s))
-	for i := 0; i < len(s); i++ {
+	return string(appendSanitized(make([]byte, 0, len(s)), s))
+}
+
+// logRuneAt looks at the character that begins with the byte s[i] (0x80 or
+// above): its length, and whether a log line must not carry it — a C1
+// control, as UTF-8 or as a bare byte, or U+2028 or U+2029. Any other
+// character is kept whole, its continuation bytes included.
+func logRuneAt(s string, i int) (n int, bad bool) {
+	r, n := utf8.DecodeRuneInString(s[i:])
+	if r == utf8.RuneError && n == 1 {
 		c := s[i]
-		switch {
-		case c == '\n':
-			b = append(b, '\\', 'n')
-		case c == '\r':
-			b = append(b, '\\', 'r')
-		case c == '\t':
-			b = append(b, '\\', 't')
-		case c < 0x20 || c == 0x7f:
-			b = append(b, '?') // other control chars → '?'
-		default:
-			b = append(b, c)
-		}
+		return 1, c <= 0x9f // a bare C1 byte; other bytes that are no UTF-8 stay as they are
 	}
-	return string(b)
+	return n, (r >= 0x80 && r <= 0x9f) || r == 0x2028 || r == 0x2029
 }
 
 // escapeQuoted escapes the two bytes that could end or bend a quoted
@@ -434,8 +442,16 @@ func appendSanitized(b []byte, s string) []byte {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch {
-		case c >= 0x20 && c != 0x7f:
+		case c >= 0x20 && c < 0x7f:
 			b = append(b, c)
+		case c >= 0x80:
+			n, bad := logRuneAt(s, i)
+			if bad {
+				b = append(b, '?')
+			} else {
+				b = append(b, s[i:i+n]...)
+			}
+			i += n - 1
 		case c == '\n':
 			b = append(b, '\\', 'n')
 		case c == '\r':
@@ -452,13 +468,22 @@ func appendSanitized(b []byte, s string) []byte {
 // appendQuotedField appends SanitizeLogField(escapeQuoted(s)).
 func appendQuotedField(b []byte, s string) []byte {
 	for i := 0; i < len(s); i++ {
-		switch c := s[i]; c {
-		case '"':
+		switch c := s[i]; {
+		case c >= 0x20 && c < 0x7f && c != '"' && c != '\\':
+			b = append(b, c) // printable ASCII: most of every field
+		case c == '"':
 			b = append(b, `\x22`...)
-		case '\\':
+		case c == '\\':
 			b = append(b, `\x5C`...)
 		default:
-			b = appendSanitized(b, s[i:i+1])
+			// A control, or a whole character of 0x80 and up (a C1 control
+			// or a separator is two or three bytes).
+			n := 1
+			if c >= 0x80 {
+				n, _ = logRuneAt(s, i)
+			}
+			b = appendSanitized(b, s[i:i+n])
+			i += n - 1
 		}
 	}
 	return b
