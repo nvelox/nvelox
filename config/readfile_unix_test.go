@@ -111,3 +111,75 @@ func TestLoad_NamedFilesThatAreFIFOs(t *testing.T) {
 		t.Fatalf("a CA file that is a FIFO: %v", err)
 	}
 }
+
+// A FIFO is refused without being opened: opening a FIFO wakes a writer
+// that waits on it, as opening a watchdog arms it. The writer here must
+// still be waiting after the refusal.
+func TestReadNamedFile_NotOpenedBeforeItsTypeIsKnown(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "fifo")
+	mkfifo(t, p)
+	opened := make(chan struct{})
+	go func() {
+		f, err := os.OpenFile(p, os.O_WRONLY, 0) // waits for a reader
+		if err == nil {
+			close(opened)
+			f.Close()
+		}
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if _, err := ReadNamedFile(p); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("a FIFO: %v", err)
+	}
+	select {
+	case <-opened:
+		t.Fatal("ReadNamedFile opened the FIFO before refusing it: a writer waiting on it went on")
+	case <-time.After(200 * time.Millisecond):
+	}
+	// Let the writer go.
+	if f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0); err == nil {
+		<-opened
+		f.Close()
+	}
+}
+
+// A file over maxNamedFile is refused, not read: a sparse one here, so the
+// test takes no room.
+func TestReadNamedFile_TooLarge(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "big")
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(maxNamedFile + 1); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if _, err := ReadNamedFile(p); err == nil || !strings.Contains(err.Error(), "larger than the 64 MiB") {
+		t.Fatalf("a file of %d bytes: %v", maxNamedFile+1, err)
+	}
+	if err := os.Truncate(p, maxNamedFile); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := ReadNamedFile(p); err != nil || len(b) != maxNamedFile {
+		t.Fatalf("a file of exactly %d bytes: %d bytes, %v", maxNamedFile, len(b), err)
+	}
+}
+
+// A file that grows past maxNamedFile once it is open (or a file that says
+// nothing of its size, as those of /proc) is read no further than that,
+// and refused.
+func TestReadNamedFile_GrowsAfterTheLook(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "grows")
+	if err := os.WriteFile(p, []byte("small"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer func(f func(string)) { afterNamedOpen = f }(afterNamedOpen)
+	afterNamedOpen = func(path string) {
+		if err := os.Truncate(path, maxNamedFile+1); err != nil {
+			t.Error(err)
+		}
+	}
+	if _, err := ReadNamedFile(p); err == nil || !strings.Contains(err.Error(), "grew past the 64 MiB") {
+		t.Fatalf("a file that grew past %d bytes once open: %v", maxNamedFile, err)
+	}
+}
