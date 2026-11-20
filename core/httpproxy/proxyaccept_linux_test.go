@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -200,6 +201,101 @@ func TestProxyHeader_OnHTTPListeners(t *testing.T) {
 		}
 		if be.count() != 1 {
 			t.Fatalf("fast=%v the backend got %d requests, want 1", fast, be.count())
+		}
+	}
+}
+
+// A version 2 header is bound to its connection's ends: on a listener bound
+// to every address, one signed for the address the relay connected to
+// (127.0.0.2) is taken; one signed for another of the listener's addresses,
+// or for another trusted address than the relay's, is not. The same on
+// every path.
+func TestProxyHeader_SignedForItsEnds(t *testing.T) {
+	quietLog(t)
+	key := []byte("0123456789abcdef0123456789abcdef-test-key")
+	for _, useTLS := range []bool{false, true} {
+		for _, fast := range []bool{true, false} {
+			name := map[bool]string{false: "http", true: "https"}[useTLS] + map[bool]string{false: "/net-http", true: "/loops"}[fast]
+			t.Run(name, func(t *testing.T) {
+				be := newRawBackend(t)
+				s := relaySite(t, be, useTLS, "127.0.0.0/8", key, nil)
+				fastPathOff.Store(!fast)
+				g := NewBindGroup("0.0.0.0:0", map[bool]string{false: "http", true: "https"}[useTLS])
+				g.AddSite(s)
+				err := g.Start()
+				fastPathOff.Store(false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					g.Stop(ctx)
+				})
+				if fast != (g.fast != nil) {
+					t.Fatalf("fast path = %v, want %v", g.fast != nil, fast)
+				}
+				_, port, _ := net.SplitHostPort(g.BoundAddr().String())
+				// try connects from 127.0.0.1 to 127.0.0.2 and sends a header
+				// signed for the connection's ends, but for what change
+				// makes of them.
+				try := func(change func(*proxy.Ends)) (*http.Response, error) {
+					t.Helper()
+					raw, err := net.Dial("tcp", "127.0.0.2:"+port)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer raw.Close()
+					raw.SetDeadline(time.Now().Add(10 * time.Second))
+					ends := proxy.RelayEnds(raw.LocalAddr(), raw.RemoteAddr())
+					if change != nil {
+						change(&ends)
+					}
+					src := &net.TCPAddr{IP: net.ParseIP("203.0.113.7"), Port: 4444}
+					h := proxyproto.HeaderProxyFromAddrs(2, src, &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443})
+					if err := proxy.SignHeaderFrom(h, key, time.Now(), ends); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := h.WriteTo(raw); err != nil {
+						return nil, err
+					}
+					var c net.Conn = raw
+					if useTLS {
+						tc := tls.Client(raw, &tls.Config{InsecureSkipVerify: true, ServerName: "example.test", NextProtos: []string{"http/1.1"}})
+						if err := tc.Handshake(); err != nil {
+							return nil, err
+						}
+						c = tc
+					}
+					if _, err := io.WriteString(c, relayGet); err != nil {
+						return nil, err
+					}
+					resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+					if err == nil {
+						io.ReadAll(resp.Body)
+					}
+					return resp, err
+				}
+				if resp, err := try(nil); err != nil || resp.StatusCode != 200 {
+					t.Fatalf("a header signed for its connection: %v, %v", err, resp)
+				}
+				before := be.count()
+				for what, change := range map[string]func(*proxy.Ends){
+					"for another address of the listener": func(e *proxy.Ends) {
+						e.Receiver = netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), e.Receiver.Port())
+					},
+					"for another trusted address": func(e *proxy.Ends) {
+						e.Relay = netip.AddrPortFrom(netip.MustParseAddr("127.0.0.3"), e.Relay.Port())
+					},
+				} {
+					if resp, err := try(change); err == nil {
+						t.Fatalf("a header signed %s: answered %d, want the connection cut", what, resp.StatusCode)
+					}
+				}
+				if be.count() != before {
+					t.Fatalf("%d requests with a header signed for other ends reached the backend", be.count()-before)
+				}
+			})
 		}
 	}
 }

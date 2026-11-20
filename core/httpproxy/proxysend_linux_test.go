@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -113,8 +114,14 @@ func (b *proxyBackend) serve(c net.Conn) {
 		rec.src, rec.dst = hdr.SourceAddr.String(), hdr.DestinationAddr.String()
 		rec.stream = hdr.TransportProtocol.IsStream()
 		if b.key != nil {
-			if err := proxy.Verify(hdr, [][]byte{b.key}, nil, time.Now()); err != nil {
-				b.refuse(c, "signature: "+err.Error())
+			// Signed in version 2, for nvelox's connection: its two ends.
+			ends := proxy.ReceiverEnds(c.LocalAddr(), c.RemoteAddr())
+			if _, counted, err := proxy.VerifyFrom(hdr, [][]byte{b.key}, nil, time.Now(), ends); err != nil || !counted {
+				why := "not signed for its connection"
+				if err != nil {
+					why = err.Error()
+				}
+				b.refuse(c, "signature: "+why)
 				return
 			}
 		}
@@ -827,7 +834,7 @@ func TestBackendProxyHeader(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			raw, err := backendProxyHeader(tc.src, tc.dst, nil, time.Time{})
+			raw, err := backendProxyHeader(tc.src, tc.dst, nil, time.Time{}, proxy.Ends{})
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("a header was made: %x", raw)
@@ -850,9 +857,11 @@ func TestBackendProxyHeader(t *testing.T) {
 			}
 		})
 	}
-	// Signed: the receiver's check passes with the key, fails with another.
+	// Signed: the receiver's check passes with the key for the connection's
+	// ends, fails with another key or other ends.
 	key := []byte("0123456789abcdef0123456789abcdef")
-	raw, err := backendProxyHeader(tcp("198.51.100.7:5000"), tcp("[2001:db8::1]:443"), key, time.Now())
+	ends := proxy.Ends{Relay: netip.MustParseAddrPort("192.0.2.1:40100"), Receiver: netip.MustParseAddrPort("192.0.2.30:8080")}
+	raw, err := backendProxyHeader(tcp("198.51.100.7:5000"), tcp("[2001:db8::1]:443"), key, time.Now(), ends)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -860,10 +869,20 @@ func TestBackendProxyHeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := proxy.Verify(h, [][]byte{key}, nil, time.Now()); err != nil {
-		t.Errorf("signature: %v", err)
+	if _, counted, err := proxy.VerifyFrom(h, [][]byte{key}, nil, time.Now(), ends); err != nil || !counted {
+		t.Errorf("signature: counted %v, %v", counted, err)
 	}
-	if err := proxy.Verify(h, [][]byte{[]byte("another key of thirty-two bytes!")}, nil, time.Now()); err == nil {
+	other := ends
+	other.Relay = netip.AddrPortFrom(ends.Relay.Addr(), 40101)
+	if _, _, err := proxy.VerifyFrom(h, [][]byte{key}, nil, time.Now(), other); err == nil {
+		t.Errorf("the signature passed for another port")
+	}
+	other = ends
+	other.Receiver = netip.MustParseAddrPort("192.0.2.31:8080")
+	if _, _, err := proxy.VerifyFrom(h, [][]byte{key}, nil, time.Now(), other); err == nil {
+		t.Errorf("the signature passed for another server")
+	}
+	if _, _, err := proxy.VerifyFrom(h, [][]byte{[]byte("another key of thirty-two bytes!")}, nil, time.Now(), ends); err == nil {
 		t.Errorf("the signature passed with another key")
 	}
 }

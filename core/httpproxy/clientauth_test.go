@@ -389,6 +389,25 @@ func TestBindGroup_ClientAuthBadCAFailsStart(t *testing.T) {
 	}
 }
 
+// net/http's server has a TLS config of its own, not the group's: Go
+// 1.26's Serve sets fields of it when it starts serving, while handshakes
+// read the group's config and a reload clones it (under Go 1.26 the race
+// detector reported that in TestBindGroup_ClientAuthFollowsReplaceSites).
+func TestBindGroup_HTTPServerOwnTLSConfig(t *testing.T) {
+	pki := newCAPKI(t, "own-config-ca")
+	addr := freeAddr(t)
+	g := startGroup(t, addr, mtlsSite(t, pki, "a", nil, true, "", ""))
+	if g.httpServer.TLSConfig == nil || g.tlsBase == nil || g.httpServer.TLSConfig == g.tlsBase {
+		t.Fatalf("net/http's TLS config %p, the group's %p: want two configs", g.httpServer.TLSConfig, g.tlsBase)
+	}
+	if code, _, err := httpsGet(pki, addr, "localhost", "localhost", nil, true); err != nil || code != 200 {
+		t.Fatalf("HTTP/2: %d %v", code, err)
+	}
+	if code, _, err := httpsGet(pki, addr, "localhost", "localhost", nil, false); err != nil || code != 200 {
+		t.Fatalf("HTTP/1.1: %d %v", code, err)
+	}
+}
+
 // A reload that turns client_auth on for a site applies to new handshakes.
 func TestBindGroup_ClientAuthFollowsReplaceSites(t *testing.T) {
 	pki := newCAPKI(t, "reload-ca")

@@ -84,7 +84,10 @@ type Engine struct {
 	// udpClientReadTimeout ends a session of a listener socket whose client
 	// has sent nothing for this long (udpsock.go).
 	udpClientReadTimeout time.Duration
-	l4Handler            *ProxyEventHandler // set by Start (under reloadMu)
+	// tcpIdleDefault is a tcp listener's timeouts.idle when it sets none,
+	// with tls or without (defaultL4IdleTimeout; tests lower it).
+	tcpIdleDefault time.Duration
+	l4Handler      *ProxyEventHandler // set by Start (under reloadMu)
 }
 
 type ListenerConfig struct {
@@ -183,6 +186,7 @@ func NewEngine(cfg *config.Config) *Engine {
 		udpMaxSessionsPerIP:  maxUDPSessionsPerIP,
 		udpNoReplyTimeout:    udpNoReplyTimeout,
 		udpClientReadTimeout: udpClientReadTimeout,
+		tcpIdleDefault:       defaultL4IdleTimeout,
 	}
 	if cfg != nil {
 		e.shutdownTimeout.Store(int64(cfg.Server.ResolveShutdownTimeout()))
@@ -219,6 +223,19 @@ func preflight(listeners []*ListenerConfig, backends []config.Backend) error {
 		}
 	}
 	return nil
+}
+
+// Check runs, on a loaded config, what Start refuses before it touches any
+// socket: the port ranges expand, every listener's derived state builds
+// and every backend_tls config builds. `nvelox --check` calls it after
+// config.Load, so a config it accepts is one a start would not refuse for
+// what is written in it (a port that is taken shows only at the start).
+func Check(cfg *config.Config) error {
+	listeners, err := ExpandListeners(cfg.Listeners)
+	if err != nil {
+		return fmt.Errorf("listener expansion: %w", err)
+	}
+	return preflight(listeners, cfg.Backends)
 }
 
 // warnInsecureBackendTLS logs, once per start / reload, every backend that
@@ -533,7 +550,11 @@ func (e *Engine) startUDPSockets(plan *udpInterfacePlan, handler *ProxyEventHand
 		if err != nil {
 			return err
 		}
-		socks = append(socks, newUDPListenSock(pc, handler, viaInterface))
+		dests := false
+		if l := handler.findListenerForAddr(pc.LocalAddr()); l != nil {
+			dests = l.proxyTrust.enabled()
+		}
+		socks = append(socks, newUDPListenSock(pc, handler, viaInterface, dests))
 		return nil
 	}
 	closeAll := func() {
@@ -669,6 +690,7 @@ func (e *Engine) Reload(cfg *config.Config) error {
 			continue
 		}
 		running.proxyTrust.setKeys(keys)
+		running.proxyTrust.shared().SetReplayWindow(l.proxyTrust.shared().ReplayWindowRequired())
 	}
 	warnInsecureBackendTLS(cfg.Backends)
 	e.Config = cfg
@@ -910,7 +932,7 @@ func ExpandListeners(listeners []config.Listener) ([]*ListenerConfig, error) {
 			ACL:             l.ACL,
 			TrustedProxies:  l.TrustedProxies,
 			AcceptProxyFrom: l.AcceptProxyFrom,
-			proxyTrust:      newProxyTrust(l.AcceptProxyFrom, l.AcceptProxyKeys),
+			proxyTrust:      newProxyTrust(l.AcceptProxyFrom, l.AcceptProxyKeys, l.ReplayWindowRequired()),
 			proxyInterfaces: l.AcceptProxyInterfaces,
 			accessLogOff:    new(atomic.Bool),
 			ServerNames:     l.ServerNames,
@@ -1241,7 +1263,7 @@ func warnIfKeyWorldReadable(keyPath string) {
 
 func (e *Engine) startTLSListener(l *ListenerConfig, handler *ProxyEventHandler) error {
 	warnIfKeyWorldReadable(l.TLS.Key)
-	cert, err := tls.LoadX509KeyPair(l.TLS.Cert, l.TLS.Key)
+	cert, err := config.LoadKeyPair(l.TLS.Cert, l.TLS.Key)
 	if err != nil {
 		return fmt.Errorf("failed to load TLS cert/key: %v", err)
 	}
@@ -1443,7 +1465,7 @@ func (e *Engine) handleTLSConn(rawConn net.Conn, tlsConfig *tls.Config, l *Liste
 	if backend != nil && backend.SendProxyV2 {
 		header := proxyproto.HeaderProxyFromAddrs(2, client, rawConn.LocalAddr())
 		if len(backend.SendProxyKey) > 0 {
-			if err := proxy.SignHeader(header, backend.SendProxyKey, time.Now()); err != nil {
+			if err := proxy.SignHeaderFrom(header, backend.SendProxyKey, time.Now(), proxy.RelayEnds(backendConn.LocalAddr(), backendConn.RemoteAddr())); err != nil {
 				logging.Error("Failed to sign PROXY v2 header on TLS conn: %v", err)
 				return
 			}
@@ -1458,9 +1480,9 @@ func (e *Engine) handleTLSConn(rawConn net.Conn, tlsConfig *tls.Config, l *Liste
 	// Bidirectional relay with half-close semantics (relay.go): a backend that
 	// closes first gets its whole response delivered followed by close_notify
 	// + FIN; a client that half-closes still gets the backend's answer. The
-	// idle timeout applies only when timeouts.idle is set — this path never
-	// had a default one.
-	res := relayL4(clientConn, backendConn, l.Timeouts.ParseIdle())
+	// idle timeout is a plain tcp listener's: timeouts.idle, else 5 minutes
+	// (this path had none until 2.0.0).
+	res := relayL4(clientConn, backendConn, e.tcpIdleTimeout(l))
 	if res.Err != nil {
 		logging.Debug("[CONN] TLS %s ended with error: %v", client, res.Err)
 	}

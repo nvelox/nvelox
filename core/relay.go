@@ -49,16 +49,20 @@ var relayBufPool = sync.Pool{New: func() any {
 	return &b
 }}
 
-// defaultL4IdleTimeout applies to plain L4 TCP listeners when timeouts.idle is
-// unset (unchanged from the previous data path). An explicit "0" disables it.
+// defaultL4IdleTimeout applies to tcp listeners, with tls or without, when
+// timeouts.idle is unset. An explicit "0" disables it.
 const defaultL4IdleTimeout = 5 * time.Minute
 
-// l4IdleTimeout resolves a plain L4 TCP listener's idle timeout.
-func l4IdleTimeout(l *ListenerConfig) time.Duration {
-	if l.Timeouts.Idle == "" {
-		return defaultL4IdleTimeout
+// tcpIdleTimeout resolves a tcp listener's idle timeout: its timeouts.idle,
+// else the engine's default (defaultL4IdleTimeout).
+func (e *Engine) tcpIdleTimeout(l *ListenerConfig) time.Duration {
+	if l.Timeouts.Idle != "" {
+		return l.Timeouts.ParseIdle()
 	}
-	return l.Timeouts.ParseIdle()
+	if e.tcpIdleDefault > 0 {
+		return e.tcpIdleDefault
+	}
+	return defaultL4IdleTimeout
 }
 
 // relayResult summarises one finished L4 session.

@@ -223,7 +223,7 @@ func TestRelayHeader_OtherPeersNotLookedAt(t *testing.T) {
 func TestRelayClient(t *testing.T) {
 	realClient := &net.TCPAddr{IP: net.ParseIP("203.0.113.7"), Port: 4242}
 	hdr := stClientHeader(t, realClient.String())
-	trust := newProxyTrust([]string{"127.0.0.0/8"}, nil)
+	trust := newProxyTrust([]string{"127.0.0.0/8"}, nil, false)
 
 	t.Run("header split across writes, payload left on the connection", func(t *testing.T) {
 		a, b := stConnPair(t)
@@ -287,7 +287,7 @@ func TestRelayClient(t *testing.T) {
 		}
 	})
 	t.Run("a signature is required with keys", func(t *testing.T) {
-		keyed := newProxyTrust([]string{"127.0.0.0/8"}, [][]byte{sigKeyA})
+		keyed := newProxyTrust([]string{"127.0.0.0/8"}, [][]byte{sigKeyA}, false)
 		a, b := stConnPair(t)
 		a.Write(hdr)
 		if client, reason, cause := keyed.relayClient(b, time.Second); client != nil || reason != proxy.RefusedSignature || !errors.Is(cause, proxy.ErrSignatureMissing) {

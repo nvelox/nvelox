@@ -9,10 +9,10 @@ its own license, reproduced here from the version that is compiled in.
 | github.com/quic-go/qpack | v0.6.0 | MIT |
 | github.com/quic-go/quic-go | v0.59.1 | MIT |
 | github.com/yookoala/gofast | v0.8.0 | BSD-3-Clause |
-| golang.org/x/crypto | v0.58.0 | BSD-3-Clause |
+| golang.org/x/crypto | v0.59.0 | BSD-3-Clause |
 | golang.org/x/net | v0.62.0 | BSD-3-Clause |
-| golang.org/x/sys | v0.49.0 | BSD-3-Clause |
-| golang.org/x/text | v0.43.0 | BSD-3-Clause |
+| golang.org/x/sys | v0.50.0 | BSD-3-Clause |
+| golang.org/x/text | v0.44.0 | BSD-3-Clause |
 | golang.org/x/tools/godoc | v0.1.0-deprecated | BSD-3-Clause |
 | gopkg.in/yaml.v3 | v3.0.1 | MIT and Apache-2.0 |
 | The Go programming language (runtime and standard library) | go1.27.4 | BSD-3-Clause |
@@ -269,6 +269,8 @@ SOFTWARE.
 
 ## github.com/yookoala/gofast v0.8.0
 
+Built from the copy in `third_party/gofast`, with the changes listed in `third_party/README.md`.
+
 `LICENCE`:
 
 ```
@@ -301,7 +303,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-## golang.org/x/crypto v0.58.0
+## golang.org/x/crypto v0.59.0
 
 `LICENSE`:
 
@@ -369,7 +371,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-## golang.org/x/sys v0.49.0
+## golang.org/x/sys v0.50.0
 
 `LICENSE`:
 
@@ -403,7 +405,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-## golang.org/x/text v0.43.0
+## golang.org/x/text v0.44.0
 
 `LICENSE`:
 

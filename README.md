@@ -70,7 +70,7 @@ Every table and chart, latency, CPU and memory of each proxy, the setup and how 
 - **Client Certificate Auth (mTLS)** — `client_auth: require` / `request` with `client_ca` verification on TLS-terminating TCP, HTTPS and HTTP/3 listeners; per site (by SNI) when sites share a port
 - **ACLs** — match by source IP/CIDR, HTTP method, path, headers; allow/deny actions (TCP/UDP listeners: source IP only)
 - **IP Allowlist/Denylist** — CIDR-based per-listener filtering on HTTP, TCP and UDP listeners (behind a trusted PROXY v2 relay, on the client it names)
-- **Signed PROXY v2 headers** — relays and receivers share a key so a forged header (a spoofed UDP source) cannot name a client; keys rotate on reload
+- **Signed PROXY v2 headers** — relays and receivers share a key so a forged header (a spoofed UDP source) cannot name a client; each header is bound to both ends of its connection or datagram and numbered, so a copy of a datagram, or a header sent from or to another address, is dropped (`accept_proxy_replay_window`; no address translation between a relay and nvelox); keys rotate on reload
 - **Interface-bound relay trust** — for UDP relays that cannot sign: trust their PROXY headers only on datagrams that arrived on chosen network interfaces (`accept_proxy_interfaces`, Linux)
 - **Per-IP Rate Limiting** — token bucket per client IP with LRU cleanup
 - **Per-Listener Rate Limiting** — global connection rate limit
@@ -82,7 +82,7 @@ Every table and chart, latency, CPU and memory of each proxy, the setup and how 
 - **Passive Health Checks** — mark down after N consecutive failures
 - **Retries / Failover** — retry on connect failure, 502, 503; skip failed servers
 - **Circuit Breaker** — closed/open/half-open state machine per backend
-- **Configurable Timeouts** — per listener: `read_header`, `idle`, and `read` / `write`, which limit how long a client may stall, not how long a transfer may take (a quiet event stream, or a long upload or download that keeps moving, is never cut); applied per request after Host-based routing, so sites sharing a bind port can differ. Per backend: `connect`, `response_header` (time to start answering, else 504) and `read` (longest silence once answering)
+- **Configurable Timeouts** — per listener: `read_header`, `idle`, and `read` / `write`, which limit how long a client may stall, not how long a transfer may take (a quiet event stream, or a long upload or download that keeps moving, is never cut); applied per request after Host-based routing, so sites sharing a bind port can differ. Per backend: `connect`, `response_header` (time to start answering, else 504) and `read` (longest silence once answering); per `fastcgi` route: `connect` and `response_header`, as on a backend
 - **Graceful Shutdown** — on `SIGINT` or `SIGTERM` nvelox accepts nothing new and answers the HTTP requests in flight (HTTP/1.1, HTTP/2 and HTTP/3) before it exits; `server.shutdown_timeout` sets how long it waits for them (default 10 s)
 
 ### Response Processing
@@ -103,7 +103,9 @@ Every table and chart, latency, CPU and memory of each proxy, the setup and how 
 - **PROXY Protocol v2** — pass client IP to TCP, UDP and HTTP backends in HAProxy format (`send_proxy_v2`; for HTTP, every backend connection serves one client connection); accept it from trusted relays (`accept_proxy_from`) on TCP, UDP, HTTP and HTTPS listeners (HTTP/1.1, HTTP/2 and HTTP/3); a listed relay must send it, and is never taken for the client of what it relays
 - **DNS Service Discovery** — periodic hostname resolution with auto-update
 - **Modular Config** — split configs via `include` glob patterns
-- **Config Validation** — comprehensive validation at load time; keys that are parsed but not implemented (`sni_routes`, `throttle`, `tls.ocsp_stapling`, `routes[].scripts`) are rejected with an error naming the key, and `server.pid_file` / `workers` print a startup warning. Started as root with `server.user` / `group`, nvelox binds its ports and then switches to that user
+- **Config Validation** — comprehensive validation at load time. A key that no setting reads is refused with the file, the line and the nearest real key (`nvelox.yaml:42:5: unknown setting "ip_denylst" in listeners[0] (did you mean "ip_denylist"?)`), in the main file and in every included one, so a misspelled setting cannot start and quietly do nothing. Keys that are parsed but not implemented (`tracing`, and on a listener `zero_copy`, `grpc`, `root`, `tls.auto_cert`, `tls.ocsp_stapling`, `sni_routes`, `throttle`, `buffering.request_body_buffer`, `routes[].scripts`, `routes[].fastcgi.index`) are rejected with an error naming the key, and so are the settings only http and https listeners read when a tcp or udp listener sets them, and `timeouts` on a udp listener. Started as root with `server.user` / `group`, nvelox binds its ports, writes `server.pid_file` when one is set, and then switches to that user
+- **Config Check** — `nvelox --check --config FILE` prints `FILE: configuration is valid` and exits 0, or prints what a start would refuse and exits 1; it binds no port and writes nothing
+- **Workers** — `server.workers` sets how many event loops run (default: one per CPU core the process may use), so nvelox can share a machine; the start log names the count
 
 ## Architecture
 
@@ -164,6 +166,8 @@ cat examples/README.md
 ```
 
 ## Configuration
+
+Every setting, what it does and its default: [docs/reference/configuration.md](docs/reference/configuration.md). A configuration that shows them: [nvelox.example.yaml](nvelox.example.yaml).
 
 ### Basic HTTP Proxy
 ```yaml
@@ -229,6 +233,10 @@ listeners:
           pass: "127.0.0.1:9000"
           document_root: "/var/www/html"
           split_path_info: "^(.+\\.php)(/.*)$"
+          timeouts:
+            connect: 5s           # unset: the listener's timeouts.connect, else 10s
+            send: 60s             # unset: 60s; "0": no limit
+            response_header: 60s  # unset: 60s
 
       - match:
           path_prefix: "/"
@@ -246,7 +254,11 @@ string as `QUERY_STRING`) goes through the ACL and the routes again and lands
 on the PHP route. Static routes never serve `.php`, `.phtml`
 or `.phar` files as files. A `fastcgi` route needs `document_root`, and
 nvelox hands PHP-FPM only an existing `.php` file inside it — nvelox must see
-the document root at the same path as PHP-FPM.
+the document root at the same path as PHP-FPM. Its `timeouts`: the dial
+gives up after `connect` (502); PHP-FPM may pause in taking the request
+body for `send` at most (504; an upload it keeps taking is never cut), and
+has `response_header` to start answering once it has the request body
+(504). A response head over 64 KiB is answered 500.
 
 ### Full Production (all features)
 ```yaml
@@ -309,7 +321,7 @@ backends:
 
 ### HTTP/3 limits
 
-The limits of HTTP/3 connections are settings under `server.http3`, for every listener with `http3: true`. Each is a size (`64KB`, `16MB`, `2GB`); the values below are the defaults.
+The limits of HTTP/3 connections are settings under `server.http3`, for every listener with `http3: true`. Each is a size (`64KB`, `16MB`, `2GB`), but for `handshakes_per_source`, a count; the values below are the defaults.
 
 ```yaml
 server:
@@ -321,9 +333,10 @@ server:
     # max_send_memory: "2GB"               # all connections together: what they hold to send
     # max_receive_memory: "2GB"            # all connections together: upload windows beyond the first
     socket_buffer: "4MB"                   # asked for each UDP socket (one per event loop), to receive and to send
+    handshakes_per_source: 32              # QUIC handshakes one client address may have running on each loop; 0: no limit
 ```
 
-The two totals default to an eighth of the memory nvelox may use (64 MiB at the least). A reload applies all seven: the totals at once, `socket_buffer` to bind addresses started after it, the others to connections opened after it. `nvelox.example.yaml` says what each one costs and gains.
+The two totals default to an eighth of the memory nvelox may use (64 MiB at the least). `handshakes_per_source` counts an IPv4 address, or an IPv6 /64, and behind a trusted relay the client it names: the first packets of further clients are dropped (they send them again) and counted in `nvelox_h3_handshakes_refused_total{reason="per_source"}`, and clients behind one address, a company's NAT say, share it. It counts the clients that proved their address (they came back with the token of the server's Retry packet), so first packets with a made-up source cannot keep an address out. A reload applies all eight: the totals and `handshakes_per_source` at once, `socket_buffer` to bind addresses started after it, the others to connections opened after it. `nvelox.example.yaml` says what each one costs and gains.
 
 The kernel grants a socket buffer up to `net.core.rmem_max` and `net.core.wmem_max` (208 KiB each by default), and all of it to a process started with `CAP_NET_ADMIN`. With a small receive buffer a fast upload loses datagrams before nvelox reads them. A listener whose sockets got less than `socket_buffer` says so in a startup warning; raising the two kernel limits to the value of `socket_buffer` or more settles it.
 

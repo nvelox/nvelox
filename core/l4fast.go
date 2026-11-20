@@ -1,8 +1,10 @@
 package core
 
 import (
+	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"time"
 
@@ -52,7 +54,7 @@ type l4FastSess struct {
 // serve gate opens.
 func (e *Engine) startL4Fast(ln net.Listener, l *ListenerConfig, h *ProxyEventHandler) error {
 	f := &l4FastServer{e: e, h: h, l: l}
-	t, err := relay.NewTCP(relay.TCPConfig{Listener: ln, IdleTimeout: l4IdleTimeout(l), Context: e.runCtx, Host: f})
+	t, err := relay.NewTCP(relay.TCPConfig{Listener: ln, IdleTimeout: e.tcpIdleTimeout(l), Context: e.runCtx, Host: f})
 	if err != nil {
 		return fmt.Errorf("TCP listener %s: %v", l.Name, err)
 	}
@@ -167,11 +169,18 @@ func (f *l4FastServer) Target(s *relay.TCPSession) (relay.TCPTarget, bool) {
 	if backend != nil && backend.SendProxyV2 {
 		// PROXY v2 to the backend: the source is the client, the
 		// destination the address the client connected to.
+		// A signed header is bound to the connection to the backend: the
+		// address it leaves from (from) and the backend's (to).
 		key := backend.SendProxyKey
-		t.Preface = func(src, dst *net.TCPAddr) ([]byte, error) {
+		t.PrefaceFrom = len(key) > 0
+		t.Preface = func(src, dst *net.TCPAddr, from, to netip.AddrPort) ([]byte, error) {
 			header := proxyproto.HeaderProxyFromAddrs(2, src, dst)
 			if len(key) > 0 {
-				if err := proxy.SignHeader(header, key, time.Now()); err != nil {
+				if !from.IsValid() || !to.IsValid() {
+					logging.Error("Failed to sign PROXY v2 header: the addresses of the connection to the backend are not known")
+					return nil, errNoSendAddr
+				}
+				if err := proxy.SignHeaderFrom(header, key, time.Now(), proxy.Ends{Relay: from, Receiver: to}); err != nil {
 					logging.Error("Failed to sign PROXY v2 header: %v", err)
 					return nil, err
 				}
@@ -186,6 +195,10 @@ func (f *l4FastServer) Target(s *relay.TCPSession) (relay.TCPTarget, bool) {
 	}
 	return t, true
 }
+
+// errNoSendAddr: a header cannot be signed for a connection whose own
+// address is not known.
+var errNoSendAddr = errors.New("the address of the connection to the backend is not known")
 
 // Connected: the session's backend connection is there.
 func (f *l4FastServer) Connected(s *relay.TCPSession) {

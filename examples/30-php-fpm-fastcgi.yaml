@@ -39,7 +39,6 @@ listeners:
   - name: "php-app"
     bind: ":9080"
     protocol: "http"
-    root: "/var/www/html"
     routes:
       # Static assets — serve directly with long cache
       - match:
@@ -72,6 +71,14 @@ listeners:
           params:
             HTTPS: "$http_x_forwarded_proto"
             REMOTE_ADDR: "$http_x_real_ip"
+          # How long PHP-FPM gets: to accept the connection, to go without
+          # taking any of an upload (one it keeps taking is never cut), and to
+          # start answering once it has the whole request. These are the
+          # defaults but connect's (the listener's, else 10s).
+          timeouts:
+            connect: "5s"
+            send: "60s"
+            response_header: "60s"
 
       # Everything else — try static, fall back to the front controller
       - match:

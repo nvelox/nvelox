@@ -15,6 +15,7 @@ import (
 	"nvelox/core/httppath"
 	"nvelox/core/httpproxy/errorhtml"
 	"nvelox/core/logging"
+	"nvelox/core/metrics"
 	"nvelox/proxy"
 )
 
@@ -23,17 +24,31 @@ import (
 // answer with nvelox's error pages and within server.http3's limits.
 func init() {
 	web.SetHooks(web.Hooks{
-		Errorf:        logging.Error,
-		Warnf:         logging.Warn,
-		Debugf:        logging.Debug,
-		AccessHead:    logging.AppendAccessHTTPHead,
-		AccessMid:     logging.AppendAccessHTTPMid,
-		AccessTail:    logging.AppendAccessHTTPTail,
-		WriteAccess:   logging.WriteAccess,
-		CanonicalPath: httppath.Canonical,
-		ErrorPage:     errorhtml.DefaultErrorPage,
-		H3Limits:      fastH3Limits,
+		Errorf:             logging.Error,
+		Warnf:              logging.Warn,
+		Debugf:             logging.Debug,
+		AccessHead:         logging.AppendAccessHTTPHead,
+		AccessMid:          logging.AppendAccessHTTPMid,
+		AccessTail:         logging.AppendAccessHTTPTail,
+		WriteAccess:        logging.WriteAccess,
+		CanonicalPath:      httppath.Canonical,
+		ErrorPage:          errorhtml.DefaultErrorPage,
+		H3Limits:           fastH3Limits,
+		H3HandshakeRefused: h3HandshakeRefused,
 	})
+}
+
+// h3RefusedPerSource counts the first packets of QUIC clients the event
+// loops dropped because their address had server.http3.handshakes_per_source
+// handshakes running.
+var h3RefusedPerSource = metrics.Default.GetCounter("nvelox_h3_handshakes_refused_total", map[string]string{"reason": "per_source"})
+
+// h3HandshakeRefused counts a QUIC client's first packet an event loop
+// dropped, by the reason the loop gives (Hooks.H3HandshakeRefused).
+func h3HandshakeRefused(reason string) {
+	if reason == "per_source" {
+		h3RefusedPerSource.Inc()
+	}
 }
 
 // This file is a bind group's side of its server on the event loops (the
@@ -62,7 +77,7 @@ func (g *BindGroup) newFast(ln net.Listener, readHeader, idle time.Duration) err
 		Name:              g.addr,
 		ReadHeaderTimeout: readHeader,
 		IdleTimeout:       idle,
-		TLS:               g.httpServer.TLSConfig,
+		TLS:               g.tlsBase,
 		Slow:              g.httpServer,
 		Host:              fastHost{g},
 		Relays:            fastHost{g},
@@ -164,14 +179,14 @@ func (h fastHost) Trusted(peer net.IP) bool { return h.g.proxyTrust().TrustsIP(p
 // Header parses the PROXY v2 header at the start of a trusted relay's
 // plain-HTTP connection; one that does not pass (malformed, a bad
 // signature) is counted and the connection closed.
-func (h fastHost) Header(relay net.IP, data []byte) (int, *net.TCPAddr) {
+func (h fastHost) Header(relay, local netip.AddrPort, data []byte) (int, *net.TCPAddr) {
 	done, hdr, consumed, perr := proxy.ParseStreamStrict(data)
 	if !done {
 		return 0, nil
 	}
-	client, reason, cause := proxyClient(h.g.proxyTrust(), hdr, perr)
+	client, reason, cause := proxyClient(h.g.proxyTrust(), hdr, perr, proxy.Ends{Relay: relay, Receiver: local})
 	if reason != "" {
-		h.g.proxyRejected(&net.TCPAddr{IP: relay}, reason, cause)
+		h.g.proxyRejected(net.TCPAddrFromAddrPort(relay), reason, cause)
 		return -1, nil
 	}
 	return consumed, client
@@ -199,7 +214,7 @@ func (h fastHost) Read(c net.Conn) (*net.TCPAddr, bool) {
 		return nil, true
 	}
 	hdr, err := proxy.ReadStreamHeader(c)
-	client, reason, cause := proxyClient(tr, hdr, err)
+	client, reason, cause := proxyClient(tr, hdr, err, proxy.ReceiverEnds(c.LocalAddr(), remote))
 	if reason != "" {
 		h.g.proxyRejected(remote, reason, cause)
 		return nil, false
@@ -213,19 +228,19 @@ func (h fastHost) Read(c net.Conn) (*net.TCPAddr, bool) {
 // and counted. The relays are the ones the group trusts now: a reload that
 // changes them applies at once. state holds the socket's pins: the client
 // each relay socket that sends to it stands for.
-func (h fastHost) Datagram(state *any, from netip.AddrPort, d []byte, now int64) ([]byte, netip.AddrPort, bool) {
+func (h fastHost) Datagram(state *any, from netip.AddrPort, to web.Dest, d []byte, now int64) ([]byte, netip.AddrPort, bool) {
 	tr := h.g.proxyTrust()
 	if !tr.Enabled() || !trustsAddr(tr, from.Addr()) {
 		return d, netip.AddrPort{}, true
 	}
-	payload, client, reason, cause := h3RelayHeader(tr, d)
+	payload, client, counter, counted, reason, cause := h3RelayHeader(tr, d, proxy.Ends{Relay: from, Receiver: to.AddrPort()})
 	if reason == "" {
 		pins, _ := (*state).(*h3Pins)
 		if pins == nil {
 			pins = &h3Pins{}
 			*state = pins
 		}
-		reason, cause = pins.pin(from, client, now)
+		reason, cause = pins.pin(from, client, now, counter, counted)
 	}
 	if reason != "" {
 		h.g.proxyRejected(net.UDPAddrFromAddrPort(from), reason, cause)
@@ -328,11 +343,16 @@ func (s *HTTPServer) fastBackend(name string) *web.Backend {
 	}
 	if sendsProxy(be) {
 		b.ProxyHeaderVaries = len(be.SendProxyKey) > 0 // a signed header carries its time
-		b.ProxyHeader = func(client, local net.Addr) ([]byte, error) {
+		b.ProxyHeader = func(client, local net.Addr, from, to netip.AddrPort) ([]byte, error) {
 			if key := be.SendProxyKey; len(key) > 0 {
-				return backendProxyHeader(client, local, key, time.Now())
+				// from and to: the connection to the server, which a
+				// signed header is bound to (ProxyHeaderVaries).
+				if !from.IsValid() || !to.IsValid() {
+					return nil, errProxyAddr
+				}
+				return backendProxyHeader(client, local, key, time.Now(), proxy.Ends{Relay: from, Receiver: to})
 			}
-			return backendProxyHeader(client, local, nil, time.Time{})
+			return backendProxyHeader(client, local, nil, time.Time{}, proxy.Ends{})
 		}
 	}
 	return b

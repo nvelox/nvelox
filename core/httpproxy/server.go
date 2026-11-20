@@ -223,7 +223,7 @@ func NewHTTPServer(l *ListenerConfig, balancers map[string]lb.Balancer, backends
 	if len(l.ErrorPages) > 0 {
 		s.ErrorPages = make(map[int][]byte)
 		for code, path := range l.ErrorPages {
-			data, err := os.ReadFile(path)
+			data, err := config.ReadNamedFile(path)
 			if err != nil {
 				logging.Error("[HTTP] Failed to load error page for %d from %s: %v", code, path, err)
 				continue
@@ -473,7 +473,7 @@ func buildBackendTLSConfig(cfg config.BackendTLSConfig) (*tls.Config, error) {
 	if cfg.Insecure {
 		t.InsecureSkipVerify = true
 	} else if cfg.CACert != "" {
-		pem, err := os.ReadFile(cfg.CACert)
+		pem, err := config.ReadNamedFile(cfg.CACert)
 		if err != nil {
 			return nil, fmt.Errorf("read ca_cert: %w", err)
 		}
@@ -490,7 +490,7 @@ func buildBackendTLSConfig(cfg config.BackendTLSConfig) (*tls.Config, error) {
 		return nil, fmt.Errorf("backend_tls: client_cert and client_key must both be set for mTLS")
 	}
 	if cfg.ClientCert != "" {
-		cert, err := tls.LoadX509KeyPair(cfg.ClientCert, cfg.ClientKey)
+		cert, err := config.LoadKeyPair(cfg.ClientCert, cfg.ClientKey)
 		if err != nil {
 			return nil, fmt.Errorf("load client cert: %w", err)
 		}
@@ -787,7 +787,12 @@ dispatch:
 			if routeHeaders != nil {
 				applyRequestHeaders(r, routeHeaders)
 			}
-			ServeFastCGI(newExpiresWriter(w, routeResult.Expires), r, routeResult.FastCGI, s.serveError)
+			fcgi := routeResult.FastCGI
+			if fcgi.Timeouts.Connect == "" {
+				// As for an HTTP backend: the route's, else the listener's.
+				fcgi.Timeouts.Connect = s.Listener.Timeouts.Connect
+			}
+			ServeFastCGI(newExpiresWriter(w, routeResult.Expires), r, fcgi, s.serveError)
 			return
 		}
 

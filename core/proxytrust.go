@@ -3,6 +3,7 @@ package core
 import (
 	"errors"
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"time"
 
@@ -17,8 +18,10 @@ import (
 // package's TCP and UDP paths call it by. A nil *proxyTrust trusts nobody.
 type proxyTrust struct{ *proxy.Trust }
 
-func newProxyTrust(cidrs []string, keys [][]byte) *proxyTrust {
-	return &proxyTrust{proxy.NewTrust(cidrs, keys)}
+func newProxyTrust(cidrs []string, keys [][]byte, replayRequired bool) *proxyTrust {
+	t := proxy.NewTrust(cidrs, keys)
+	t.SetReplayWindow(replayRequired)
+	return &proxyTrust{t}
 }
 
 // shared returns the proxy.Trust (nil for a nil receiver).
@@ -32,9 +35,123 @@ func (p *proxyTrust) shared() *proxy.Trust {
 // setKeys replaces the signing keys (nil: headers need no signature).
 func (p *proxyTrust) setKeys(keys [][]byte) { p.Trust.SetKeys(keys) }
 
-// verify checks a trusted peer's header (proxy.Trust.Verify).
-func (p *proxyTrust) verify(h *proxyproto.Header, payload []byte, datagram bool) error {
-	return p.shared().Verify(h, payload, datagram)
+// relayDatagram checks the header of a datagram from a trusted relay's
+// socket, with the ends ends (proxy.Trust.VerifyFrom): the counter it
+// carries (counted false: none), for the window of that relay socket
+// (relayWindows), or the reason the datagram is dropped.
+func (p *proxyTrust) relayDatagram(h *proxyproto.Header, payload []byte, ends proxy.Ends) (counter uint64, counted bool, drop string) {
+	counter, counted, err := p.shared().VerifyFrom(h, payload, true, ends)
+	if err != nil {
+		return 0, false, udpDropBadSignature
+	}
+	return counter, counted, ""
+}
+
+const (
+	// relayWindowKeep is how long the window of a relay socket is kept
+	// once no session uses it: a header taken in it passes its time check
+	// until proxy.SignatureWindow after it was signed, which may be
+	// proxy.SignatureWindow after it was taken.
+	relayWindowKeep = 2 * proxy.SignatureWindow
+	// relayWindowExpireMax bounds the windows one call removes, so that no
+	// datagram waits for many: each session that ends adds at most one to
+	// remove.
+	relayWindowExpireMax = 64
+)
+
+// relayWindow is the replay window of one relay socket (a trusted peer's
+// address and port; accept_proxy_replay_window): the counters of its
+// headers that were taken. The sessions of that socket use it one after
+// the other.
+type relayWindow struct {
+	proxy.ReplayWindow
+	peer     netip.AddrPort
+	sessions int   // the sessions that use it
+	ended    int64 // when the last of them ended (unix nanoseconds)
+	queued   bool  // it has an entry in relayWindows.idle
+}
+
+// relayWindows holds the windows of the relay sockets one event loop, or
+// one listener socket, serves. A window outlives the sessions that used
+// it: the session that took a header may end long before a copy of that
+// header stops passing its time check (no answer from the server, a
+// failure, a refusal), and the copy would begin a new session. A window is
+// made for the first counted header of a relay socket, so only a relay
+// that has the key adds one. Not safe for concurrent use.
+type relayWindows struct {
+	m map[netip.AddrPort]*relayWindow
+	// idle: the windows whose sessions all ended, about in the order the
+	// last one did. A window has one entry at most, however many sessions
+	// end: the list grows with the relay sockets, not with the sessions
+	// (a flood of sessions that are refused at once ends one each). A window
+	// used again since its entry was made is put back, at its later end,
+	// when the entry comes up.
+	idle []idleWindow
+}
+
+type idleWindow struct {
+	w     *relayWindow
+	ended int64
+}
+
+// attach returns the window of the relay socket at peer for a session that
+// takes its counters from now on (unix nanoseconds). A window no session
+// has used for more than relayWindowKeep starts empty: what it held passes
+// its time check no longer.
+func (t *relayWindows) attach(peer netip.AddrPort, now int64) *relayWindow {
+	if t.m == nil {
+		t.m = make(map[netip.AddrPort]*relayWindow)
+	}
+	w := t.m[peer]
+	switch {
+	case w == nil:
+		w = &relayWindow{peer: peer}
+		t.m[peer] = w
+	case w.sessions == 0 && now-w.ended > int64(relayWindowKeep):
+		w.ReplayWindow = proxy.ReplayWindow{}
+	}
+	w.sessions++
+	t.expire(now)
+	return w
+}
+
+// detach: a session that used w is over (now: unix nanoseconds).
+func (t *relayWindows) detach(w *relayWindow, now int64) {
+	w.sessions--
+	w.ended = now
+	if w.sessions == 0 && !w.queued {
+		w.queued = true
+		t.idle = append(t.idle, idleWindow{w, now})
+	}
+	t.expire(now)
+}
+
+// expire removes, oldest first, windows no session has used since their
+// last one ended more than relayWindowKeep ago: at most
+// relayWindowExpireMax of them.
+func (t *relayWindows) expire(now int64) {
+	for i := 0; i < relayWindowExpireMax && len(t.idle) > 0; i++ {
+		e := t.idle[0]
+		if now-e.ended <= int64(relayWindowKeep) {
+			return
+		}
+		t.idle[0] = idleWindow{}
+		t.idle = t.idle[1:]
+		w := e.w
+		w.queued = false
+		switch {
+		case w.sessions > 0:
+			// In use: queued again when its last session ends.
+		case w.ended != e.ended:
+			// Used again since, and idle again from a later end: put
+			// back at that end (behind entries that may be older; a
+			// window goes at most relayWindowKeep late, never early).
+			w.queued = true
+			t.idle = append(t.idle, idleWindow{w, w.ended})
+		case t.m[w.peer] == w:
+			delete(t.m, w.peer)
+		}
+	}
 }
 
 func (p *proxyTrust) enabled() bool { return p.shared().Enabled() }
@@ -65,7 +182,7 @@ func (p *proxyTrust) relayClient(c net.Conn, wait time.Duration) (client net.Add
 	c.SetReadDeadline(time.Now().Add(wait))
 	hdr, err := proxy.ReadStreamHeader(c)
 	c.SetReadDeadline(time.Time{})
-	named, reason, cause := p.shared().StreamClient(hdr, err)
+	named, reason, cause := p.shared().StreamClient(hdr, err, proxy.ReceiverEnds(c.LocalAddr(), c.RemoteAddr()))
 	if reason != "" {
 		return nil, reason, cause
 	}

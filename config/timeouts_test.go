@@ -108,3 +108,64 @@ func TestResolveResponseHeader(t *testing.T) {
 		}
 	}
 }
+
+// A fastcgi route takes an HTTP backend's connect and response_header;
+// every other timeouts field would do nothing there: refused. The block is
+// read from the config file like any other (the loader refuses unknown
+// keys).
+func TestValidation_FastCGITimeouts(t *testing.T) {
+	cases := []struct {
+		name    string
+		to      TimeoutConfig
+		wantErr []string
+	}{
+		{"none", TimeoutConfig{}, nil},
+		{"both", TimeoutConfig{Connect: "2s", ResponseHeader: "30s"}, nil},
+		{"zero is no limit", TimeoutConfig{Connect: "0", ResponseHeader: "0"}, nil},
+		{"read", TimeoutConfig{Read: "5m"}, []string{"route 0: fastcgi", "timeouts.read does nothing on a fastcgi route", "connect, response_header and send"}},
+		{"write", TimeoutConfig{Write: "30s"}, []string{"route 0: fastcgi", "timeouts.write does nothing on a fastcgi route"}},
+		{"idle", TimeoutConfig{Idle: "30s"}, []string{"route 0: fastcgi", "timeouts.idle does nothing on a fastcgi route"}},
+		{"read_header", TimeoutConfig{ReadHeader: "5s"}, []string{"route 0: fastcgi", "timeouts.read_header does nothing on a fastcgi route"}},
+		{"bad connect", TimeoutConfig{Connect: "2 seconds"}, []string{"route 0: fastcgi", "timeouts.connect"}},
+		{"bad response_header", TimeoutConfig{ResponseHeader: "soon"}, []string{"route 0: fastcgi", "timeouts.response_header"}},
+		{"negative response_header", TimeoutConfig{ResponseHeader: "-1s"}, []string{"route 0: fastcgi", "timeouts.response_header", "negative"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := baseCfg(Listener{Name: "web", Bind: ":80", Protocol: "http", Routes: []RouteConfig{{
+				Match:   RouteMatch{PathRegex: `\.php$`},
+				FastCGI: FastCGIConfig{Pass: "127.0.0.1:9000", DocumentRoot: "/var/www/html", Timeouts: c.to},
+			}}})
+			err := validate(cfg)
+			if c.wantErr == nil {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			wantErr(t, err, c.wantErr...)
+		})
+	}
+
+	cfg, err := loadYAML(t, `version: "2"
+listeners:
+  - name: php
+    bind: ":8080"
+    protocol: http
+    routes:
+      - match:
+          path_regex: "\\.php$"
+        fastcgi:
+          pass: "127.0.0.1:9000"
+          document_root: /var/www/html
+          timeouts:
+            connect: 3s
+            response_header: 90s
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Listeners[0].Routes[0].FastCGI.Timeouts; got.Connect != "3s" || got.ResponseHeader != "90s" {
+		t.Fatalf("fastcgi timeouts read as %+v", got)
+	}
+}

@@ -580,7 +580,11 @@ func (g *BindGroup) Start() error {
 		if err != nil {
 			return err
 		}
-		g.httpServer.TLSConfig = tlsCfg
+		// net/http's server gets a copy of its own: Go 1.26's Serve sets
+		// fields of its TLS config when it starts serving, while the
+		// handshakes read the group's (tlsCfg, here and on the event
+		// loops) and a reload clones it (siteClientConfig).
+		g.httpServer.TLSConfig = tlsCfg.Clone()
 
 		// Start HTTP/3 (QUIC) if ANY site in the group enables it. The
 		// shared QUIC listener uses the same multi-cert tls.Config — its
@@ -610,7 +614,7 @@ func (g *BindGroup) Start() error {
 		if err == nil && !fast {
 			// net/http accepts: a trusted relay's PROXY header is read
 			// under the TLS handshake.
-			ln = tls.NewListener(&proxyListener{Listener: ln, g: g, timeout: readHeaderTO}, g.httpServer.TLSConfig)
+			ln = tls.NewListener(&proxyListener{Listener: ln, g: g, timeout: readHeaderTO}, tlsCfg)
 		}
 		if err != nil {
 			return fmt.Errorf("listen %s: %w", g.addr, err)
@@ -838,7 +842,7 @@ func (g *BindGroup) loadCertState() (*tlsState, error) {
 			continue
 		}
 		warnIfKeyWorldReadable(s.Listener.TLS.Key)
-		cert, err := tls.LoadX509KeyPair(s.Listener.TLS.Cert, s.Listener.TLS.Key)
+		cert, err := config.LoadKeyPair(s.Listener.TLS.Cert, s.Listener.TLS.Key)
 		if err != nil {
 			return nil, fmt.Errorf("site %s: failed to load TLS cert/key: %v", s.Listener.Name, err)
 		}
@@ -920,7 +924,7 @@ func (g *BindGroup) ReloadCerts() (int, error) {
 				s.Listener.Name, caErr)
 			ca = failClosedClientAuth
 		}
-		cert, err := tls.LoadX509KeyPair(s.Listener.TLS.Cert, s.Listener.TLS.Key)
+		cert, err := config.LoadKeyPair(s.Listener.TLS.Cert, s.Listener.TLS.Key)
 		if err != nil {
 			old, ok := prevByName[s.Listener.Name]
 			if !ok {

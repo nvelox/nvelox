@@ -253,11 +253,11 @@ func TestTrustedOwnAddresses(t *testing.T) {
 	_, lan, _ := net.ParseCIDR("192.0.2.10/24")
 	addrs := []net.Addr{&net.IPNet{IP: net.ParseIP("127.0.0.1"), Mask: lo.Mask},
 		&net.IPNet{IP: net.ParseIP("::1"), Mask: v6.Mask}, &net.IPNet{IP: net.ParseIP("192.0.2.10"), Mask: lan.Mask}}
-	got := trustedOwnAddresses(newProxyTrust([]string{"192.0.2.0/24"}, nil), addrs)
+	got := trustedOwnAddresses(newProxyTrust([]string{"192.0.2.0/24"}, nil, false), addrs)
 	if len(got) != 1 || got[0] != "192.0.2.10" {
 		t.Errorf("relay subnet that holds this machine's address: %v, want [192.0.2.10]", got)
 	}
-	if got := trustedOwnAddresses(newProxyTrust([]string{"198.51.100.0/24"}, nil), addrs); len(got) != 0 {
+	if got := trustedOwnAddresses(newProxyTrust([]string{"198.51.100.0/24"}, nil, false), addrs); len(got) != 0 {
 		t.Errorf("relay subnet without this machine's addresses: %v, want none", got)
 	}
 }

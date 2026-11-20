@@ -3,6 +3,7 @@ package core
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"nvelox/core/logging"
@@ -20,9 +21,13 @@ type UDPPool struct {
 // UDPSession represents an active UDP client-to-backend mapping.
 type UDPSession struct {
 	BackendConn net.Conn
-	Target      string
-	LastActive  time.Time
-	mu          sync.Mutex
+	// sent is the counter of the last header signed to the backend on
+	// BackendConn (proxy.NextCounter), shared by the sessions that use the
+	// socket in turn.
+	sent       atomic.Uint64
+	Target     string
+	LastActive time.Time
+	mu         sync.Mutex
 }
 
 // NewUDPPool creates a pool with the given session TTL and starts cleanup.

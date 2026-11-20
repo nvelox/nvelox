@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"nvelox/proxy"
 )
 
 // The UDP listener sockets where the event loops are not supported
@@ -35,6 +37,10 @@ type udpConn struct {
 	remote netip.AddrPort
 	raddr  *net.UDPAddr
 	last   atomic.Int64 // when the client's last datagram came (UnixNano)
+	// dest is where the datagram being handed on (OnData) was sent: what a
+	// relay's signed header is bound to. The socket's reader alone writes
+	// and reads it.
+	dest netip.AddrPort
 }
 
 // LocalAddr is the address of the listener socket the client sent to.
@@ -67,6 +73,7 @@ func (c *udpConn) close(err error) {
 // udpListenSock is one UDP listener socket and the sessions of its clients.
 type udpListenSock struct {
 	pc      *net.UDPConn
+	rd      *proxy.DestReader
 	laddr   net.Addr
 	handler *ProxyEventHandler
 	// viaInterface: the socket is bound to one of its listener's
@@ -74,15 +81,19 @@ type udpListenSock struct {
 	viaInterface bool
 	readTimeout  time.Duration // udpClientReadTimeout of the engine
 
-	mu     sync.Mutex
-	conns  map[netip.AddrPort]*udpConn
-	closed bool
-	done   chan struct{}
-	wg     sync.WaitGroup
+	mu      sync.Mutex
+	conns   map[netip.AddrPort]*udpConn
+	windows relayWindows // the relay sockets' replay windows
+	closed  bool
+	done    chan struct{}
+	wg      sync.WaitGroup
 }
 
-func newUDPListenSock(pc *net.UDPConn, h *ProxyEventHandler, viaInterface bool) *udpListenSock {
-	s := &udpListenSock{pc: pc, laddr: pc.LocalAddr(), handler: h, viaInterface: viaInterface,
+// newUDPListenSock serves pc for h. dests: the listener trusts relays, whose
+// signed headers are bound to where each datagram was sent (on a socket
+// bound to every address, the system tells it).
+func newUDPListenSock(pc *net.UDPConn, h *ProxyEventHandler, viaInterface, dests bool) *udpListenSock {
+	s := &udpListenSock{pc: pc, rd: proxy.NewDestReader(pc, dests), laddr: pc.LocalAddr(), handler: h, viaInterface: viaInterface,
 		readTimeout: udpClientReadTimeout,
 		conns:       make(map[netip.AddrPort]*udpConn), done: make(chan struct{})}
 	if h != nil && h.engine != nil && h.engine.udpClientReadTimeout > 0 {
@@ -108,6 +119,34 @@ func (s *udpListenSock) forget(c *udpConn) {
 	s.mu.Unlock()
 }
 
+// takeCounter takes counter, from a counted header of the relay socket at
+// remote, in that socket's replay window, which the session ctx uses from
+// its first such header on: false when the socket sent it before or it is
+// older than the window.
+func (s *udpListenSock) takeCounter(ctx *ConnContext, remote netip.AddrPort, counter uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ctx.win == nil {
+		now := time.Now().UnixNano()
+		ctx.win = s.windows.attach(remote, now)
+		if ctx.winReleased { // a datagram that came as the session ended
+			s.windows.detach(ctx.win, now)
+		}
+	}
+	return ctx.win.Take(counter)
+}
+
+// releaseWindow: the session ctx is over. The window it used stays for the
+// next sessions of its relay socket (relayWindows.detach).
+func (s *udpListenSock) releaseWindow(ctx *ConnContext) {
+	s.mu.Lock()
+	if ctx.win != nil && !ctx.winReleased {
+		s.windows.detach(ctx.win, time.Now().UnixNano())
+	}
+	ctx.winReleased = true
+	s.mu.Unlock()
+}
+
 // read hands every datagram to the handler: OnOpen for the first one of a
 // client, then OnData. An empty datagram keeps its client's session, begins
 // none and is not handed on. A datagram is valid only during the call.
@@ -115,7 +154,7 @@ func (s *udpListenSock) read() {
 	defer s.wg.Done()
 	buf := make([]byte, udpMaxDatagram)
 	for {
-		n, from, err := s.pc.ReadFromUDPAddrPort(buf)
+		n, from, to, err := s.rd.ReadFrom(buf)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
@@ -155,6 +194,7 @@ func (s *udpListenSock) read() {
 			s.handler.onOpen(c, s.viaInterface)
 		}
 		if n > 0 {
+			c.dest = to
 			s.handler.OnData(c, buf[:n])
 		}
 	}

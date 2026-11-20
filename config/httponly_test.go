@@ -1,0 +1,97 @@
+package config
+
+import (
+	"testing"
+	"time"
+)
+
+// The settings only http and https listeners read are refused on a tcp or
+// udp listener, which would ignore them, each by its name; on an http
+// listener they load. Timeouts are refused on a udp listener only.
+func TestValidation_HTTPOnlyKeysRefusedOnTCPAndUDP(t *testing.T) {
+	keys := []struct {
+		name string
+		set  func(*Listener)
+	}{
+		{"routes", func(l *Listener) { l.Routes = []RouteConfig{{Match: RouteMatch{PathPrefix: "/"}, Backend: "be"}} }},
+		{"headers", func(l *Listener) { l.Headers.ResponseRemove = []string{"Server"} }},
+		{"compression", func(l *Listener) { l.Compression.Enabled = true }},
+		{"cache", func(l *Listener) { l.Cache.DefaultTTL = "5m" }},
+		{"error_pages", func(l *Listener) { l.ErrorPages = map[int]string{404: "/var/www/404.html"} }},
+		{"buffering", func(l *Listener) { l.Buffering.ResponseBuffer = "64KB" }},
+		{"max_body_size", func(l *Listener) { l.MaxBodySize = "10MB" }},
+		{"ip_rate_limit", func(l *Listener) { l.IPRateLimit.RequestsPerSecond = 10 }},
+		{"request_id", func(l *Listener) { l.RequestID.Enabled = true }},
+		{"trusted_proxies", func(l *Listener) { l.TrustedProxies = []string{"10.0.0.0/8"} }},
+		{"server_names", func(l *Listener) { l.ServerNames = []string{"example.com"} }},
+		{"default_server", func(l *Listener) { l.DefaultServer = true }},
+	}
+	for _, proto := range []string{"tcp", "udp"} {
+		for _, k := range keys {
+			l := Listener{Name: "l", Bind: ":7000", Protocol: proto, Backend: "be"}
+			k.set(&l)
+			wantErr(t, validate(baseCfg(l)), "listener l", k.name, "only http and https listeners read")
+		}
+	}
+	// Two at once: both named.
+	l := Listener{Name: "l", Bind: ":7000", Protocol: "tcp", Backend: "be", MaxBodySize: "1MB", TrustedProxies: []string{"10.0.0.0/8"}}
+	wantErr(t, validate(baseCfg(l)), "max_body_size, trusted_proxies")
+
+	// On an http listener every one of them loads.
+	h := Listener{Name: "h", Bind: ":8080", Protocol: "http", Backend: "be"}
+	for _, k := range keys {
+		k.set(&h)
+	}
+	if err := validate(baseCfg(h)); err != nil {
+		t.Fatalf("an http listener with every key: %v", err)
+	}
+
+	// Timeouts: refused on udp, read on tcp.
+	u := Listener{Name: "u", Bind: ":5353", Protocol: "udp", Backend: "be", Timeouts: TimeoutConfig{Idle: "30s"}}
+	wantErr(t, validate(baseCfg(u)), "listener u", "timeouts do nothing on a udp listener")
+	tcp := Listener{Name: "t", Bind: ":7001", Protocol: "tcp", Backend: "be", Timeouts: TimeoutConfig{Idle: "30s", Connect: "2s"}}
+	if err := validate(baseCfg(tcp)); err != nil {
+		t.Fatalf("a tcp listener with timeouts: %v", err)
+	}
+	// On tcp, the timeouts an L4 connection never reads: refused, each named.
+	for _, f := range []struct {
+		name string
+		set  func(*TimeoutConfig)
+	}{
+		{"timeouts.read_header", func(c *TimeoutConfig) { c.ReadHeader = "5s" }},
+		{"timeouts.read", func(c *TimeoutConfig) { c.Read = "5s" }},
+		{"timeouts.write", func(c *TimeoutConfig) { c.Write = "5s" }},
+	} {
+		l := Listener{Name: "t", Bind: ":7001", Protocol: "tcp", Backend: "be", Timeouts: TimeoutConfig{Idle: "30s"}}
+		f.set(&l.Timeouts)
+		wantErr(t, validate(baseCfg(l)), "listener t", f.name, "reads timeouts.connect and timeouts.idle only")
+	}
+	// An empty value of each is no setting.
+	quiet := Listener{Name: "q", Bind: ":5354", Protocol: "udp", Backend: "be",
+		Headers: HeadersConfig{RequestAdd: map[string]string{}}, Compression: CompressionConfig{Types: []string{}}}
+	if err := validate(baseCfg(quiet)); err != nil {
+		t.Fatalf("empty values on a udp listener: %v", err)
+	}
+}
+
+// timeouts.send belongs to a fastcgi route: refused on a listener and on a
+// backend, its value checked on a route.
+func TestValidation_SendTimeoutOnlyOnFastCGIRoutes(t *testing.T) {
+	l := Listener{Name: "h", Bind: ":8080", Protocol: "http", Backend: "be", Timeouts: TimeoutConfig{Send: "5s"}}
+	wantErr(t, validate(baseCfg(l)), "listener h", "timeouts.send is a fastcgi route setting")
+	if err := validateBackendTimeouts(Backend{Name: "be", Timeouts: TimeoutConfig{Send: "5s"}}); err == nil {
+		t.Fatal("a backend with timeouts.send: want an error")
+	}
+	if err := validateFastCGITimeouts(TimeoutConfig{Send: "5s"}); err != nil {
+		t.Fatalf("a fastcgi route with timeouts.send: %v", err)
+	}
+	if err := validateFastCGITimeouts(TimeoutConfig{Send: "soon"}); err == nil {
+		t.Fatal("a fastcgi route with timeouts.send \"soon\": want an error")
+	}
+	if d := (TimeoutConfig{}).ResolveSend(60 * time.Second); d != 60*time.Second {
+		t.Fatalf("unset send: %v, want the default", d)
+	}
+	if d := (TimeoutConfig{Send: "0"}).ResolveSend(60 * time.Second); d != 0 {
+		t.Fatalf("send \"0\": %v, want 0 (no limit)", d)
+	}
+}

@@ -1,12 +1,17 @@
 package httpproxy
 
 import (
+	"context"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"nvelox/config"
 	"nvelox/core/httpproxy/errorhtml"
@@ -98,9 +103,30 @@ func ServeFastCGI(w http.ResponseWriter, r *http.Request, cfg config.FastCGIConf
 		return
 	}
 
-	// Use gofast to handle the request
-	connFactory := gofast.SimpleConnFactory(network, address)
-	clientFactory := gofast.SimpleClientFactory(connFactory)
+	// Use gofast to handle the request. The dial is bounded by the connect
+	// timeout (the route's, else the listener's, else 10s) and ends when the
+	// client goes away; the connection is kept for the response-head timer.
+	var upstream net.Conn
+	connectTimeout := cfg.Timeouts.ParseConnect()
+	sendTimeout := cfg.Timeouts.ResolveSend(defaultFastCGISend)
+	var fw *fcgiResponseWriter
+	clientFactory := gofast.SimpleClientFactory(func() (net.Conn, error) {
+		c, err := fcgiDial(r.Context(), network, address, connectTimeout)
+		upstream = c
+		if err != nil || sendTimeout <= 0 {
+			return c, err
+		}
+		// The upstream may go sendTimeout without taking any of the
+		// request; past it the exchange ends (a 504 when it had not begun
+		// to answer).
+		return &fcgiSendConn{Conn: c, limit: sendTimeout, stalled: func() {
+			if fw.headTimeout() {
+				logging.Warn("[FCGI] %s %s: the upstream took nothing of the request body for %v, answering 504",
+					logging.SanitizeLogField(r.Method), logging.SanitizeLogField(r.URL.Path), sendTimeout)
+				c.Close()
+			}
+		}}, nil
+	})
 
 	// Build a session handler chain
 	chain := gofast.Chain(
@@ -129,12 +155,82 @@ func ServeFastCGI(w http.ResponseWriter, r *http.Request, cfg config.FastCGIConf
 		},
 	)
 
-	handler := gofast.NewHandler(chain(gofast.BasicSession), clientFactory)
-
 	logging.Info("[FCGI] %s %s -> %s:%s (script: %s)",
 		logging.SanitizeLogField(r.Method), logging.SanitizeLogField(r.URL.Path),
 		network, address, logging.SanitizeLogField(scriptFilename))
-	handler.ServeHTTP(&fcgiResponseWriter{ResponseWriter: w, base: w.Header().Clone(), serveError: serveError}, r)
+
+	// The exchange, without gofast's own handler (gofast.NewHandler): that
+	// one keeps all of the upstream's stderr in memory until the response
+	// ends, then writes it to the standard logger as it came, where a
+	// newline in it (a PHP warning quoting a request) starts a log line of
+	// the upstream's making.
+	client, err := clientFactory()
+	if err != nil {
+		logging.Error("[FCGI] %s %s: %s:%s: %v", logging.SanitizeLogField(r.Method),
+			logging.SanitizeLogField(r.URL.Path), network, address, err)
+		serveError(w, http.StatusBadGateway)
+		return
+	}
+	defer client.Close()
+	// The exchange lasts no longer than the client's request: when that
+	// ends (the client went away, the server is shutting down), the
+	// upstream's connection is closed, which ends the exchange whatever the
+	// upstream is doing. Without it, an upstream that stalls holds the
+	// request, its goroutines and both connections until it closes itself.
+	stopWithRequest := context.AfterFunc(r.Context(), func() { upstream.Close() })
+	defer stopWithRequest()
+	fw = &fcgiResponseWriter{ResponseWriter: w, base: w.Header().Clone(), serveError: serveError}
+	req := gofast.NewRequest(r)
+	if d := cfg.Timeouts.ResolveResponseHeader(defaultBackendResponseHeader); d > 0 {
+		// The upstream gets d to start answering once it has the request,
+		// as an HTTP backend does: the timer starts when the request body
+		// has been read to its end (at once without one), and the response
+		// head stops it. When it fires first, the upstream's connection is
+		// closed, which ends the exchange, and the client gets a 504.
+		var timer atomic.Pointer[time.Timer]
+		start := func() {
+			timer.Store(time.AfterFunc(d, func() {
+				if fw.headTimeout() {
+					logging.Warn("[FCGI] %s %s: no response head within %v, answering 504",
+						logging.SanitizeLogField(r.Method), logging.SanitizeLogField(r.URL.Path), d)
+					upstream.Close()
+				}
+			}))
+		}
+		defer func() {
+			if t := timer.Load(); t != nil {
+				t.Stop()
+			}
+		}()
+		if req.Stdin == nil {
+			start()
+		} else {
+			req.Stdin = &fcgiBody{ReadCloser: req.Stdin, sent: start}
+		}
+	}
+	resp, err := chain(gofast.BasicSession)(client, req)
+	if err != nil {
+		logging.Error("[FCGI] %s %s: %s:%s: %v", logging.SanitizeLogField(r.Method),
+			logging.SanitizeLogField(r.URL.Path), network, address, err)
+		serveError(w, http.StatusInternalServerError)
+		return
+	}
+	if err := resp.WriteTo(fw, fcgiStderr{r}); err != nil {
+		logging.Warn("[FCGI] %s %s: %s", logging.SanitizeLogField(r.Method),
+			logging.SanitizeLogField(r.URL.Path), logging.SanitizeLogField(err.Error()))
+	}
+}
+
+// fcgiStderr writes what the FastCGI upstream sends on stderr (PHP's errors
+// and warnings, for one) to the error log as it arrives, at error level as
+// nginx does: a line for each piece read (at most io.Copy's 32 KiB),
+// control characters escaped, nothing kept.
+type fcgiStderr struct{ r *http.Request }
+
+func (e fcgiStderr) Write(p []byte) (int, error) {
+	logging.Error("[FCGI] %s %s: upstream stderr: %s", logging.SanitizeLogField(e.r.Method),
+		logging.SanitizeLogField(e.r.URL.Path), logging.SanitizeLogField(string(p)))
+	return len(p), nil
 }
 
 // fastCGIScript reports whether scriptFilename may be handed to the FastCGI
@@ -212,13 +308,28 @@ func fcgiHeaderName(name string) bool {
 // took nvelox down. A status outside 200-599 (1xx included: a FastCGI
 // response has a single header block) becomes a 502 from nvelox instead,
 // without the upstream's headers or body; gofast still reads the upstream
-// response to its end.
+// response to its end. A response head that comes after the response-head
+// timeout fired (headTimeout) becomes a 504 the same way.
 type fcgiResponseWriter struct {
 	http.ResponseWriter
 	base        http.Header // response headers set before the exchange
 	serveError  func(http.ResponseWriter, int)
 	wroteHeader bool
-	discard     bool // the upstream response was replaced by a 502
+	discard     bool         // the upstream response was replaced by nvelox's answer
+	head        atomic.Int32 // the response head against its timer: headWaiting, headCame or headTimedOut
+}
+
+const (
+	headWaiting int32 = iota
+	headCame
+	headTimedOut
+)
+
+// headTimeout is called by the response-head timer: it reports whether the
+// head had not come yet. From then on the client is answered 504 and the
+// upstream's answer, if one still comes, is dropped.
+func (f *fcgiResponseWriter) headTimeout() bool {
+	return f.head.CompareAndSwap(headWaiting, headTimedOut)
 }
 
 func (f *fcgiResponseWriter) WriteHeader(code int) {
@@ -226,14 +337,22 @@ func (f *fcgiResponseWriter) WriteHeader(code int) {
 		return
 	}
 	f.wroteHeader = true
+	if !f.head.CompareAndSwap(headWaiting, headCame) {
+		f.replace(http.StatusGatewayTimeout)
+		return
+	}
 	if code >= 200 && code <= 599 {
 		f.ResponseWriter.WriteHeader(code)
 		return
 	}
-	// Answer 502 instead: drop the headers gofast already copied from the
-	// upstream response (back to the ones set before the exchange) and
-	// discard its body.
 	logging.Warn("[FCGI] upstream sent Status %d — answering 502", code)
+	f.replace(http.StatusBadGateway)
+}
+
+// replace answers code from nvelox in place of the upstream's response: the
+// headers gofast already copied from it are dropped (back to the ones set
+// before the exchange), and so is its body.
+func (f *fcgiResponseWriter) replace(code int) {
 	h := f.ResponseWriter.Header()
 	for k := range h {
 		delete(h, k)
@@ -242,7 +361,7 @@ func (f *fcgiResponseWriter) WriteHeader(code int) {
 		h[k] = v
 	}
 	f.discard = true
-	f.serveError(f.ResponseWriter, http.StatusBadGateway)
+	f.serveError(f.ResponseWriter, code)
 }
 
 func (f *fcgiResponseWriter) Write(b []byte) (int, error) {
@@ -253,6 +372,69 @@ func (f *fcgiResponseWriter) Write(b []byte) (int, error) {
 		return len(b), nil
 	}
 	return f.ResponseWriter.Write(b)
+}
+
+// fcgiBody is the request body as gofast reads it for the upstream: sent
+// is called once, when gofast has read the last of it (a read that ends or
+// fails, or one that gives nothing, which gofast takes as the end). Only
+// gofast's request writer reads it.
+type fcgiBody struct {
+	io.ReadCloser
+	sent func()
+	done bool
+}
+
+func (b *fcgiBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if (err != nil || n == 0) && !b.done {
+		b.done = true
+		b.sent()
+	}
+	return n, err
+}
+
+// defaultFastCGISend is a fastcgi route's timeouts.send when it sets none.
+const defaultFastCGISend = 60 * time.Second
+
+// fcgiSendConn is the upstream's connection as gofast writes the request to
+// it. A write the upstream takes none of within limit fails, and stalled is
+// called (once); whatever it takes starts limit again, as nginx's
+// fastcgi_send_timeout does, so an upload that keeps moving is never cut.
+// An upstream that has begun to answer keeps answering: only the request
+// ends.
+type fcgiSendConn struct {
+	net.Conn
+	limit   time.Duration
+	stalled func()
+	once    sync.Once
+}
+
+func (c *fcgiSendConn) Write(p []byte) (int, error) {
+	n := 0
+	for {
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.limit))
+		m, err := c.Conn.Write(p[n:])
+		n += m
+		if err == nil {
+			return n, nil
+		}
+		if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+			return n, err
+		}
+		if m == 0 {
+			c.once.Do(c.stalled)
+			return n, err
+		}
+		// The upstream took some of it before the deadline: limit starts
+		// again for the rest.
+	}
+}
+
+// fcgiDial dials the FastCGI upstream within timeout (0: no limit); the
+// dial also ends with ctx.
+func fcgiDial(ctx context.Context, network, address string, timeout time.Duration) (net.Conn, error) {
+	d := net.Dialer{Timeout: timeout}
+	return d.DialContext(ctx, network, address)
 }
 
 // builtinErrorPage writes nvelox's built-in error page for code.

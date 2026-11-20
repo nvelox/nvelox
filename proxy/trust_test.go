@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"testing"
 	"testing/iotest"
 	"time"
@@ -205,6 +206,13 @@ func TestStreamClient(t *testing.T) {
 	}
 	udp := proxyproto.HeaderProxyFromAddrs(2, &net.UDPAddr{IP: net.ParseIP("203.0.113.7"), Port: 4444}, &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443})
 	local := &proxyproto.Header{Version: 2, Command: proxyproto.LOCAL, TransportProtocol: proxyproto.UNSPEC}
+	// Version 2, made for the relay's connection with the ends testEnds.
+	signedV2 := proxyproto.HeaderProxyFromAddrs(2, &net.TCPAddr{IP: net.ParseIP("203.0.113.7"), Port: 4444}, &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443})
+	if err := SignHeaderFrom(signedV2, key, time.Now(), testEnds); err != nil {
+		t.Fatal(err)
+	}
+	required := NewTrust([]string{"10.0.0.0/8"}, [][]byte{key})
+	required.SetReplayWindow(true)
 
 	for name, tc := range map[string]struct {
 		trust  *Trust
@@ -228,13 +236,16 @@ func TestStreamClient(t *testing.T) {
 		"nothing sent":              {open, nil, ErrNothingSent, "", NothingSent},
 		"nothing sent, keys set":    {keyed, nil, ErrNothingSent, "", NothingSent},
 		"a broken header, keys set": {keyed, nil, ErrBadHeader, "", RefusedMalformed},
+		"version 2, its connection": {keyed, v2Header(t, signedV2), nil, "203.0.113.7:4444", ""},
+		"version 2, required":       {required, v2Header(t, signedV2), nil, "203.0.113.7:4444", ""},
+		"version 1, required":       {required, v2Header(t, signed), nil, "", RefusedSignature},
 	} {
 		var h *proxyproto.Header
 		err := tc.err
 		if tc.hdr != nil {
 			h, err = parse(tc.hdr)
 		}
-		client, reason, cause := tc.trust.StreamClient(h, err)
+		client, reason, cause := tc.trust.StreamClient(h, err, testEnds)
 		got := ""
 		if client != nil {
 			got = client.String()
@@ -246,6 +257,12 @@ func TestStreamClient(t *testing.T) {
 		if (reason != "") != (cause != nil) {
 			t.Errorf("%s: reason %q with cause %v", name, reason, cause)
 		}
+	}
+	// A version 2 header copied onto another connection of the relay's.
+	h, err := parse(v2Header(t, signedV2))
+	another := Ends{Relay: netip.MustParseAddrPort("192.0.2.50:40002"), Receiver: testEnds.Receiver}
+	if client, reason, _ := keyed.StreamClient(h, err, another); client != nil || reason != RefusedSignature {
+		t.Errorf("version 2 on another connection: client %v, reason %q; want refused for its signature", client, reason)
 	}
 }
 

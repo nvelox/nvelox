@@ -24,6 +24,7 @@ func newH3Set(l config.HTTP3Limits) *h3Set {
 		MaxSendMemory:              l.MaxSendMemory,
 		MaxReceiveMemory:           l.MaxReceiveMemory,
 		SocketBuffer:               l.SocketBuffer,
+		HandshakesPerSource:        l.HandshakesPerSource,
 	}}
 }
 

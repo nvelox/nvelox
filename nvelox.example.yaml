@@ -18,8 +18,17 @@ server:
   # follow a symbolic link at a log path.
   # user: "nvelox"
   # group: "nvelox"
-  # pid_file / workers are accepted but not implemented (no pid file, one
-  # process); setting them prints a startup WARNING.
+  # pid_file: where nvelox writes its process ID once every port is bound,
+  # before it switches to `user` (so the file may live where only root
+  # writes, e.g. /run/nvelox.pid); a clean stop removes it when the process
+  # still may. Read at start: a reload does not move it.
+  # pid_file: "/run/nvelox.pid"
+  # workers: how many event loops run, and with them how many CPU cores
+  # nvelox uses for traffic. Left out: one per CPU core the process may use.
+  # `workers: 4` on a 16-core machine leaves the other cores to whatever
+  # else runs there. Read at start: a reload does not change it. The start
+  # log says how many run ("[SERVER] 4 event loops").
+  # workers: 4
   # shutdown_timeout: how long a stop (SIGINT or SIGTERM) lets the HTTP
   # requests in flight finish; what is left then is closed. Nothing new is
   # accepted on the HTTP ports meanwhile, so this is also the longest that a
@@ -30,11 +39,12 @@ server:
   # ends nvelox at once.
   # shutdown_timeout: "10s"
   # http3: the limits of HTTP/3 connections, for every listener with
-  # `http3: true`. Each is a size: a whole number with B, KB, MB or GB
-  # (KB is 1024 bytes). Zero is not taken. Not set, each has the default
-  # shown. A reload applies them: the two totals at once, socket_buffer to
-  # the bind addresses started after it, the others to the connections
-  # opened after it.
+  # `http3: true`. Each is a size, a whole number with B, KB, MB or GB
+  # (KB is 1024 bytes), but for handshakes_per_source, a count. A size of
+  # zero is not taken. Not set, each has the default shown. A reload
+  # applies them: the two totals and handshakes_per_source at once,
+  # socket_buffer to the bind addresses started after it, the others to
+  # the connections opened after it.
   # http3:
   #   # The largest header section a request may have; a larger one is
   #   # answered 431. A connection may have 100 requests open, and so hold
@@ -74,10 +84,22 @@ server:
   #   # a process started with CAP_NET_ADMIN. A listener whose sockets got
   #   # less says so in a startup WARNING. 64KB to 64MB.
   #   socket_buffer: "4MB"
-  #   # max_send_buffer, the two totals and socket_buffer belong to the
-  #   # QUIC transport nvelox runs on Linux. On other platforms they change
-  #   # nothing (a startup WARNING says so) and the other three are read
-  #   # when a bind address starts.
+  #   # How many QUIC handshakes one client address (an IPv4 address, an
+  #   # IPv6 /64; behind a trusted relay, the client it names) may have
+  #   # running at once on each event loop. A handshake costs a good part
+  #   # of a millisecond of CPU and holds TLS state for up to 10 s: without
+  #   # this, one address could take every place of a loop. It counts the
+  #   # clients that proved their address (they came back with the token
+  #   # of the server's Retry packet), so first packets with a made-up
+  #   # source cannot keep an address out. The first packets of its
+  #   # further clients are dropped (they send them again) and counted in
+  #   # nvelox_h3_handshakes_refused_total. Clients behind one address (a
+  #   # company's NAT) share it. 0 (no limit) to 4096.
+  #   handshakes_per_source: 32
+  #   # max_send_buffer, the two totals, socket_buffer and
+  #   # handshakes_per_source belong to the QUIC transport nvelox runs on
+  #   # Linux. On other platforms they change nothing (a startup WARNING
+  #   # says so) and the other three are read when a bind address starts.
 
 # ─── Logging ───────────────────────────────────────────────
 # Log files are created 0640 in 0750 directories (an existing file is
@@ -139,11 +161,20 @@ admin:
 # the new rules; one they would refuse is closed. See
 # examples/32-hot-reload.yaml.
 
-# ─── OpenTelemetry Tracing ─────────────────────────────────
-# tracing:
-#   enabled: true
-#   endpoint: "http://jaeger:4318"
-#   service: "nvelox"
+# ─── Keys nvelox does not read ─────────────────────────────
+# A key that no setting reads is refused at load: the error names the
+# file, the line, the key and, when one is near, the key that was meant
+#   nvelox.yaml:42:5: unknown setting "ip_denylst" in listeners[0] (did you mean "ip_denylist"?)
+# so a misspelled setting cannot start and quietly do nothing. The same
+# holds for a key that is parsed but not implemented yet (`tracing`, and
+# on a listener `zero_copy`, `grpc`, `tls.auto_cert`,
+# `tls.ocsp_stapling`, `sni_routes`, `throttle`,
+# `buffering.request_body_buffer`, `routes[].scripts`): the error says so.
+# To check a file without starting anything:
+#   nvelox --check --config /etc/nvelox/nvelox.yaml
+# prints "<file>: configuration is valid" and exits 0, or prints what a
+# start would refuse and exits 1. It binds no port and opens no file but
+# the config and the files it names.
 
 # ─── Modular Config Includes ──────────────────────────────
 include: "/etc/nvelox/config.d/*.yaml"
@@ -232,7 +263,8 @@ listeners:
     #   ip_allowlist, ip_denylist, ip_rate_limit, acl and X-Forwarded-For;
     #   trusted_proxies is matched against that client too, so a relay is
     #   not listed there. Listeners that share a port set the same
-    #   accept_proxy_from and accept_proxy_key_file.
+    #   accept_proxy_from, accept_proxy_key_file and
+    #   accept_proxy_replay_window.
     #   https listeners with http3: a UDP relay puts the header in front of
     #   every datagram, signed (accept_proxy_key_file is required with
     #   http3). On Linux a reload that changes accept_proxy_from holds for
@@ -254,6 +286,22 @@ listeners:
     #   sending nvelox signs with send_proxy_key_file. Rotation without a
     #   restart: add the new key on the receivers (SIGHUP), put it first on
     #   the senders (SIGHUP), then remove the old key from the receivers.
+    # accept_proxy_replay_window: required
+    #   What a signed header must carry. nvelox signs with a counter
+    #   (signature version 2), bound to both ends of the connection or
+    #   datagram: the relay's address and port, and the address and port it
+    #   sends to. A copy sent again, from another address or port, or to
+    #   another address or port of this host, is dropped, so a relay must
+    #   reach nvelox with its addresses unchanged: no address translation
+    #   (NAT, a load balancer's address) between them.
+    #   "when_present" (the default) also takes headers signed without one
+    #   (version 1: nvelox 1.x, 2.0.0-rc.3 and older, or another relay);
+    #   "required" takes only headers with a counter. Needs
+    #   accept_proxy_key_file. nvelox 1.3.0 and older, and 2.0.0-rc.3 and
+    #   older, refuse version 2: upgrade the receivers before the senders,
+    #   then set required. Another receiver at the same address and port (an
+    #   anycast address) would take a copy as new: give such receivers their
+    #   own keys.
     # accept_proxy_interfaces: ["eth1"]
     #   (udp listeners, Linux) A trusted peer's PROXY header counts only on
     #   datagrams that arrived on one of these network interfaces — e.g. a
@@ -339,6 +387,11 @@ listeners:
       default_ttl: "5m"
       methods: ["GET"]
 
+    # The buffer a response body is copied through, on a listener that
+    # compresses, caches or asks for client certificates (default 32KB).
+    buffering:
+      response_buffer: "64KB"
+
     # Error pages (custom HTML files, falls back to built-in styled pages)
     # error_pages:
     #   404: "/var/www/errors/404.html"
@@ -348,11 +401,21 @@ listeners:
     headers:
       request_add:
         X-Proxy: "nvelox"
+      request_set:              # in place of a header of the same name
+        X-Environment: "production"
       response_add:
         Strict-Transport-Security: "max-age=31536000"
         X-Content-Type-Options: "nosniff"
       response_remove:
         - "Server"
+
+    # A request ID (X-Request-ID) for every request: passed to the backend,
+    # returned to the client, written in the access log. trust_inbound keeps
+    # the ID any client sends, for internal listeners; otherwise only
+    # trusted_proxies may send one.
+    request_id:
+      enabled: true
+      # trust_inbound: true
 
     # L7 Routes (first match wins)
     routes:
@@ -390,6 +453,7 @@ listeners:
           pass: "127.0.0.1:9000"           # or "unix:/var/run/php-fpm.sock"
           document_root: "/var/www/html"
           split_path_info: "^(.+\\.php)(/.*)$"
+          # script_name: "/index.php"     # SCRIPT_NAME (default: from the path)
           params:
             HTTPS: "on"
 
@@ -424,12 +488,9 @@ listeners:
   #                      one. Default 5m on plain tcp listeners ("0" =
   #                      never); on tls-terminating tcp listeners only when set.
   #   timeouts.connect — backend dial timeout (default 10s).
-  #   zero_copy        — accepted for compatibility; no effect (L4 TCP uses a
-  #                      16 KiB buffered copy per direction).
   - name: "game-ports"
     bind: ":10000-10100"
     protocol: "tcp"
-    zero_copy: true
     backend: "game-servers"
 
   # ─── Dedicated-port MUX (range → one backend port) ─────
@@ -444,7 +505,6 @@ listeners:
   # - name: "dedicated-mux"
   #   bind: ":17000-17100"          # the dedicated range (grow as needed)
   #   protocol: "tcp"
-  #   zero_copy: true
   #   backend: "port-mux"           # backend MUST specify an explicit port (the mux port)
   #   accept_proxy_from: ["10.50.0.0/16"]   # trust PROXY headers from your relays
   # (and a matching backend, e.g.)
@@ -539,7 +599,9 @@ backends:
     send_proxy_v2: false
     # send_proxy_key_file: "/etc/nvelox/proxy.keys"  # sign the header (with
     #   the first key) for a receiver that sets accept_proxy_key_file; for
-    #   UDP every datagram's header is signed over that datagram
+    #   UDP every datagram's header is signed over that datagram. Signed in
+    #   version 2 (this side's port and a counter): nvelox 1.3.0 and older,
+    #   and 2.0.0-rc.3 and older, refuse it, so upgrade the receivers first
 
     # Timeouts of this backend. "0" means unlimited.
     #   connect         — dial timeout (else the listener's, else 10s).
@@ -570,6 +632,7 @@ backends:
     sticky_session:
       type: "cookie"           # cookie, header, ip_hash
       cookie_name: "NVELOX_SRV"
+      # header_name: "X-Session"  # with type header
       ttl: "1h"
 
     # Health checks

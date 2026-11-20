@@ -21,6 +21,7 @@ import (
 	"nvelox/core/metrics"
 	"nvelox/proxy"
 
+	"github.com/nvelox/ngx/web"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
@@ -35,6 +36,11 @@ type relaySocket struct {
 	uc     *net.UDPConn
 	client atomic.Pointer[string] // the client named ("ip:port"); "": no header at all
 	key    []byte                 // signs the header when set
+	// counted: the signature is version 2, with the socket's port and a
+	// counter (accept_proxy_replay_window).
+	counted bool
+	counter atomic.Uint64
+	last    atomic.Pointer[[]byte] // the last datagram sent, header and all
 }
 
 func newRelaySocket(t *testing.T, client string, key []byte) *relaySocket {
@@ -62,7 +68,13 @@ func (r *relaySocket) WriteTo(p []byte, addr net.Addr) (int, error) {
 			return 0, err
 		}
 		hdr := b.Bytes()
-		if r.key != nil {
+		switch {
+		case r.key != nil && r.counted:
+			ends := proxy.RelayEnds(r.uc.LocalAddr(), addr)
+			if hdr, err = proxy.SignedHeaderBytesFrom(hdr, r.key, p, time.Now(), ends, r.counter.Add(1)); err != nil {
+				return 0, err
+			}
+		case r.key != nil:
 			if hdr, err = proxy.SignedHeaderBytes(hdr, r.key, p, time.Now()); err != nil {
 				return 0, err
 			}
@@ -72,6 +84,8 @@ func (r *relaySocket) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if _, err := r.uc.WriteTo(out, addr); err != nil {
 		return 0, err
 	}
+	sent := append([]byte(nil), out...)
+	r.last.Store(&sent)
 	return len(p), nil
 }
 
@@ -295,6 +309,7 @@ func TestH3RelayPins(t *testing.T) {
 		return append(hdr, payload...)
 	}
 	relay := netip.MustParseAddrPort("192.0.2.10:7000")
+	server := netip.MustParseAddrPort("192.0.2.1:443")
 	age := func(k netip.AddrPort) {
 		c.mu.Lock()
 		p := c.pins[k]
@@ -303,17 +318,17 @@ func TestH3RelayPins(t *testing.T) {
 		c.mu.Unlock()
 	}
 
-	payload, reason, _ := c.relayed(tr, relay, datagram("203.0.113.9:4321"))
+	payload, reason, _ := c.relayed(tr, relay, server, datagram("203.0.113.9:4321"))
 	if reason != "" || string(payload) != "a QUIC packet" {
 		t.Fatalf("first datagram: %q, reason %q", payload, reason)
 	}
 	if got, ok := c.client(relay); !ok || got.String() != "203.0.113.9:4321" {
 		t.Fatalf("pinned client %v, %v", got, ok)
 	}
-	if _, reason, _ := c.relayed(tr, relay, datagram("198.51.100.1:5")); reason != h3RelayClientChanged {
+	if _, reason, _ := c.relayed(tr, relay, server, datagram("198.51.100.1:5")); reason != h3RelayClientChanged {
 		t.Errorf("another client on the same relay socket: reason %q, want %q", reason, h3RelayClientChanged)
 	}
-	if _, reason, _ := c.relayed(tr, relay, datagram("203.0.113.9:4321")); reason != "" {
+	if _, reason, _ := c.relayed(tr, relay, server, datagram("203.0.113.9:4321")); reason != "" {
 		t.Errorf("the pinned client again: reason %q", reason)
 	}
 	// Once the pin has expired the socket may serve another client, and
@@ -322,7 +337,7 @@ func TestH3RelayPins(t *testing.T) {
 	if _, ok := c.client(relay); ok {
 		t.Errorf("an expired pin still names a client")
 	}
-	if _, reason, _ := c.relayed(tr, relay, datagram("198.51.100.1:5")); reason != "" {
+	if _, reason, _ := c.relayed(tr, relay, server, datagram("198.51.100.1:5")); reason != "" {
 		t.Errorf("another client after the pin expired: reason %q", reason)
 	}
 
@@ -337,10 +352,10 @@ func TestH3RelayPins(t *testing.T) {
 	c.swept = now
 	c.mu.Unlock()
 	fresh := netip.MustParseAddrPort("192.0.2.11:7001")
-	if _, reason, _ := c.relayed(tr, fresh, datagram("203.0.113.9:4321")); reason != h3RelayTableFull {
+	if _, reason, _ := c.relayed(tr, fresh, server, datagram("203.0.113.9:4321")); reason != h3RelayTableFull {
 		t.Errorf("a new relay socket with the table full: reason %q, want %q", reason, h3RelayTableFull)
 	}
-	if _, reason, _ := c.relayed(tr, relay, datagram("198.51.100.1:5")); reason != "" {
+	if _, reason, _ := c.relayed(tr, relay, server, datagram("198.51.100.1:5")); reason != "" {
 		t.Errorf("a known relay socket with the table full: reason %q", reason)
 	}
 	c.mu.Lock()
@@ -351,7 +366,7 @@ func TestH3RelayPins(t *testing.T) {
 		}
 	}
 	c.mu.Unlock()
-	if _, reason, _ := c.relayed(tr, fresh, datagram("203.0.113.9:4321")); reason != "" {
+	if _, reason, _ := c.relayed(tr, fresh, server, datagram("203.0.113.9:4321")); reason != "" {
 		t.Errorf("a new relay socket once the old pins expired: reason %q", reason)
 	}
 	c.mu.Lock()
@@ -362,9 +377,247 @@ func TestH3RelayPins(t *testing.T) {
 	}
 
 	// Without keys nothing a relay sends is taken.
-	if _, reason, _ := c.relayed(proxy.NewTrust([]string{"192.0.2.0/24"}, nil), fresh, datagram("203.0.113.9:4321")); reason != proxy.RefusedSignature {
+	if _, reason, _ := c.relayed(proxy.NewTrust([]string{"192.0.2.0/24"}, nil), fresh, server, datagram("203.0.113.9:4321")); reason != proxy.RefusedSignature {
 		t.Errorf("trust without keys: reason %q, want %q", reason, proxy.RefusedSignature)
 	}
+}
+
+// A pin's window: a counter is taken once from its relay socket, a copy is
+// refused also once the pin has expired, until the pin is swept; a copy
+// from another port or another trusted address, or to another address of
+// the server, fails its signature.
+func TestH3RelayPins_Counted(t *testing.T) {
+	if h3RelayPinTTL < 2*proxy.SignatureWindow {
+		t.Fatalf("pins are kept %v, less than the %v a header can pass its time check after it was taken", h3RelayPinTTL, 2*proxy.SignatureWindow)
+	}
+	tr := proxy.NewTrust([]string{"192.0.2.0/24"}, [][]byte{h3RelayKey})
+	c := newH3RelayConn(nil, nil)
+	dst := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 443}
+	relay := netip.MustParseAddrPort("192.0.2.10:7000")
+	server := netip.MustParseAddrPort("192.0.2.1:443")
+	datagram := func(client string, from netip.AddrPort, counter uint64) []byte {
+		src, err := net.ResolveUDPAddr("udp", client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var b bytes.Buffer
+		if err := proxy.WriteProxyHeaderV2(&b, src, dst); err != nil {
+			t.Fatal(err)
+		}
+		payload := []byte("a QUIC packet")
+		hdr, err := proxy.SignedHeaderBytesFrom(b.Bytes(), h3RelayKey, payload, time.Now(), proxy.Ends{Relay: from, Receiver: server}, counter)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(hdr, payload...)
+	}
+	age := func(by time.Duration) {
+		c.mu.Lock()
+		p := c.pins[relay]
+		p.seen -= int64(by)
+		c.pins[relay] = p
+		c.mu.Unlock()
+	}
+	first := datagram("203.0.113.9:4321", relay, 500)
+	if _, reason, _ := c.relayed(tr, relay, server, first); reason != "" {
+		t.Fatalf("first datagram: reason %q", reason)
+	}
+	if _, reason, _ := c.relayed(tr, relay, server, first); reason != proxy.RefusedReplayed {
+		t.Errorf("a copy: reason %q, want %q", reason, proxy.RefusedReplayed)
+	}
+	for what, e := range map[string][2]netip.AddrPort{
+		"from another port":            {netip.AddrPortFrom(relay.Addr(), 7001), server},
+		"from another trusted address": {netip.MustParseAddrPort("192.0.2.11:7000"), server},
+		"to another address":           {relay, netip.MustParseAddrPort("192.0.2.2:443")},
+		"to another port":              {relay, netip.MustParseAddrPort("192.0.2.1:8443")},
+	} {
+		if _, reason, _ := c.relayed(tr, e[0], e[1], first); reason != proxy.RefusedSignature {
+			t.Errorf("a copy %s: reason %q, want %q", what, reason, proxy.RefusedSignature)
+		}
+	}
+	// Expired, not yet swept: the client may change, the window holds.
+	age(h3RelayPinTTL)
+	if _, reason, _ := c.relayed(tr, relay, server, first); reason != proxy.RefusedReplayed {
+		t.Errorf("a copy once the pin has expired: reason %q, want %q", reason, proxy.RefusedReplayed)
+	}
+	if _, reason, _ := c.relayed(tr, relay, server, datagram("198.51.100.1:5", relay, 501)); reason != "" {
+		t.Errorf("another client once the pin has expired: reason %q", reason)
+	}
+	// Swept (unused for more than h3RelayPinTTL): the window goes with the
+	// pin, as every header it took has passed its time.
+	age(h3RelayPinTTL + 1)
+	c.mu.Lock()
+	c.sweep(time.Now().UnixNano())
+	_, kept := c.pins[relay]
+	c.mu.Unlock()
+	if kept {
+		t.Fatal("a pin unused for more than h3RelayPinTTL was not swept")
+	}
+	if _, reason, _ := c.relayed(tr, relay, server, datagram("198.51.100.1:5", relay, 501)); reason != "" {
+		t.Errorf("a counter after the pin was swept: reason %q", reason)
+	}
+}
+
+// A copy of a relay's datagram whose header carries a counter is dropped
+// and counted as replayed; from another port of the relay its signature
+// does not hold. The relay's own datagrams go on.
+func TestHTTP3_RelayCopiesDropped(t *testing.T) { quicGoPath(t); relayCopiesDropped(t, quicGoServes) }
+
+func TestH3Loops_RelayCopiesDropped(t *testing.T) { onLoops(t); relayCopiesDropped(t, loopsServe) }
+
+func relayCopiesDropped(t *testing.T, served func(*testing.T, *BindGroup)) {
+	quietLog(t)
+	pki := newCAPKI(t, "h3-relay-copy-ca")
+	site := h3RelaySite(t, pki, "127.0.0.0/8", nil)
+	name := site.Listener.Name
+	addr := freeAddr(t)
+	served(t, startGroup(t, addr, site))
+	tlsConf := h3ClientTLS(pki)
+	ua, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counted := func(what, reason string, before uint64) {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); h3Refusals(name, reason) == before; {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: not counted as %q", what, reason)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	sock := newRelaySocket(t, "203.0.113.9:4321", h3RelayKey)
+	sock.counted = true
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	qt := &quic.Transport{Conn: sock}
+	defer qt.Close()
+	conn, err := qt.Dial(ctx, ua, tlsConf, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseWithError(0, "")
+	cc := (&http3.Transport{}).NewClientConn(conn)
+	get := func(what string) {
+		t.Helper()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+addr+"/", nil)
+		resp, err := cc.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if string(b) != "client=203.0.113.9" {
+			t.Fatalf("%s: %q, want client=203.0.113.9", what, b)
+		}
+	}
+	get("through the relay")
+	copied := *sock.last.Load()
+
+	before := h3Refusals(name, proxy.RefusedReplayed)
+	if _, err := sock.uc.WriteTo(copied, ua); err != nil {
+		t.Fatal(err)
+	}
+	counted("a copy from the relay socket", proxy.RefusedReplayed, before)
+
+	other, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	before = h3Refusals(name, proxy.RefusedSignature)
+	if _, err := other.WriteTo(copied, ua); err != nil {
+		t.Fatal(err)
+	}
+	counted("a copy from another port", proxy.RefusedSignature, before)
+
+	get("the relay's next request")
+}
+
+// On a listener bound to every address, a relay's datagram passes on the
+// address it was signed for (here 127.0.0.2); a copy sent to another of
+// the listener's addresses, or from another trusted address (127.0.0.3),
+// fails its signature.
+func TestHTTP3_RelayCopiesToOtherEnds(t *testing.T) {
+	quicGoPath(t)
+	relayCopiesToOtherEnds(t, quicGoServes)
+}
+
+func TestH3Loops_RelayCopiesToOtherEnds(t *testing.T) {
+	onLoops(t)
+	relayCopiesToOtherEnds(t, loopsServe)
+}
+
+func relayCopiesToOtherEnds(t *testing.T, served func(*testing.T, *BindGroup)) {
+	quietLog(t)
+	pki := newCAPKI(t, "h3-relay-ends-ca")
+	site := h3RelaySite(t, pki, "127.0.0.0/8", nil)
+	name := site.Listener.Name
+	_, port, _ := net.SplitHostPort(freeAddr(t))
+	served(t, startGroup(t, "0.0.0.0:"+port, site))
+	two := "127.0.0.2:" + port
+	ua, err := net.ResolveUDPAddr("udp", two)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counted := func(what string, before uint64) {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); h3Refusals(name, proxy.RefusedSignature) == before; {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: not counted as %q", what, proxy.RefusedSignature)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	sock := newRelaySocket(t, "203.0.113.9:4321", h3RelayKey)
+	sock.counted = true
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	qt := &quic.Transport{Conn: sock}
+	defer qt.Close()
+	conn, err := qt.Dial(ctx, ua, h3ClientTLS(pki), nil)
+	if err != nil {
+		t.Fatalf("through the relay to %s: %v", two, err)
+	}
+	defer conn.CloseWithError(0, "")
+	cc := (&http3.Transport{}).NewClientConn(conn)
+	get := func(what string) {
+		t.Helper()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+two+"/", nil)
+		resp, err := cc.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if string(b) != "client=203.0.113.9" {
+			t.Fatalf("%s: %q, want client=203.0.113.9", what, b)
+		}
+	}
+	get("through the relay")
+	copied := *sock.last.Load()
+
+	before := h3Refusals(name, proxy.RefusedSignature)
+	one, _ := net.ResolveUDPAddr("udp", "127.0.0.1:"+port)
+	if _, err := sock.uc.WriteTo(copied, one); err != nil {
+		t.Fatal(err)
+	}
+	counted("a copy to another address of the listener", before)
+
+	other, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	before = h3Refusals(name, proxy.RefusedSignature)
+	if _, err := other.WriteTo(copied, ua); err != nil {
+		t.Fatal(err)
+	}
+	counted("a copy from another trusted address", before)
+
+	get("the relay's next request")
 }
 
 // The same through the event loops: a relayed client's requests are its
@@ -570,13 +823,14 @@ func TestH3Loops_RelayDatagramHook(t *testing.T) {
 		return append(hdr, payload...)
 	}
 	relay := netip.MustParseAddrPort("127.0.0.1:7000")
+	to := web.DestAt(netip.MustParseAddrPort("192.0.2.1:443"))
 	var state any
 	now := time.Now().UnixNano()
 	at := func(d time.Duration) int64 { return now + int64(d) }
 	refused := func(what string, d []byte, when int64, reason string) {
 		t.Helper()
 		before := h3Refusals(name, reason)
-		if payload, client, ok := h.Datagram(&state, relay, d, when); ok || payload != nil || client.IsValid() {
+		if payload, client, ok := h.Datagram(&state, relay, to, d, when); ok || payload != nil || client.IsValid() {
 			t.Errorf("%s: passed on (%q from %v, %v); want it dropped", what, payload, client, ok)
 		}
 		if got := h3Refusals(name, reason); got != before+1 {
@@ -584,23 +838,23 @@ func TestH3Loops_RelayDatagramHook(t *testing.T) {
 		}
 	}
 
-	if payload, client, ok := h.Datagram(&state, relay, datagram("203.0.113.9:4321", h3RelayKey), at(0)); !ok || string(payload) != "a QUIC packet" || client.String() != "203.0.113.9:4321" {
+	if payload, client, ok := h.Datagram(&state, relay, to, datagram("203.0.113.9:4321", h3RelayKey), at(0)); !ok || string(payload) != "a QUIC packet" || client.String() != "203.0.113.9:4321" {
 		t.Fatalf("the first datagram: %q from %v, %v", payload, client, ok)
 	}
 	refused("another client on the pinned relay socket", datagram("198.51.100.1:5", h3RelayKey), at(time.Second), h3RelayClientChanged)
-	if _, client, ok := h.Datagram(&state, relay, datagram("203.0.113.9:4321", h3RelayKey), at(2*time.Second)); !ok || client.String() != "203.0.113.9:4321" {
+	if _, client, ok := h.Datagram(&state, relay, to, datagram("203.0.113.9:4321", h3RelayKey), at(2*time.Second)); !ok || client.String() != "203.0.113.9:4321" {
 		t.Errorf("the pinned client again: %v, %v", client, ok)
 	}
 	refused("a datagram without a header", []byte("a QUIC packet"), at(3*time.Second), proxy.RefusedMissing)
 	refused("an unsigned header", datagram("203.0.113.9:4321", nil), at(3*time.Second), proxy.RefusedSignature)
 	refused("a header signed with another key", datagram("203.0.113.9:4321", []byte("0123456789abcdef0123456789abcdef-another")), at(3*time.Second), proxy.RefusedSignature)
 	// Once the pin has run out, the socket may stand for another client.
-	if _, client, ok := h.Datagram(&state, relay, datagram("198.51.100.1:5", h3RelayKey), at(h3RelayPinTTL+3*time.Second)); !ok || client.String() != "198.51.100.1:5" {
+	if _, client, ok := h.Datagram(&state, relay, to, datagram("198.51.100.1:5", h3RelayKey), at(h3RelayPinTTL+3*time.Second)); !ok || client.String() != "198.51.100.1:5" {
 		t.Errorf("another client after the pin ran out: %v, %v", client, ok)
 	}
 	// An address the listener does not trust is a client: its datagram
 	// passes as it is, without a client named.
-	if payload, client, ok := h.Datagram(&state, netip.MustParseAddrPort("192.0.2.1:9"), []byte("a QUIC packet"), at(0)); !ok || string(payload) != "a QUIC packet" || client.IsValid() {
+	if payload, client, ok := h.Datagram(&state, netip.MustParseAddrPort("192.0.2.1:9"), to, []byte("a QUIC packet"), at(0)); !ok || string(payload) != "a QUIC packet" || client.IsValid() {
 		t.Errorf("a direct client's datagram: %q from %v, %v", payload, client, ok)
 	}
 }
