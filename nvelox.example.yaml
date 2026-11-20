@@ -88,10 +88,13 @@ server:
   #   # IPv6 /64; behind a trusted relay, the client it names) may have
   #   # running at once on each event loop. A handshake costs a good part
   #   # of a millisecond of CPU and holds TLS state for up to 10 s: without
-  #   # this, one address could take every place of a loop. The first
-  #   # packets of its further clients are dropped (they send them again)
-  #   # and counted in nvelox_h3_handshakes_refused_total. Clients behind
-  #   # one address (a company's NAT) share it. 0 (no limit) to 4096.
+  #   # this, one address could take every place of a loop. It counts the
+  #   # clients that proved their address (they came back with the token
+  #   # of the server's Retry packet), so first packets with a made-up
+  #   # source cannot keep an address out. The first packets of its
+  #   # further clients are dropped (they send them again) and counted in
+  #   # nvelox_h3_handshakes_refused_total. Clients behind one address (a
+  #   # company's NAT) share it. 0 (no limit) to 4096.
   #   handshakes_per_source: 32
   #   # max_send_buffer, the two totals, socket_buffer and
   #   # handshakes_per_source belong to the QUIC transport nvelox runs on

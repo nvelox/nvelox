@@ -62,7 +62,14 @@ type HTTP3Config struct {
 	// HandshakesPerSource is how many QUIC handshakes one client address
 	// (an IPv4 address, or an IPv6 /64) may have running at once on each
 	// event loop; behind a trusted relay, the address the relay names.
-	// The first packets of its further clients are dropped, and counted in
+	// It counts the clients that proved their address: they came back
+	// with the token of the server's Retry packet (through a relay, a
+	// token made for the client the relay names). A client taken on trust
+	// is not counted, so first packets with a made-up source take no
+	// address's places; the server runs at most 128 handshakes with
+	// clients taken on trust (shared out among its event loops) and sends
+	// further new clients a Retry. The first packets of an address's
+	// further clients are dropped, and counted in
 	// nvelox_h3_handshakes_refused_total{reason="per_source"}, until one of
 	// its handshakes completes or is given up (after 10 s); a client sends
 	// them again. Clients behind one address, a company's NAT say, share
