@@ -252,10 +252,11 @@ type Listener struct {
 	// listeners share one bind address: matched against the TLS server
 	// name and the Host header, an exact name first, then one with a
 	// wildcard in its leftmost label ("*.example.com"). A listener alone on
-	// its address answers for every name.
+	// its address answers for every name. Refused on tcp and udp.
 	ServerNames []string `yaml:"server_names,omitempty"`
 	// Makes this listener the one that answers a request whose name no
 	// listener on its bind address lists. At most one to a bind address.
+	// Refused on tcp and udp.
 	DefaultServer bool `yaml:"default_server,omitempty"`
 
 	// A limit for the whole listener: new connections a second on tcp, new
@@ -740,18 +741,19 @@ type TimeoutConfig struct {
 	Connect string `yaml:"connect,omitempty"`
 	// On an http or https listener: how long a client may take to send a
 	// request's head. Default 10s. The listeners on one bind address share
-	// one value, the largest they set. "0": no limit. Refused on a backend
-	// and on a fastcgi route.
+	// one value, the largest they set. "0": no limit. Refused on a tcp
+	// listener, on a backend and on a fastcgi route.
 	ReadHeader string `yaml:"read_header,omitempty"`
 	// On an http or https listener: how long a client may pause while it
 	// sends a request body (default 60s). On a backend: how long a server
 	// may stay silent once it has started to answer (no limit unless set).
 	// A transfer that keeps moving is never cut. "0": no limit. Refused on
-	// a fastcgi route.
+	// a tcp listener and on a fastcgi route.
 	Read string `yaml:"read,omitempty"`
 	// On an http or https listener: how long a client may pause while it
 	// takes a response. Default 60s. A download that keeps moving is never
-	// cut. "0": no limit. Refused on a backend and on a fastcgi route.
+	// cut. "0": no limit. Refused on a tcp listener, on a backend and on a
+	// fastcgi route.
 	Write string `yaml:"write,omitempty"`
 	// How long a connection may stay idle on a listener: on http and https
 	// a kept-alive connection between requests (default 120s; the
@@ -1577,6 +1579,8 @@ func rejectHTTPOnlyKeys(l Listener, proto string) error {
 		{"ip_rate_limit", l.IPRateLimit != (IPRateLimitConfig{})},
 		{"request_id", l.RequestID != (RequestIDConfig{})},
 		{"trusted_proxies", len(l.TrustedProxies) > 0},
+		{"server_names", len(l.ServerNames) > 0},
+		{"default_server", l.DefaultServer},
 	} {
 		if k.on {
 			set = append(set, k.name)
@@ -1587,6 +1591,19 @@ func rejectHTTPOnlyKeys(l Listener, proto string) error {
 	}
 	if proto == "udp" && l.Timeouts != (TimeoutConfig{}) {
 		return fmt.Errorf("listener %s: timeouts do nothing on a udp listener (a session ends after 60s without a datagram from its client, or 10s without a reply from its backend); remove them", l.Name)
+	}
+	if proto == "tcp" {
+		var set []string
+		for _, f := range []struct{ name, val string }{
+			{"read_header", l.Timeouts.ReadHeader}, {"read", l.Timeouts.Read}, {"write", l.Timeouts.Write},
+		} {
+			if f.val != "" {
+				set = append(set, "timeouts."+f.name)
+			}
+		}
+		if len(set) > 0 {
+			return fmt.Errorf("listener %s: %s: a tcp listener reads timeouts.connect and timeouts.idle only, and would ignore these; remove them", l.Name, strings.Join(set, ", "))
+		}
 	}
 	return nil
 }

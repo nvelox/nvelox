@@ -68,8 +68,8 @@ Every setting nvelox reads from its configuration file, under the key it is writ
 - **`zero_copy`** (true or false): Not built yet: a listener that sets it to true is refused at load.
 - **`backend`** (text): The backend to pass traffic to, by its name. A tcp or udp listener passes every connection or session to it, and needs one. An http or https listener with routes passes it the requests no route takes; without routes, every request.
 - **`default_backend`** (text): The former name of backend. A listener that uses it loads, with a warning that names the new key; one that sets both is refused.
-- **`server_names`** (list of text): The host names this listener answers for when several http or https listeners share one bind address: matched against the TLS server name and the Host header, an exact name first, then one with a wildcard in its leftmost label ("*.example.com"). A listener alone on its address answers for every name.
-- **`default_server`** (true or false): Makes this listener the one that answers a request whose name no listener on its bind address lists. At most one to a bind address.
+- **`server_names`** (list of text): The host names this listener answers for when several http or https listeners share one bind address: matched against the TLS server name and the Host header, an exact name first, then one with a wildcard in its leftmost label ("*.example.com"). A listener alone on its address answers for every name. Refused on tcp and udp.
+- **`default_server`** (true or false): Makes this listener the one that answers a request whose name no listener on its bind address lists. At most one to a bind address. Refused on tcp and udp.
 - **`rate_limit`** (section): A limit for the whole listener: new connections a second on tcp, new sessions on udp, requests on http and https.
 - **`timeouts`** (section): How long the listener waits for its clients, and how long it gives a backend to accept a connection. Refused on a udp listener: a udp session ends after 60 seconds without a datagram from its client, or 10 seconds without a reply from its backend.
 - **`tls`** (section): The certificate an https listener, or a tcp listener that ends TLS, presents, and how it treats client certificates.
@@ -105,9 +105,9 @@ Every setting nvelox reads from its configuration file, under the key it is writ
 ## `listeners[].timeouts`
 
 - **`connect`** (text): How long opening a connection to a server may take, such as "5s": a backend's own, else its listener's, else 10s. When it fails a request is answered 502, a tcp client's connection closed. "0": no limit.
-- **`read_header`** (text): On an http or https listener: how long a client may take to send a request's head. Default 10s. The listeners on one bind address share one value, the largest they set. "0": no limit. Refused on a backend and on a fastcgi route.
-- **`read`** (text): On an http or https listener: how long a client may pause while it sends a request body (default 60s). On a backend: how long a server may stay silent once it has started to answer (no limit unless set). A transfer that keeps moving is never cut. "0": no limit. Refused on a fastcgi route.
-- **`write`** (text): On an http or https listener: how long a client may pause while it takes a response. Default 60s. A download that keeps moving is never cut. "0": no limit. Refused on a backend and on a fastcgi route.
+- **`read_header`** (text): On an http or https listener: how long a client may take to send a request's head. Default 10s. The listeners on one bind address share one value, the largest they set. "0": no limit. Refused on a tcp listener, on a backend and on a fastcgi route.
+- **`read`** (text): On an http or https listener: how long a client may pause while it sends a request body (default 60s). On a backend: how long a server may stay silent once it has started to answer (no limit unless set). A transfer that keeps moving is never cut. "0": no limit. Refused on a tcp listener and on a fastcgi route.
+- **`write`** (text): On an http or https listener: how long a client may pause while it takes a response. Default 60s. A download that keeps moving is never cut. "0": no limit. Refused on a tcp listener, on a backend and on a fastcgi route.
 - **`idle`** (text): How long a connection may stay idle on a listener: on http and https a kept-alive connection between requests (default 120s; the listeners on one bind address share the largest they set); on tcp, with tls or without, a connection with no traffic either way (default 5m). "0": no limit. Refused on a backend and on a fastcgi route.
 - **`response_header`** (text): On a backend, or a fastcgi route: how long a server may take to start answering once it has the request. Default 60s, then 504. Refused on a listener. "0": no limit.
 
@@ -213,9 +213,9 @@ Every setting nvelox reads from its configuration file, under the key it is writ
 ## `listeners[].routes[].fastcgi.timeouts`
 
 - **`connect`** (text): How long opening a connection to a server may take, such as "5s": a backend's own, else its listener's, else 10s. When it fails a request is answered 502, a tcp client's connection closed. "0": no limit.
-- **`read_header`** (text): On an http or https listener: how long a client may take to send a request's head. Default 10s. The listeners on one bind address share one value, the largest they set. "0": no limit. Refused on a backend and on a fastcgi route.
-- **`read`** (text): On an http or https listener: how long a client may pause while it sends a request body (default 60s). On a backend: how long a server may stay silent once it has started to answer (no limit unless set). A transfer that keeps moving is never cut. "0": no limit. Refused on a fastcgi route.
-- **`write`** (text): On an http or https listener: how long a client may pause while it takes a response. Default 60s. A download that keeps moving is never cut. "0": no limit. Refused on a backend and on a fastcgi route.
+- **`read_header`** (text): On an http or https listener: how long a client may take to send a request's head. Default 10s. The listeners on one bind address share one value, the largest they set. "0": no limit. Refused on a tcp listener, on a backend and on a fastcgi route.
+- **`read`** (text): On an http or https listener: how long a client may pause while it sends a request body (default 60s). On a backend: how long a server may stay silent once it has started to answer (no limit unless set). A transfer that keeps moving is never cut. "0": no limit. Refused on a tcp listener and on a fastcgi route.
+- **`write`** (text): On an http or https listener: how long a client may pause while it takes a response. Default 60s. A download that keeps moving is never cut. "0": no limit. Refused on a tcp listener, on a backend and on a fastcgi route.
 - **`idle`** (text): How long a connection may stay idle on a listener: on http and https a kept-alive connection between requests (default 120s; the listeners on one bind address share the largest they set); on tcp, with tls or without, a connection with no traffic either way (default 5m). "0": no limit. Refused on a backend and on a fastcgi route.
 - **`response_header`** (text): On a backend, or a fastcgi route: how long a server may take to start answering once it has the request. Default 60s, then 504. Refused on a listener. "0": no limit.
 
@@ -276,9 +276,9 @@ Every setting nvelox reads from its configuration file, under the key it is writ
 ## `backends[].timeouts`
 
 - **`connect`** (text): How long opening a connection to a server may take, such as "5s": a backend's own, else its listener's, else 10s. When it fails a request is answered 502, a tcp client's connection closed. "0": no limit.
-- **`read_header`** (text): On an http or https listener: how long a client may take to send a request's head. Default 10s. The listeners on one bind address share one value, the largest they set. "0": no limit. Refused on a backend and on a fastcgi route.
-- **`read`** (text): On an http or https listener: how long a client may pause while it sends a request body (default 60s). On a backend: how long a server may stay silent once it has started to answer (no limit unless set). A transfer that keeps moving is never cut. "0": no limit. Refused on a fastcgi route.
-- **`write`** (text): On an http or https listener: how long a client may pause while it takes a response. Default 60s. A download that keeps moving is never cut. "0": no limit. Refused on a backend and on a fastcgi route.
+- **`read_header`** (text): On an http or https listener: how long a client may take to send a request's head. Default 10s. The listeners on one bind address share one value, the largest they set. "0": no limit. Refused on a tcp listener, on a backend and on a fastcgi route.
+- **`read`** (text): On an http or https listener: how long a client may pause while it sends a request body (default 60s). On a backend: how long a server may stay silent once it has started to answer (no limit unless set). A transfer that keeps moving is never cut. "0": no limit. Refused on a tcp listener and on a fastcgi route.
+- **`write`** (text): On an http or https listener: how long a client may pause while it takes a response. Default 60s. A download that keeps moving is never cut. "0": no limit. Refused on a tcp listener, on a backend and on a fastcgi route.
 - **`idle`** (text): How long a connection may stay idle on a listener: on http and https a kept-alive connection between requests (default 120s; the listeners on one bind address share the largest they set); on tcp, with tls or without, a connection with no traffic either way (default 5m). "0": no limit. Refused on a backend and on a fastcgi route.
 - **`response_header`** (text): On a backend, or a fastcgi route: how long a server may take to start answering once it has the request. Default 60s, then 504. Refused on a listener. "0": no limit.
 

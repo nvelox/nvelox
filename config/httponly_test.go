@@ -22,6 +22,8 @@ func TestValidation_HTTPOnlyKeysRefusedOnTCPAndUDP(t *testing.T) {
 		{"ip_rate_limit", func(l *Listener) { l.IPRateLimit.RequestsPerSecond = 10 }},
 		{"request_id", func(l *Listener) { l.RequestID.Enabled = true }},
 		{"trusted_proxies", func(l *Listener) { l.TrustedProxies = []string{"10.0.0.0/8"} }},
+		{"server_names", func(l *Listener) { l.ServerNames = []string{"example.com"} }},
+		{"default_server", func(l *Listener) { l.DefaultServer = true }},
 	}
 	for _, proto := range []string{"tcp", "udp"} {
 		for _, k := range keys {
@@ -49,6 +51,19 @@ func TestValidation_HTTPOnlyKeysRefusedOnTCPAndUDP(t *testing.T) {
 	tcp := Listener{Name: "t", Bind: ":7001", Protocol: "tcp", Backend: "be", Timeouts: TimeoutConfig{Idle: "30s", Connect: "2s"}}
 	if err := validate(baseCfg(tcp)); err != nil {
 		t.Fatalf("a tcp listener with timeouts: %v", err)
+	}
+	// On tcp, the timeouts an L4 connection never reads: refused, each named.
+	for _, f := range []struct {
+		name string
+		set  func(*TimeoutConfig)
+	}{
+		{"timeouts.read_header", func(c *TimeoutConfig) { c.ReadHeader = "5s" }},
+		{"timeouts.read", func(c *TimeoutConfig) { c.Read = "5s" }},
+		{"timeouts.write", func(c *TimeoutConfig) { c.Write = "5s" }},
+	} {
+		l := Listener{Name: "t", Bind: ":7001", Protocol: "tcp", Backend: "be", Timeouts: TimeoutConfig{Idle: "30s"}}
+		f.set(&l.Timeouts)
+		wantErr(t, validate(baseCfg(l)), "listener t", f.name, "reads timeouts.connect and timeouts.idle only")
 	}
 	// An empty value of each is no setting.
 	quiet := Listener{Name: "q", Bind: ":5354", Protocol: "udp", Backend: "be",
