@@ -22,8 +22,6 @@ var plainReads = map[string]int{
 	// The configuration file itself, which may be a pipe
 	// (nvelox --check --config <(generate)).
 	"config/config.go Load os.ReadFile": 1,
-	// nvelox's own pid file, to see that it still holds this process's ID.
-	"core/pidfile/pidfile.go Write os.ReadFile": 1,
 	// The status of each of nvelox's threads (/proc/self/task), to see that
 	// every one has switched user.
 	"core/privdrop/privdrop_linux.go threadsIn os.ReadFile": 1,
