@@ -157,6 +157,13 @@ func ServeFastCGI(w http.ResponseWriter, r *http.Request, cfg config.FastCGIConf
 		return
 	}
 	defer client.Close()
+	// The exchange lasts no longer than the client's request: when that
+	// ends (the client went away, the server is shutting down), the
+	// upstream's connection is closed, which ends the exchange whatever the
+	// upstream is doing. Without it, an upstream that stalls holds the
+	// request, its goroutines and both connections until it closes itself.
+	stopWithRequest := context.AfterFunc(r.Context(), func() { upstream.Close() })
+	defer stopWithRequest()
 	fw := &fcgiResponseWriter{ResponseWriter: w, base: w.Header().Clone(), serveError: serveError}
 	req := gofast.NewRequest(r)
 	if d := cfg.Timeouts.ResolveResponseHeader(defaultBackendResponseHeader); d > 0 {
