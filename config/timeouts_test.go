@@ -122,7 +122,7 @@ func TestValidation_FastCGITimeouts(t *testing.T) {
 		{"none", TimeoutConfig{}, nil},
 		{"both", TimeoutConfig{Connect: "2s", ResponseHeader: "30s"}, nil},
 		{"zero is no limit", TimeoutConfig{Connect: "0", ResponseHeader: "0"}, nil},
-		{"read", TimeoutConfig{Read: "5m"}, []string{"route 0: fastcgi", "timeouts.read does nothing on a fastcgi route", "connect and response_header"}},
+		{"read", TimeoutConfig{Read: "5m"}, []string{"route 0: fastcgi", "timeouts.read does nothing on a fastcgi route", "connect, response_header and send"}},
 		{"write", TimeoutConfig{Write: "30s"}, []string{"route 0: fastcgi", "timeouts.write does nothing on a fastcgi route"}},
 		{"idle", TimeoutConfig{Idle: "30s"}, []string{"route 0: fastcgi", "timeouts.idle does nothing on a fastcgi route"}},
 		{"read_header", TimeoutConfig{ReadHeader: "5s"}, []string{"route 0: fastcgi", "timeouts.read_header does nothing on a fastcgi route"}},

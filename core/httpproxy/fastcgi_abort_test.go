@@ -3,6 +3,7 @@ package httpproxy
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -179,4 +180,146 @@ func (xs) Read(p []byte) (int, error) {
 		p[i] = 'x'
 	}
 	return len(p), nil
+}
+
+// TestFastCGI_SendTimeout: a FastCGI server that takes nothing of the
+// request body for the route's timeouts.send ends the exchange, and the
+// client gets a 504 from nvelox (the server had not begun to answer); an
+// upload the server keeps taking is not cut, however long the body.
+func TestFastCGI_SendTimeout(t *testing.T) {
+	if err := logging.Init("error", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = logging.Init("info", "", "") })
+
+	t.Run("takes nothing", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, "index.php"), []byte("<?php"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ln.Close() })
+		accepted := make(chan net.Conn, 1)
+		go func() {
+			if c, err := ln.Accept(); err == nil {
+				accepted <- c // read nothing
+			}
+		}()
+		t.Cleanup(func() {
+			select {
+			case c := <-accepted:
+				c.Close()
+			default:
+			}
+		})
+		cfg := config.FastCGIConfig{Pass: ln.Addr().String(), DocumentRoot: root}
+		cfg.Timeouts.Send = "300ms"
+		const size = 1 << 30
+		r := httptest.NewRequest("POST", "/index.php", io.LimitReader(xs{}, size))
+		r.ContentLength = size
+		start := time.Now()
+		rec := serveFCGI(t, cfg, r)
+		if rec.Code != http.StatusGatewayTimeout {
+			t.Fatalf("a server that takes none of the body: %d, want 504", rec.Code)
+		}
+		if took := time.Since(start); took > 5*time.Second {
+			t.Fatalf("504 after %v, want soon after the 300ms send timeout", took)
+		}
+	})
+
+	t.Run("takes it slowly", func(t *testing.T) {
+		cfg, current := fakeFCGIUpstream(t)
+		cfg.Timeouts.Send = "300ms"
+		current.Store(&fcgiReply{out: []byte("Content-Type: text/plain\r\n\r\ngot it")})
+		// 600ms of body, a byte every 200ms: each piece is taken at once.
+		r := httptest.NewRequest("POST", "/index.php", &slowBody{n: 3, gap: 200 * time.Millisecond})
+		if rec := serveFCGI(t, cfg, r); rec.Code != http.StatusOK || rec.Body.String() != "got it" {
+			t.Fatalf("an upload slower than the send timeout that the server takes: %d %q, want 200", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// scriptedConn is a FastCGI upstream's connection for fcgiSendConn: each
+// write takes as much as takes says, in turn (all of it once the list is
+// used up), and fails with a timeout when that is less than it was given.
+// fail, when set, fails every write at once. deadlines holds the write
+// deadline each write had.
+type scriptedConn struct {
+	net.Conn
+	takes     []int
+	fail      error
+	deadline  time.Time
+	deadlines []time.Time
+	taken     []byte
+}
+
+func (c *scriptedConn) SetWriteDeadline(t time.Time) error {
+	c.deadline = t
+	return nil
+}
+
+func (c *scriptedConn) Write(p []byte) (int, error) {
+	c.deadlines = append(c.deadlines, c.deadline)
+	if c.fail != nil {
+		return 0, c.fail
+	}
+	n := len(p)
+	if len(c.takes) > 0 {
+		n = min(n, c.takes[0])
+		c.takes = c.takes[1:]
+	}
+	c.taken = append(c.taken, p[:n]...)
+	if n < len(p) {
+		return n, os.ErrDeadlineExceeded
+	}
+	return n, nil
+}
+
+// TestFastCGI_SendConn: the send timeout is a pause in what the upstream
+// takes. A write it takes some of before each deadline goes on, with the
+// limit counted again from each try; one it takes nothing of for the limit
+// fails, and the exchange is ended once.
+func TestFastCGI_SendConn(t *testing.T) {
+	const limit = time.Minute
+	t.Run("keeps taking", func(t *testing.T) {
+		sc := &scriptedConn{takes: []int{3, 3, 3}}
+		stalls := 0
+		c := &fcgiSendConn{Conn: sc, limit: limit, stalled: func() { stalls++ }}
+		before := time.Now()
+		n, err := c.Write([]byte("0123456789"))
+		after := time.Now()
+		if err != nil || n != 10 || string(sc.taken) != "0123456789" || stalls != 0 {
+			t.Fatalf("an upstream that takes some of each try: wrote %d, %v; it took %q; %d stalls", n, err, sc.taken, stalls)
+		}
+		if len(sc.deadlines) != 4 {
+			t.Fatalf("%d tries, want 4", len(sc.deadlines))
+		}
+		for i, d := range sc.deadlines {
+			if d.Before(before.Add(limit)) || d.After(after.Add(limit)) {
+				t.Errorf("try %d: deadline %v, want the limit from the try (%v to %v)", i, d, before.Add(limit), after.Add(limit))
+			}
+		}
+	})
+	t.Run("takes nothing", func(t *testing.T) {
+		sc := &scriptedConn{takes: []int{4, 0, 0}}
+		stalls := 0
+		c := &fcgiSendConn{Conn: sc, limit: limit, stalled: func() { stalls++ }}
+		if n, err := c.Write([]byte("0123456789")); n != 4 || !errors.Is(err, os.ErrDeadlineExceeded) || stalls != 1 {
+			t.Fatalf("an upstream that stops taking: wrote %d, %v; %d stalls, want 4, a timeout and 1", n, err, stalls)
+		}
+		if _, err := c.Write([]byte("x")); err == nil || stalls != 1 {
+			t.Fatalf("the next write: %v, %d stalls; want a timeout, and the exchange ended once", err, stalls)
+		}
+	})
+	t.Run("another error", func(t *testing.T) {
+		sc := &scriptedConn{fail: io.ErrClosedPipe}
+		stalls := 0
+		c := &fcgiSendConn{Conn: sc, limit: limit, stalled: func() { stalls++ }}
+		if n, err := c.Write([]byte("0123456789")); n != 0 || err != io.ErrClosedPipe || stalls != 0 || len(sc.deadlines) != 1 {
+			t.Fatalf("a write that fails at once: %d, %v, %d stalls, %d tries", n, err, stalls, len(sc.deadlines))
+		}
+	})
 }

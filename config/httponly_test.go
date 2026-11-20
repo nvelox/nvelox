@@ -2,6 +2,7 @@ package config
 
 import (
 	"testing"
+	"time"
 )
 
 // The settings only http and https listeners read are refused on a tcp or
@@ -70,5 +71,27 @@ func TestValidation_HTTPOnlyKeysRefusedOnTCPAndUDP(t *testing.T) {
 		Headers: HeadersConfig{RequestAdd: map[string]string{}}, Compression: CompressionConfig{Types: []string{}}}
 	if err := validate(baseCfg(quiet)); err != nil {
 		t.Fatalf("empty values on a udp listener: %v", err)
+	}
+}
+
+// timeouts.send belongs to a fastcgi route: refused on a listener and on a
+// backend, its value checked on a route.
+func TestValidation_SendTimeoutOnlyOnFastCGIRoutes(t *testing.T) {
+	l := Listener{Name: "h", Bind: ":8080", Protocol: "http", Backend: "be", Timeouts: TimeoutConfig{Send: "5s"}}
+	wantErr(t, validate(baseCfg(l)), "listener h", "timeouts.send is a fastcgi route setting")
+	if err := validateBackendTimeouts(Backend{Name: "be", Timeouts: TimeoutConfig{Send: "5s"}}); err == nil {
+		t.Fatal("a backend with timeouts.send: want an error")
+	}
+	if err := validateFastCGITimeouts(TimeoutConfig{Send: "5s"}); err != nil {
+		t.Fatalf("a fastcgi route with timeouts.send: %v", err)
+	}
+	if err := validateFastCGITimeouts(TimeoutConfig{Send: "soon"}); err == nil {
+		t.Fatal("a fastcgi route with timeouts.send \"soon\": want an error")
+	}
+	if d := (TimeoutConfig{}).ResolveSend(60 * time.Second); d != 60*time.Second {
+		t.Fatalf("unset send: %v, want the default", d)
+	}
+	if d := (TimeoutConfig{Send: "0"}).ResolveSend(60 * time.Second); d != 0 {
+		t.Fatalf("send \"0\": %v, want 0 (no limit)", d)
 	}
 }

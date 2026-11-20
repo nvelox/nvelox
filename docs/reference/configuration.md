@@ -110,6 +110,7 @@ Every setting nvelox reads from its configuration file, under the key it is writ
 - **`write`** (text): On an http or https listener: how long a client may pause while it takes a response. Default 60s. A download that keeps moving is never cut. "0": no limit. Refused on a tcp listener, on a backend and on a fastcgi route.
 - **`idle`** (text): How long a connection may stay idle on a listener: on http and https a kept-alive connection between requests (default 120s; the listeners on one bind address share the largest they set); on tcp, with tls or without, a connection with no traffic either way (default 5m). "0": no limit. Refused on a backend and on a fastcgi route.
 - **`response_header`** (text): On a backend, or a fastcgi route: how long a server may take to start answering once it has the request. Default 60s, then 504. Refused on a listener. "0": no limit.
+- **`send`** (text): On a fastcgi route: how long a FastCGI server may pause in taking the request body. Default 60s; past it the exchange ends, with a 504 if the server had not begun to answer. An upload it keeps taking is never cut. "0": no limit. Refused on a listener and on a backend.
 
 ## `listeners[].tls`
 
@@ -208,7 +209,7 @@ Every setting nvelox reads from its configuration file, under the key it is writ
 - **`split_path_info`** (text): A regular expression that splits the path into the script and PATH_INFO, as nginx's fastcgi_split_path_info does, such as "^(.+\.php)(/.+)$".
 - **`params`** (map of text to text): More FastCGI parameters, by name.
 - **`index`** (text): Not built yet: a route that sets it is refused at load. try_files names the script a request falls back to.
-- **`timeouts`** (section): Two timeouts apply to a FastCGI server: connect (how long the connection to it may take: default the listener's, else 10s; 502 when it fails) and response_header (how long it may take to start answering once it has the request: default 60s, then 504). The others are refused here.
+- **`timeouts`** (section): Three timeouts apply to a FastCGI server: connect (how long the connection to it may take: default the listener's, else 10s; 502 when it fails), send (how long it may pause in taking the request body: default 60s, then 504) and response_header (how long it may take to start answering once it has the request: default 60s, then 504). The others are refused here.
 
 ## `listeners[].routes[].fastcgi.timeouts`
 
@@ -218,6 +219,7 @@ Every setting nvelox reads from its configuration file, under the key it is writ
 - **`write`** (text): On an http or https listener: how long a client may pause while it takes a response. Default 60s. A download that keeps moving is never cut. "0": no limit. Refused on a tcp listener, on a backend and on a fastcgi route.
 - **`idle`** (text): How long a connection may stay idle on a listener: on http and https a kept-alive connection between requests (default 120s; the listeners on one bind address share the largest they set); on tcp, with tls or without, a connection with no traffic either way (default 5m). "0": no limit. Refused on a backend and on a fastcgi route.
 - **`response_header`** (text): On a backend, or a fastcgi route: how long a server may take to start answering once it has the request. Default 60s, then 504. Refused on a listener. "0": no limit.
+- **`send`** (text): On a fastcgi route: how long a FastCGI server may pause in taking the request body. Default 60s; past it the exchange ends, with a 504 if the server had not begun to answer. An upload it keeps taking is never cut. "0": no limit. Refused on a listener and on a backend.
 
 ## `listeners[].headers`
 
@@ -281,6 +283,7 @@ Every setting nvelox reads from its configuration file, under the key it is writ
 - **`write`** (text): On an http or https listener: how long a client may pause while it takes a response. Default 60s. A download that keeps moving is never cut. "0": no limit. Refused on a tcp listener, on a backend and on a fastcgi route.
 - **`idle`** (text): How long a connection may stay idle on a listener: on http and https a kept-alive connection between requests (default 120s; the listeners on one bind address share the largest they set); on tcp, with tls or without, a connection with no traffic either way (default 5m). "0": no limit. Refused on a backend and on a fastcgi route.
 - **`response_header`** (text): On a backend, or a fastcgi route: how long a server may take to start answering once it has the request. Default 60s, then 504. Refused on a listener. "0": no limit.
+- **`send`** (text): On a fastcgi route: how long a FastCGI server may pause in taking the request body. Default 60s; past it the exchange ends, with a 504 if the server had not begun to answer. An upload it keeps taking is never cut. "0": no limit. Refused on a listener and on a backend.
 
 ## `backends[].retry`
 

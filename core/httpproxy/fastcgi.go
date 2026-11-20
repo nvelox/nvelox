@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -107,10 +108,24 @@ func ServeFastCGI(w http.ResponseWriter, r *http.Request, cfg config.FastCGIConf
 	// client goes away; the connection is kept for the response-head timer.
 	var upstream net.Conn
 	connectTimeout := cfg.Timeouts.ParseConnect()
+	sendTimeout := cfg.Timeouts.ResolveSend(defaultFastCGISend)
+	var fw *fcgiResponseWriter
 	clientFactory := gofast.SimpleClientFactory(func() (net.Conn, error) {
 		c, err := fcgiDial(r.Context(), network, address, connectTimeout)
 		upstream = c
-		return c, err
+		if err != nil || sendTimeout <= 0 {
+			return c, err
+		}
+		// The upstream may go sendTimeout without taking any of the
+		// request; past it the exchange ends (a 504 when it had not begun
+		// to answer).
+		return &fcgiSendConn{Conn: c, limit: sendTimeout, stalled: func() {
+			if fw.headTimeout() {
+				logging.Warn("[FCGI] %s %s: the upstream took nothing of the request body for %v, answering 504",
+					logging.SanitizeLogField(r.Method), logging.SanitizeLogField(r.URL.Path), sendTimeout)
+				c.Close()
+			}
+		}}, nil
 	})
 
 	// Build a session handler chain
@@ -164,7 +179,7 @@ func ServeFastCGI(w http.ResponseWriter, r *http.Request, cfg config.FastCGIConf
 	// request, its goroutines and both connections until it closes itself.
 	stopWithRequest := context.AfterFunc(r.Context(), func() { upstream.Close() })
 	defer stopWithRequest()
-	fw := &fcgiResponseWriter{ResponseWriter: w, base: w.Header().Clone(), serveError: serveError}
+	fw = &fcgiResponseWriter{ResponseWriter: w, base: w.Header().Clone(), serveError: serveError}
 	req := gofast.NewRequest(r)
 	if d := cfg.Timeouts.ResolveResponseHeader(defaultBackendResponseHeader); d > 0 {
 		// The upstream gets d to start answering once it has the request,
@@ -376,6 +391,43 @@ func (b *fcgiBody) Read(p []byte) (int, error) {
 		b.sent()
 	}
 	return n, err
+}
+
+// defaultFastCGISend is a fastcgi route's timeouts.send when it sets none.
+const defaultFastCGISend = 60 * time.Second
+
+// fcgiSendConn is the upstream's connection as gofast writes the request to
+// it. A write the upstream takes none of within limit fails, and stalled is
+// called (once); whatever it takes starts limit again, as nginx's
+// fastcgi_send_timeout does, so an upload that keeps moving is never cut.
+// An upstream that has begun to answer keeps answering: only the request
+// ends.
+type fcgiSendConn struct {
+	net.Conn
+	limit   time.Duration
+	stalled func()
+	once    sync.Once
+}
+
+func (c *fcgiSendConn) Write(p []byte) (int, error) {
+	n := 0
+	for {
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.limit))
+		m, err := c.Conn.Write(p[n:])
+		n += m
+		if err == nil {
+			return n, nil
+		}
+		if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+			return n, err
+		}
+		if m == 0 {
+			c.once.Do(c.stalled)
+			return n, err
+		}
+		// The upstream took some of it before the deadline: limit starts
+		// again for the rest.
+	}
 }
 
 // fcgiDial dials the FastCGI upstream within timeout (0: no limit); the

@@ -635,11 +635,12 @@ type FastCGIConfig struct {
 	// Not built yet: a route that sets it is refused at load. try_files
 	// names the script a request falls back to.
 	Index string `yaml:"index,omitempty"`
-	// Two timeouts apply to a FastCGI server: connect (how long the
+	// Three timeouts apply to a FastCGI server: connect (how long the
 	// connection to it may take: default the listener's, else 10s; 502 when
-	// it fails) and response_header (how long it may take to start
-	// answering once it has the request: default 60s, then 504). The others
-	// are refused here.
+	// it fails), send (how long it may pause in taking the request body:
+	// default 60s, then 504) and response_header (how long it may take to
+	// start answering once it has the request: default 60s, then 504). The
+	// others are refused here.
 	Timeouts TimeoutConfig `yaml:"timeouts,omitempty"`
 }
 
@@ -765,6 +766,11 @@ type TimeoutConfig struct {
 	// start answering once it has the request. Default 60s, then 504.
 	// Refused on a listener. "0": no limit.
 	ResponseHeader string `yaml:"response_header,omitempty"`
+	// On a fastcgi route: how long a FastCGI server may pause in taking the
+	// request body. Default 60s; past it the exchange ends, with a 504 if
+	// the server had not begun to answer. An upload it keeps taking is
+	// never cut. "0": no limit. Refused on a listener and on a backend.
+	Send string `yaml:"send,omitempty"`
 }
 
 // ParseConnect returns the connect timeout duration, defaulting to 10s.
@@ -852,6 +858,16 @@ func (t TimeoutConfig) ResolveResponseHeader(def time.Duration) time.Duration {
 	return d
 }
 
+// ResolveSend returns a fastcgi route's send timeout: def when unset, 0 (no
+// limit) for "0".
+func (t TimeoutConfig) ResolveSend(def time.Duration) time.Duration {
+	if t.Send == "" {
+		return def
+	}
+	d, _ := time.ParseDuration(t.Send)
+	return d
+}
+
 // validateTimeout checks one timeout value: empty (unset) or a duration that
 // is not negative ("0" = no limit). A negative value used to pass and act as
 // no limit at all.
@@ -875,6 +891,9 @@ func validateTimeout(val string) error {
 // would do nothing.
 func validateBackendTimeouts(b Backend) error {
 	t := b.Timeouts
+	if t.Send != "" {
+		return fmt.Errorf("backend %s: timeouts.send is a fastcgi route setting; a backend takes connect, response_header and read", b.Name)
+	}
 	for _, f := range []struct{ name, val string }{
 		{"write", t.Write}, {"idle", t.Idle}, {"read_header", t.ReadHeader},
 	} {
@@ -897,18 +916,18 @@ func validateBackendTimeouts(b Backend) error {
 func (l Listener) ReplayWindowRequired() bool { return l.AcceptProxyReplayWindow == "required" }
 
 // validateFastCGITimeouts checks a fastcgi route's timeouts: connect and
-// response_header, as on an HTTP backend; the others would do nothing on a
-// fastcgi route and are refused.
+// response_header, as on an HTTP backend, and send; the others would do
+// nothing on a fastcgi route and are refused.
 func validateFastCGITimeouts(t TimeoutConfig) error {
 	for _, f := range []struct{ name, val string }{
 		{"read", t.Read}, {"write", t.Write}, {"idle", t.Idle}, {"read_header", t.ReadHeader},
 	} {
 		if f.val != "" {
-			return fmt.Errorf("timeouts.%s does nothing on a fastcgi route; it takes connect and response_header", f.name)
+			return fmt.Errorf("timeouts.%s does nothing on a fastcgi route; it takes connect, response_header and send", f.name)
 		}
 	}
 	for _, f := range []struct{ name, val string }{
-		{"connect", t.Connect}, {"response_header", t.ResponseHeader},
+		{"connect", t.Connect}, {"response_header", t.ResponseHeader}, {"send", t.Send},
 	} {
 		if err := validateTimeout(f.val); err != nil {
 			return fmt.Errorf("timeouts.%s %q: %v", f.name, f.val, err)
@@ -1450,6 +1469,9 @@ func validate(cfg *Config) error {
 		// Validate listener timeouts. response_header is a backend setting.
 		if l.Timeouts.ResponseHeader != "" {
 			return fmt.Errorf("listener %s: timeouts.response_header is a backend setting (the time a backend gets to start answering)", l.Name)
+		}
+		if l.Timeouts.Send != "" {
+			return fmt.Errorf("listener %s: timeouts.send is a fastcgi route setting (how long a FastCGI server may pause in taking a request body)", l.Name)
 		}
 		for _, field := range []struct{ name, val string }{
 			{"connect", l.Timeouts.Connect}, {"read_header", l.Timeouts.ReadHeader},

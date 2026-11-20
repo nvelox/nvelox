@@ -405,6 +405,7 @@ Every HTTP response gets exactly one line, written when the request ends (for a 
 | L7 backend response headers | backend `timeouts.response_header`, else 60 s (504) | `core/httpproxy/server.go`, `core/httpproxy/proxy.go` |
 | L7 backend silence once answering | backend `timeouts.read`, else none | `core/httpproxy/silence.go` |
 | FastCGI dial | route `fastcgi.timeouts.connect`, else the listener's, else 10 s (502) | `core/httpproxy/fastcgi.go`, `core/httpproxy/server.go` |
+| FastCGI request body | route `fastcgi.timeouts.send`, else 60 s, for each pause in taking the body (504 when it had not begun to answer); `"0"`: no limit | `core/httpproxy/fastcgi.go` (`fcgiSendConn`) |
 | FastCGI response head | route `fastcgi.timeouts.response_header`, else 60 s, from the end of the request body (504) | `core/httpproxy/fastcgi.go` |
 | FastCGI response head size | 64 KiB, each line included (500 above) | `third_party/gofast/client.go` (`maxResponseHead`) |
 | WebSocket tunnel idle | site `timeouts.idle`, else 120 s | `core/httpproxy/tunnel.go` |
@@ -429,6 +430,7 @@ Every HTTP response gets exactly one line, written when the request ends (for a 
 | A FastCGI upstream's response head is refused (a `Status` that is not a number, a header line without a colon, a head over 64 KiB, no header before the blank line, no `Content-Type`) | 500, without the upstream's body; the request ends once the upstream has answered (`third_party/gofast/client.go` `writeResponse`) |
 | A FastCGI upstream cannot be reached | 502 with nvelox's error page (the site's own when it has one), the reason in the error log (`core/httpproxy/fastcgi.go`) |
 | A FastCGI upstream does not start answering within `timeouts.response_header` | Its connection is closed; 504 with nvelox's error page (`core/httpproxy/fastcgi.go`) |
+| A FastCGI upstream takes nothing of the request body for `timeouts.send` | The body is no longer sent; when it had not begun to answer, its connection is closed and the client gets 504 with nvelox's error page (`core/httpproxy/fastcgi.go`) |
 | A source the listener refuses keeps sending (UDP) | Each datagram is refused after a look at the access policy: it takes nothing from the listener's rate limit, is counted in `nvelox_udp_dropped_total`, and its source has one access-log line in 10 seconds (a listener remembers 1,024 refused sources; past that a refusal is counted only). One summary line per reason is logged every 10 seconds |
 | A client the access policy refuses connects (TCP) | Closed before the listener's rate limit is asked: it takes nothing from it |
 | The PROXY v2 header a UDP backend wants cannot be built for a client | The session is refused and counted (`no_backend_header`); nothing of it reaches the backend |
